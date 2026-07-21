@@ -118,5 +118,7 @@ export function toConversationKey(message: IncomingMessage): ConversationKey {
 export function resultToReply(result: RunResult): string {
   if (result.terminal === "failed") throw new Error("Agent Session 执行失败");
   if (!result.messages.length) throw new Error("Agent Session 已结束，但没有产生回复");
-  return result.messages.join("\n\n");
+  // 一个 run 可能产生多条 agent.message：前面的通常是“让我先检查…”一类
+  // 工具执行播报，最后一条才是面向用户的完整结果。
+  return result.messages.at(-1)!;
 }

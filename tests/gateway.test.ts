@@ -17,6 +17,10 @@ test("result requires both a successful terminal and a business message", () => 
   assert.throws(() => resultToReply({ terminal: "idle", messages: [] }), /没有产生回复/);
   assert.throws(() => resultToReply({ terminal: "failed", messages: ["partial"] }), /执行失败/);
   assert.equal(resultToReply({ terminal: "idle", messages: ["完成"] }), "完成");
+  assert.equal(resultToReply({
+    terminal: "idle",
+    messages: ["让我先检查 lark-cli。", "现在读取相关 Skill。", "文档已创建：https://example.com/docx/1"]
+  }), "文档已创建：https://example.com/docx/1");
 });
 
 test("gateway acknowledges quickly, deduplicates, and reuses a session", async () => {
