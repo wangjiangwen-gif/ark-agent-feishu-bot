@@ -1,11 +1,13 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
 import { chmod, readFile, rename, writeFile } from "node:fs/promises";
-import { stdin, stdout } from "node:process";
+import { loadEnvFile, stdin, stdout } from "node:process";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig } from "./config.ts";
+import { getArkagentPaths } from "./paths.ts";
 
-const command = process.argv[2] || "help";
+const command = process.argv[2] || "run";
 
 async function main(): Promise<void> {
   try {
@@ -16,13 +18,14 @@ async function main(): Promise<void> {
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     if (error instanceof Error && error.message.startsWith("缺少环境变量")) {
-      console.error("请运行 npm run init 完成交互式配置。");
+      console.error("请运行 arkagent init 完成交互式配置。");
     }
     process.exitCode = 1;
   }
 }
 
 async function run(): Promise<void> {
+  const paths = loadSavedEnvironment();
   const config = loadConfig();
   const [{ ArkClient }, { startFeishuGateway }, { Gateway }, { GatewayStore }, { FeishuOAuth }] = await Promise.all([
     import("./ark.ts"), import("./feishu.ts"), import("./gateway.ts"), import("./store.ts"), import("./oauth.ts")
@@ -37,7 +40,7 @@ async function run(): Promise<void> {
     if (!refreshing) refreshing = (async () => {
       tokens = await oauth.refresh(tokens.refreshToken);
       await ark.updateEnvironmentCredential(config.arkVaultId, config.arkCredentialId, tokens.accessToken);
-      await persistOAuthState(".env", tokens.refreshToken, tokens.expiresAt);
+      await persistOAuthState(paths.configPath, tokens.refreshToken, tokens.expiresAt);
     })().finally(() => { refreshing = undefined; });
     await refreshing;
   };
@@ -67,6 +70,7 @@ function assertLarkResponse(response: { code?: number; msg?: string }, action: s
 }
 
 async function doctor(): Promise<void> {
+  loadSavedEnvironment();
   const config = loadConfig();
   const { ArkClient } = await import("./ark.ts");
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
@@ -91,6 +95,7 @@ async function guidedInit(): Promise<void> {
     return readMaskedInput(`${label}（输入内容以 • 显示）: `);
   };
   try {
+    const paths = getArkagentPaths();
     const [{ ArkClient }, { runGuidedInit }, { FeishuOAuth }, Lark, qrModule] = await Promise.all([
       import("./ark.ts"), import("./init.ts"), import("./oauth.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
     ]);
@@ -125,14 +130,22 @@ async function guidedInit(): Promise<void> {
         const tokens = await oauth.poll(device);
         const userOpenId = await oauth.getUserOpenId(tokens.accessToken);
         return { tokens, userOpenId };
-      }
+      },
+      envPath: paths.configPath,
+      gatewayDatabasePath: paths.databasePath
     });
     console.log(`已创建飞书办公助手 Agent：${result.agentId}`);
     console.log(`${result.environmentCreated ? "已创建" : "已复用"} Environment：${result.environmentId}`);
-    console.log(`配置已安全写入 ${result.envPath}。下一步运行：npm run doctor`);
+    console.log(`配置已安全写入 ${result.envPath}。下一步运行：arkagent doctor`);
   } finally {
     rl?.close();
   }
+}
+
+function loadSavedEnvironment(): ReturnType<typeof getArkagentPaths> {
+  const paths = getArkagentPaths();
+  if (existsSync(paths.configPath)) loadEnvFile(paths.configPath);
+  return paths;
 }
 
 async function readMaskedInput(prompt: string): Promise<string> {
@@ -185,7 +198,7 @@ async function persistOAuthState(path: string, refreshToken: string, expiresAt: 
 }
 
 function printHelp(): void {
-  console.log(`ark-feishu <command>\n\n  init    交互式配置并自动创建 Environment\n  doctor  检查配置并验证方舟 Agent\n  run     启动本地 Gateway`);
+  console.log(`arkagent [command]\n\n  init    交互式认领办公助手\n  doctor  检查配置并验证方舟 Agent\n  run     启动本地 Gateway（默认）`);
 }
 
 await main();

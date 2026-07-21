@@ -6,7 +6,7 @@
 
 ## 你会得到什么
 
-运行一次 `npm run init` 后，工具会自动完成四件事：
+运行一次 `npx --yes arkagent@latest init` 后，工具会自动完成四件事：
 
 | 自动完成 | 结果 |
 |---|---|
@@ -29,16 +29,13 @@
 
 不需要提前准备 Agent、Environment、Vault、飞书 App ID 或 App Secret。
 
-### 2. 安装与初始化
+### 2. 一条命令初始化
 
 ```bash
-git clone https://github.com/wangjiangwen-gif/ark-agent-feishu-bot.git
-cd ark-agent-feishu-bot
-npm install
-npm run init
+npx --yes arkagent@latest init
 ```
 
-向导会先询问方舟 API Key，输入不会显示。Base URL、权限域和 Environment 名称直接回车即可使用默认值。
+向导只询问方舟 API Key，输入时以 `•` 提供反馈但不会显示原文。Base URL、`docs,drive` 权限域和 Environment 名称全部使用默认值。
 
 随后完成两次扫码：
 
@@ -49,13 +46,21 @@ npm run init
 
 > 第一次扫码的页面可能把部分宽权限显示为“不支持自动开通”。可以继续下一步；第二个用户授权页面会展示并开通常用权限包。最终是否可用，以第二次授权完成后的实际调用为准。
 
-每次执行 `init` 都会新建一个个人办公助手 Agent，不会搜索或复用已有 Agent。检测到本地 `.env` 时，向导会先询问是否覆盖。
+每次执行 `init` 都会新建一个个人办公助手 Agent，不会搜索或复用已有 Agent。配置会直接覆盖写入 `~/.arkagent/config.env`。
 
 ### 3. 检查并启动
 
 ```bash
-npm run doctor
-npm start
+npx --yes arkagent@latest doctor
+npx --yes arkagent@latest
+```
+
+如果准备长期运行，可以全局安装，之后命令更短：
+
+```bash
+npm install -g arkagent
+arkagent init
+arkagent
 ```
 
 看到“Gateway 已启动，正在通过飞书 WebSocket 接收消息”后，在飞书中找到刚创建的应用并发送消息。
@@ -100,13 +105,13 @@ npm start
 
 | 凭证 | 保存位置 | 原因 |
 |---|---|---|
-| 方舟 API Key | 本地 `.env` | Gateway 调用 Managed Agents API |
-| App Secret | 本地 `.env` | WebSocket 鉴权与 refresh token 刷新 |
-| refresh token | 本地 `.env` | 换取新的用户 access token |
+| 方舟 API Key | `~/.arkagent/config.env` | Gateway 调用 Managed Agents API |
+| App Secret | `~/.arkagent/config.env` | WebSocket 鉴权与 refresh token 刷新 |
+| refresh token | `~/.arkagent/config.env` | 换取新的用户 access token |
 | user access token | 方舟 Vault Credential | 仅在 Session 运行时以环境变量注入 |
 | App ID | Environment 环境变量 | 供沙箱内的 `lark-cli` 使用 |
 
-`.env`、`data/` 和 `node_modules/` 已加入 `.gitignore`。不要把 `.env` 上传到 GitHub，也不要在 Agent prompt 或日志中打印凭证。
+配置目录权限为 `0700`，配置文件权限为 `0600`；Gateway 数据保存在 `~/.arkagent/gateway.db`。不要在 Agent prompt 或日志中打印凭证。
 
 Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新方舟 Credential，再原子更新本地 refresh token。
 
@@ -135,8 +140,11 @@ docker run --rm \
 ## 开发
 
 ```bash
+npm install
 npm test
 npm run check
+npm run build
+npm pack --dry-run
 ```
 
 | 文件 | 职责 |

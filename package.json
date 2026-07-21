@@ -1,17 +1,41 @@
 {
-  "name": "ark-agent-feishu-bot",
+  "name": "arkagent",
   "version": "0.1.0",
-  "private": true,
+  "description": "Turn a Volcano Ark Managed Agent into a Feishu office assistant with one API key and two QR scans.",
   "type": "module",
   "bin": {
-    "ark-feishu": "./src/cli.ts"
+    "arkagent": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wangjiangwen-gif/ark-agent-feishu-bot.git"
+  },
+  "homepage": "https://github.com/wangjiangwen-gif/ark-agent-feishu-bot#readme",
+  "bugs": {
+    "url": "https://github.com/wangjiangwen-gif/ark-agent-feishu-bot/issues"
+  },
+  "keywords": [
+    "volcano-ark",
+    "managed-agents",
+    "feishu",
+    "lark",
+    "agent"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
-    "init": "node --env-file-if-exists=.env --experimental-strip-types src/cli.ts init",
-    "start": "node --env-file-if-exists=.env --experimental-strip-types src/cli.ts run",
-    "doctor": "node --env-file-if-exists=.env --experimental-strip-types src/cli.ts doctor",
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "init": "node --experimental-strip-types src/cli.ts init",
+    "start": "node --experimental-strip-types src/cli.ts run",
+    "doctor": "node --experimental-strip-types src/cli.ts doctor",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "check": "node --experimental-strip-types --check src/cli.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/init.ts && node --experimental-strip-types --check src/scopes.ts && node --experimental-strip-types --check src/oauth.ts && node --experimental-strip-types --check src/gateway.ts && node --experimental-strip-types --check src/ark.ts && node --experimental-strip-types --check src/store.ts && node --experimental-strip-types --check src/feishu.ts"
+    "check": "node --experimental-strip-types --check src/cli.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/init.ts && node --experimental-strip-types --check src/paths.ts && node --experimental-strip-types --check src/scopes.ts && node --experimental-strip-types --check src/oauth.ts && node --experimental-strip-types --check src/gateway.ts && node --experimental-strip-types --check src/ark.ts && node --experimental-strip-types --check src/store.ts && node --experimental-strip-types --check src/feishu.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.56.0",
@@ -19,5 +43,8 @@
   },
   "engines": {
     "node": ">=22.13"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
   }
 }

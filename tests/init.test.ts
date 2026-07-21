@@ -8,18 +8,17 @@ import { OFFICE_AGENT_NAME, runGuidedInit, serializeEnv } from "../src/init.ts";
 test("guided init reuses an environment with the stable name", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-feishu-init-"));
   const envPath = join(dir, ".env");
-    const answers = ["ark-feishu-agent-1"];
   let creates = 0;
   let agentCreates = 0;
   try {
     const result = await runGuidedInit({
-      ask: async () => answers.shift() || "",
+      ask: async () => { throw new Error("默认初始化不应询问非密钥配置"); },
       askSecret: async label => label.includes("方舟") ? "ark-secret" : "feishu-secret",
       createFeishuApp: async () => ({ appId: "cli-1", appSecret: "feishu-secret" }),
       authorizeUser: async () => ({ tokens: { accessToken: "uat", refreshToken: "refresh", expiresAt: 2_000_000_000_000 }, userOpenId: "ou-user" }),
       createArk: () => ({
         createAgent: async config => { agentCreates++; assert.equal(config.name, OFFICE_AGENT_NAME); return { id: "agent-1", name: config.name, version: "1" }; },
-        listEnvironments: async () => [{ id: "env-existing", name: "ark-feishu-agent-1" }],
+        listEnvironments: async () => [{ id: "env-existing", name: "ark-feishu-agent-1-cli-1" }],
         createEnvironment: async name => { creates++; return { id: "env-new", name }; },
         listVaults: async () => [{ id: "vlt-1", displayName: "ark-feishu-agent-1-ou-user" }],
         createVault: async () => "vlt-new",
@@ -45,10 +44,9 @@ test("guided init reuses an environment with the stable name", async () => {
 test("guided init creates an environment when no stable match exists", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-feishu-init-"));
   const envPath = join(dir, ".env");
-    const answers = ["ark-feishu-agent-2-cli-2"];
   try {
     const result = await runGuidedInit({
-      ask: async () => answers.shift() || "",
+      ask: async () => { throw new Error("默认初始化不应询问非密钥配置"); },
       askSecret: async label => label.includes("方舟") ? "ark-secret" : "feishu-secret",
       createFeishuApp: async () => ({ appId: "cli-2", appSecret: "feishu-secret" }),
       authorizeUser: async () => ({ tokens: { accessToken: "uat", refreshToken: "refresh", expiresAt: 2_000_000_000_000 }, userOpenId: "ou-user" }),

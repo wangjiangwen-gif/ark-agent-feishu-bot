@@ -1,4 +1,5 @@
-import { chmod, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import type { AgentConfig, ArkClient } from "./ark.ts";
 import type { OAuthTokens } from "./oauth.ts";
 import { resolveLarkUserScopes } from "./scopes.ts";
@@ -38,6 +39,7 @@ export async function runGuidedInit(options: {
   createFeishuApp: (userScopes: string[]) => Promise<{ appId: string; appSecret: string; userOpenId?: string }>;
   authorizeUser: (app: { appId: string; appSecret: string }, userScopes: string[]) => Promise<{ tokens: OAuthTokens; userOpenId: string }>;
   envPath?: string;
+  gatewayDatabasePath?: string;
 }): Promise<{ agentId: string; environmentId: string; environmentCreated: boolean; envPath: string }> {
   const arkApiKey = await requiredSecret(options.askSecret, "方舟 API Key");
   const arkBaseUrl = DEFAULT_ARK_BASE_URL;
@@ -62,7 +64,7 @@ export async function runGuidedInit(options: {
 
   // App ID 是 Environment 配置的一部分，因此名称也包含 App ID，避免重跑 init 时误复用旧应用的 Environment。
   const suggestedName = `ark-feishu-${sanitizeName(agent.id)}-${sanitizeName(feishuApp.appId)}`.slice(0, 60);
-  const environmentName = await options.ask("自动创建的 Environment 名称", suggestedName);
+  const environmentName = suggestedName;
 
   let environments = await ark.listEnvironments();
   let environment = environments.find(item => item.name === environmentName);
@@ -92,9 +94,10 @@ export async function runGuidedInit(options: {
     FEISHU_REFRESH_TOKEN: authorization.tokens.refreshToken,
     FEISHU_ACCESS_TOKEN_EXPIRES_AT: String(authorization.tokens.expiresAt),
     LARK_CLI_DOMAINS: larkDomains.split(/[\s,]+/).filter(Boolean).join(","),
-    GATEWAY_DB_PATH: "./data/gateway.db",
+    GATEWAY_DB_PATH: options.gatewayDatabasePath || "./data/gateway.db",
     SESSION_TIMEOUT_MS: "600000"
   });
+  await mkdir(dirname(envPath), { recursive: true, mode: 0o700 });
   await writeFile(envPath, content, { encoding: "utf8", mode: 0o600 });
   await chmod(envPath, 0o600);
   return { agentId: agent.id, environmentId: environment.id, environmentCreated, envPath };
