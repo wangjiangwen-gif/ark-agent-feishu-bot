@@ -48,22 +48,18 @@ npx --yes arkagent@latest init
 
 每次执行 `init` 都会新建一个个人办公助手 Agent，不会搜索或复用已有 Agent。配置会直接覆盖写入 `~/.arkagent/config.env`。
 
-### 3. 检查并启动
+### 3. 开始使用
 
-```bash
-npx --yes arkagent@latest doctor
-npx --yes arkagent@latest
-```
+初始化完成后，CLI 会自动启动 Gateway。看到“Gateway 已启动，正在通过飞书 WebSocket 接收消息”后，在飞书中找到刚创建的应用并发送消息。
+
+以后需要重新启动时运行 `npx --yes arkagent@latest`；需要检查配置时运行 `npx --yes arkagent@latest doctor`。
 
 如果准备长期运行，可以全局安装，之后命令更短：
 
 ```bash
 npm install -g arkagent
 arkagent init
-arkagent
 ```
-
-看到“Gateway 已启动，正在通过飞书 WebSocket 接收消息”后，在飞书中找到刚创建的应用并发送消息。
 
 可以先试：
 

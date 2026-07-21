@@ -136,7 +136,9 @@ async function guidedInit(): Promise<void> {
     });
     console.log(`已创建飞书办公助手 Agent：${result.agentId}`);
     console.log(`${result.environmentCreated ? "已创建" : "已复用"} Environment：${result.environmentId}`);
-    console.log(`配置已安全写入 ${result.envPath}。下一步运行：arkagent doctor`);
+    console.log(`配置已安全写入 ${result.envPath}。`);
+    console.log("初始化完成，正在启动 Gateway…");
+    await run();
   } finally {
     rl?.close();
   }
@@ -159,6 +161,7 @@ async function readMaskedInput(prompt: string): Promise<string> {
     const finish = (error?: Error): void => {
       stdin.off("keypress", onKeypress);
       stdin.setRawMode(false);
+      stdin.pause();
       stdout.write("\n");
       if (error) reject(error);
       else resolve(chars.join(""));
