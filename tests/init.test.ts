@@ -8,7 +8,7 @@ import { OFFICE_AGENT_NAME, runGuidedInit, serializeEnv } from "../src/init.ts";
 test("guided init reuses an environment with the stable name", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-feishu-init-"));
   const envPath = join(dir, ".env");
-    const answers = ["https://ark.example/api/v3", "docs,drive", "ark-feishu-agent-1"];
+    const answers = ["ark-feishu-agent-1"];
   let creates = 0;
   let agentCreates = 0;
   try {
@@ -45,7 +45,7 @@ test("guided init reuses an environment with the stable name", async () => {
 test("guided init creates an environment when no stable match exists", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-feishu-init-"));
   const envPath = join(dir, ".env");
-    const answers = ["https://ark.example/api/v3", "docs,drive", "ark-feishu-agent-2-cli-2"];
+    const answers = ["ark-feishu-agent-2-cli-2"];
   try {
     const result = await runGuidedInit({
       ask: async () => answers.shift() || "",

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { access, chmod, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, readFile, rename, writeFile } from "node:fs/promises";
 import { stdin, stdout } from "node:process";
-import { createInterface } from "node:readline/promises";
-import { Writable } from "node:stream";
+import { emitKeypressEvents } from "node:readline";
+import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig } from "./config.ts";
 
 const command = process.argv[2] || "help";
@@ -41,10 +41,16 @@ async function run(): Promise<void> {
     })().finally(() => { refreshing = undefined; });
     await refreshing;
   };
-  let sendReply: (chatId: string, text: string) => Promise<void> = async () => {
-    throw new Error("飞书客户端尚未就绪");
+  const Lark = await import("@larksuiteoapi/node-sdk");
+  const client = new Lark.Client({ appId: config.feishuAppId, appSecret: config.feishuAppSecret });
+  const sendReply = async (chatId: string, text: string): Promise<void> => {
+    const response = await client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) }
+    });
+    assertLarkResponse(response, "发送文本消息");
   };
-  const gateway = new Gateway(store, ark, (chatId, text) => sendReply(chatId, text), {
+  const gateway = new Gateway(store, ark, sendReply, {
     agentId: config.arkAgentId,
     environmentId: config.arkEnvironmentId,
     vaultId: config.arkVaultId,
@@ -52,16 +58,12 @@ async function run(): Promise<void> {
     beforeCreateSession: ensureCredentialFresh,
     timeoutMs: config.sessionTimeoutMs
   });
-  const Lark = await import("@larksuiteoapi/node-sdk");
-  const client = new Lark.Client({ appId: config.feishuAppId, appSecret: config.feishuAppSecret });
-  sendReply = async (chatId, text) => {
-    await client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) }
-    });
-  };
   await startFeishuGateway({ appId: config.feishuAppId, appSecret: config.feishuAppSecret, gateway });
   console.log("Gateway 已启动，正在通过飞书 WebSocket 接收消息。");
+}
+
+function assertLarkResponse(response: { code?: number; msg?: string }, action: string): void {
+  if (response.code && response.code !== 0) throw new Error(`${action}失败：${response.msg || `code ${response.code}`}`);
 }
 
 async function doctor(): Promise<void> {
@@ -75,29 +77,20 @@ async function doctor(): Promise<void> {
 
 async function guidedInit(): Promise<void> {
   if (!stdin.isTTY) throw new Error("交互式 init 需要在终端中运行");
-  const output = new MutedOutput();
-  const rl = createInterface({ input: stdin, output, terminal: true });
+  let rl: Interface | undefined;
+  const getReadline = (): Interface => {
+    if (!rl) rl = createInterface({ input: stdin, output: stdout, terminal: true });
+    return rl;
+  };
   const ask = async (label: string, defaultValue?: string): Promise<string> => {
     const suffix = defaultValue ? ` [${defaultValue}]` : "";
-    const answer = await rl.question(`${label}${suffix}: `);
+    const answer = await getReadline().question(`${label}${suffix}: `);
     return answer.trim() || defaultValue || "";
   };
   const askSecret = async (label: string): Promise<string> => {
-    stdout.write(`${label}（输入内容不会显示）: `);
-    output.muted = true;
-    const answer = await rl.question("");
-    output.muted = false;
-    stdout.write("\n");
-    return answer;
+    return readMaskedInput(`${label}（输入内容以 • 显示）: `);
   };
   try {
-    if (await fileExists(".env")) {
-      const overwrite = (await ask("检测到已有 .env，是否覆盖", "n")).toLowerCase();
-      if (overwrite !== "y" && overwrite !== "yes") {
-        console.log("已取消，没有修改 .env。");
-        return;
-      }
-    }
     const [{ ArkClient }, { runGuidedInit }, { FeishuOAuth }, Lark, qrModule] = await Promise.all([
       import("./ark.ts"), import("./init.ts"), import("./oauth.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
     ]);
@@ -138,9 +131,42 @@ async function guidedInit(): Promise<void> {
     console.log(`${result.environmentCreated ? "已创建" : "已复用"} Environment：${result.environmentId}`);
     console.log(`配置已安全写入 ${result.envPath}。下一步运行：npm run doctor`);
   } finally {
-    output.muted = false;
-    rl.close();
+    rl?.close();
   }
+}
+
+async function readMaskedInput(prompt: string): Promise<string> {
+  if (!stdin.isTTY || typeof stdin.setRawMode !== "function") throw new Error("安全输入需要在终端中运行");
+  stdout.write(prompt);
+  emitKeypressEvents(stdin);
+  stdin.setRawMode(true);
+  stdin.resume();
+  return new Promise<string>((resolve, reject) => {
+    const chars: string[] = [];
+    const finish = (error?: Error): void => {
+      stdin.off("keypress", onKeypress);
+      stdin.setRawMode(false);
+      stdout.write("\n");
+      if (error) reject(error);
+      else resolve(chars.join(""));
+    };
+    const onKeypress = (value: string, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
+      if (key.ctrl && key.name === "c") return finish(new Error("初始化已取消"));
+      if (key.name === "return" || key.name === "enter") return finish();
+      if (key.name === "backspace") {
+        if (chars.length > 0) {
+          chars.pop();
+          stdout.write("\b \b");
+        }
+        return;
+      }
+      if (key.ctrl || key.meta || !value) return;
+      const input = Array.from(value).filter(char => char >= " " && char !== "\u007f");
+      chars.push(...input);
+      stdout.write("•".repeat(input.length));
+    };
+    stdin.on("keypress", onKeypress);
+  });
 }
 
 async function persistOAuthState(path: string, refreshToken: string, expiresAt: number): Promise<void> {
@@ -160,19 +186,6 @@ async function persistOAuthState(path: string, refreshToken: string, expiresAt: 
 
 function printHelp(): void {
   console.log(`ark-feishu <command>\n\n  init    交互式配置并自动创建 Environment\n  doctor  检查配置并验证方舟 Agent\n  run     启动本地 Gateway`);
-}
-
-async function fileExists(path: string): Promise<boolean> {
-  try { await access(path); return true; } catch { return false; }
-}
-
-class MutedOutput extends Writable {
-  muted = false;
-
-  _write(chunk: Buffer | string, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-    if (!this.muted) stdout.write(chunk, encoding);
-    callback();
-  }
 }
 
 await main();

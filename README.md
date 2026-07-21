@@ -91,7 +91,7 @@ npm start
 | 业务域 | OAuth scopes | 用途 |
 |---|---|---|
 | 基础 | `offline_access`、`auth:user.id:read` | 刷新 token、确认授权用户 |
-| docs | `docx:document`、`docx:document:create` | 创建与操作飞书文档 |
+| docs | `docx:document`、`docx:document:create`、`docx:document:readonly`、`docx:document:write_only` | 创建、回读与更新飞书文档 |
 | drive | `drive:drive`、`drive:file` | 访问云空间文件 |
 
 当前版本只内置 `docs` 与 `drive`。如果办公助手返回 `missing_scopes`，需要扩展 `src/scopes.ts` 后重新运行初始化，以完成应用开通和用户增量授权。
@@ -115,8 +115,8 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 - 单聊中的文本消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
 - 一个飞书会话复用一个 Managed Agents Session；`/new` 显式重置。
-- 新 Session 立即回复处理提示；复用 Session 超过 2.5 秒才发送提示。
-- Agent 调用工具时，Gateway 会发送脱敏后的过程摘要，同类进度至少间隔 5 秒。
+- 新建 Session 会立即回复一次“正在处理”；复用 Session 只有超过 2.5 秒仍未完成时才发送一次提示。
+- Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
 - 图片、文件、富文本与交互卡片暂不处理。
 

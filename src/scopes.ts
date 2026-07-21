@@ -3,7 +3,9 @@ const BASE_SCOPES = ["offline_access", "auth:user.id:read"];
 // 与 lark-cli 的业务域命名对齐。宽权限可能在应用创建页显示“不支持自动开通”，
 // 但会在随后用户 OAuth 的“常用权限包”中完成开通与授权。
 const DOMAIN_SCOPES = {
-  docs: ["docx:document", "docx:document:create"],
+  // lark-cli 的 create/fetch/update 分别校验细粒度 scope。只申请
+  // docx:document + create 会出现“能创建、不能回读或追加”的半可用状态。
+  docs: ["docx:document", "docx:document:create", "docx:document:readonly", "docx:document:write_only"],
   drive: ["drive:drive", "drive:file"]
 };
 

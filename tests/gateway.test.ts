@@ -39,7 +39,7 @@ test("gateway acknowledges quickly, deduplicates, and reuses a session", async (
   store.close();
 });
 
-test("reused slow sessions receive a delayed progress reply", async () => {
+test("reused slow sessions receive one delayed processing reply", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
   let runs = 0;
@@ -62,20 +62,23 @@ test("reused slow sessions receive a delayed progress reply", async () => {
   store.close();
 });
 
-test("gateway streams sanitized Agent progress before the final reply", async () => {
+test("gateway filters Agent tool progress and sends only the final reply", async () => {
   const store = new GatewayStore(":memory:");
   store.saveSession({ tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" }, "session-1", "agent-1");
   const replies: string[] = [];
+  let receivedProgressCallback = false;
   const gateway = new Gateway(store, {
     createSession: async () => "session-1",
     run: async (_sessionId, _text, _timeout, onProgress) => {
+      receivedProgressCallback = Boolean(onProgress);
       await onProgress?.("正在执行：检查 lark-cli");
       return { terminal: "idle" as const, messages: ["可用"] };
     }
   }, async (_chatId, text) => { replies.push(text); }, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000, progressDelayMs: 50 });
   gateway.accept(message());
   await delay(20);
-  assert.deepEqual(replies, ["执行进度：正在执行：检查 lark-cli", "可用"]);
+  assert.equal(receivedProgressCallback, false);
+  assert.deepEqual(replies, ["可用"]);
   store.close();
 });
 

@@ -77,8 +77,6 @@ export class Gateway {
     let sessionId = this.store.getSession(key);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
-    let lastProgress = "";
-    let lastProgressAt = 0;
     if (!sessionId) {
       await this.reply(message.chatId, "已收到，正在处理。首次启动可能需要几分钟。");
       sessionId = await this.ark.createSession(this.options.agentId, this.options.environmentId, [this.options.vaultId]);
@@ -91,14 +89,9 @@ export class Gateway {
       }, this.options.progressDelayMs ?? 2_500);
     }
     try {
-      const result = await this.ark.run(sessionId, message.text, this.options.timeoutMs, async progress => {
-        const now = Date.now();
-        if (progress === lastProgress || now - lastProgressAt < 5_000) return;
-        lastProgress = progress;
-        lastProgressAt = now;
-        if (progressTimer) clearTimeout(progressTimer);
-        await this.reply(message.chatId, `执行进度：${progress}`);
-      });
+      // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result
+      // 转成“执行进度：xxx”消息刷屏。
+      const result = await this.ark.run(sessionId, message.text, this.options.timeoutMs);
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
       await this.reply(message.chatId, resultToReply(result));

@@ -6,6 +6,8 @@ import { resolveLarkUserScopes } from "./scopes.ts";
 export type Ask = (label: string, defaultValue?: string) => Promise<string>;
 
 export const OFFICE_AGENT_NAME = "飞书办公助手（方舟 MA 版）";
+export const DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
+export const DEFAULT_LARK_DOMAINS = "docs,drive";
 
 export const OFFICE_AGENT_CONFIG: AgentConfig = {
   name: OFFICE_AGENT_NAME,
@@ -38,11 +40,11 @@ export async function runGuidedInit(options: {
   envPath?: string;
 }): Promise<{ agentId: string; environmentId: string; environmentCreated: boolean; envPath: string }> {
   const arkApiKey = await requiredSecret(options.askSecret, "方舟 API Key");
-  const arkBaseUrl = await options.ask("方舟 API Base URL", "https://ark.cn-beijing.volces.com/api/v3");
+  const arkBaseUrl = DEFAULT_ARK_BASE_URL;
   const ark = options.createArk(arkApiKey, arkBaseUrl.replace(/\/$/, ""));
   // 个人级初始化每次都创建新的办公助手；创建是非幂等操作，失败后不自动重试。
   const agent = await ark.createAgent(OFFICE_AGENT_CONFIG);
-  const larkDomains = await options.ask("lark-cli 用户权限域（逗号分隔）", "docs,drive");
+  const larkDomains = DEFAULT_LARK_DOMAINS;
   const userScopes = resolveLarkUserScopes(larkDomains);
   const feishuApp = await options.createFeishuApp(userScopes);
   const authorization = await options.authorizeUser(feishuApp, userScopes);
