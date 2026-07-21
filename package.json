@@ -1,0 +1,23 @@
+{
+  "name": "ark-agent-feishu-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ark-feishu": "./src/cli.ts"
+  },
+  "scripts": {
+    "init": "node --env-file-if-exists=.env --experimental-strip-types src/cli.ts init",
+    "start": "node --env-file-if-exists=.env --experimental-strip-types src/cli.ts run",
+    "doctor": "node --env-file-if-exists=.env --experimental-strip-types src/cli.ts doctor",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "check": "node --experimental-strip-types --check src/cli.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/init.ts && node --experimental-strip-types --check src/scopes.ts && node --experimental-strip-types --check src/oauth.ts && node --experimental-strip-types --check src/gateway.ts && node --experimental-strip-types --check src/ark.ts && node --experimental-strip-types --check src/store.ts && node --experimental-strip-types --check src/feishu.ts"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.56.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
