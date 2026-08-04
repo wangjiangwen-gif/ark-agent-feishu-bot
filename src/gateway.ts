@@ -68,18 +68,23 @@ export class Gateway {
       await this.reply(message.chatId, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
     }
-    await this.options.beforeCreateSession?.();
     if (message.text.trim() === "/new") {
       this.store.resetSession(key);
       await this.reply(message.chatId, "已开启新会话，下一条消息会创建新的 Agent Session。");
       return;
     }
+    await this.options.beforeCreateSession?.();
     let sessionId = this.store.getSession(key);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
     if (!sessionId) {
       await this.reply(message.chatId, "已收到，正在处理。首次启动可能需要几分钟。");
-      sessionId = await this.ark.createSession(this.options.agentId, this.options.environmentId, [this.options.vaultId]);
+      sessionId = await this.ark.createSession(
+        this.options.agentId,
+        this.options.environmentId,
+        [this.options.vaultId],
+        { FEISHU_USER_OPEN_ID: message.userOpenId }
+      );
       this.store.saveSession(key, sessionId, this.options.agentId);
     } else {
       progressTimer = setTimeout(() => {
@@ -111,7 +116,7 @@ export function toConversationKey(message: IncomingMessage): ConversationKey {
     tenantKey: message.tenantKey,
     chatId: message.chatId,
     threadId: message.threadId,
-    userOpenId: message.chatType === "p2p" ? message.userOpenId : ""
+    userOpenId: message.userOpenId
   };
 }
 

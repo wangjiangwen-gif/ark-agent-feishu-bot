@@ -57,6 +57,11 @@ export class GatewayStore {
     this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(this.conversationKey(key));
   }
 
+  resetAllSessions(): number {
+    const result = this.db.prepare("DELETE FROM conversations").run();
+    return Number(result.changes);
+  }
+
   claimEvent(eventId: string): boolean {
     const result = this.db.prepare("INSERT OR IGNORE INTO processed_events (event_id, status, updated_at) VALUES (?, 'processing', ?)").run(eventId, new Date().toISOString());
     return Number(result.changes) === 1;

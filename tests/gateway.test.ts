@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
-import { Gateway, resultToReply, shouldHandleMessage, type IncomingMessage } from "../src/gateway.ts";
+import { Gateway, resultToReply, shouldHandleMessage, toConversationKey, type IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
 
 function message(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
@@ -11,6 +11,14 @@ function message(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
 test("group messages require an explicit bot mention", () => {
   assert.equal(shouldHandleMessage(message({ chatType: "group", mentionedBot: false })), false);
   assert.equal(shouldHandleMessage(message({ chatType: "group", mentionedBot: true })), true);
+});
+
+test("group conversations are isolated by the sender open_id", () => {
+  const first = message({ chatType: "group", mentionedBot: true, userOpenId: "ou-user-1" });
+  const second = message({ chatType: "group", mentionedBot: true, userOpenId: "ou-user-2" });
+  const store = new GatewayStore(":memory:");
+  assert.notEqual(store.conversationKey(toConversationKey(first)), store.conversationKey(toConversationKey(second)));
+  store.close();
 });
 
 test("result requires both a successful terminal and a business message", () => {
@@ -40,6 +48,25 @@ test("gateway acknowledges quickly, deduplicates, and reuses a session", async (
   assert.equal(creates, 1);
   assert.equal(runs, 2);
   assert.deepEqual(replies, ["已收到，正在处理。首次启动可能需要几分钟。", "回复", "回复"]);
+  store.close();
+});
+
+test("gateway creates a session bound to the user Vault", async () => {
+  const store = new GatewayStore(":memory:");
+  let sessionVaultIds: string[] | undefined;
+  let sessionEnv: Record<string, string> | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async (_agentId, _environmentId, vaultIds, env) => {
+      sessionVaultIds = vaultIds;
+      sessionEnv = env;
+      return "session-1";
+    },
+    run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
+  }, async () => undefined, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "ou-current-user", timeoutMs: 5_000 });
+  gateway.accept(message({ userOpenId: "ou-current-user" }));
+  await delay(30);
+  assert.deepEqual(sessionVaultIds, ["vlt-1"]);
+  assert.deepEqual(sessionEnv, { FEISHU_USER_OPEN_ID: "ou-current-user" });
   store.close();
 });
 
@@ -93,5 +120,26 @@ test("gateway rejects users other than the authorized user", async () => {
   gateway.accept(message({ userOpenId: "user-2" }));
   await delay(20);
   assert.match(replies[0], /未授权/);
+  store.close();
+});
+
+test("/new resets the session without refreshing an expired credential", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };
+  store.saveSession(key, "session-old", "agent-1");
+  const replies: string[] = [];
+  let refreshAttempts = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => "never",
+    run: async () => ({ terminal: "idle" as const, messages: [] })
+  }, async (_chatId, text) => { replies.push(text); }, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000,
+    beforeCreateSession: async () => { refreshAttempts++; throw new Error("expired"); }
+  });
+  gateway.accept(message({ text: "/new" }));
+  await delay(20);
+  assert.equal(refreshAttempts, 0);
+  assert.equal(store.getSession(key), undefined);
+  assert.match(replies[0], /已开启新会话/);
   store.close();
 });

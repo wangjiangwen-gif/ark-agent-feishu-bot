@@ -58,7 +58,7 @@ export class FeishuOAuth {
       if (error === "slow_down") { interval += 5_000; await delay(interval); continue; }
       throw oauthError(response.status, payload);
     }
-    throw new Error("飞书用户授权已过期，请重新运行 init");
+    throw new Error("飞书用户授权链接已过期，请重新运行 arkagent login；首次使用请运行 arkagent init");
   }
 
   async refresh(refreshToken: string): Promise<OAuthTokens> {

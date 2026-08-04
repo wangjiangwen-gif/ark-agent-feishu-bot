@@ -21,3 +21,16 @@ test("store claims the same Feishu event only once", () => {
   assert.equal(store.claimEvent("event-1"), false);
   store.close();
 });
+
+test("store resets every session without clearing event deduplication", () => {
+  const store = new GatewayStore(":memory:");
+  const anotherKey = { ...key, chatId: "chat-2" };
+  store.saveSession(key, "session-1", "agent-1");
+  store.saveSession(anotherKey, "session-2", "agent-1");
+  assert.equal(store.claimEvent("event-1"), true);
+  assert.equal(store.resetAllSessions(), 2);
+  assert.equal(store.getSession(key), undefined);
+  assert.equal(store.getSession(anotherKey), undefined);
+  assert.equal(store.claimEvent("event-1"), false);
+  store.close();
+});
