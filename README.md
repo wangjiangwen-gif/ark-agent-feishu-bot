@@ -54,6 +54,14 @@ npx --yes arkagent@latest init
 
 以后需要重新启动时运行 `npx --yes arkagent@latest`；需要检查配置时运行 `npx --yes arkagent@latest doctor`。
 
+如果飞书 `refresh_token` 过期，或需要换一个用户重新授权，不要再次初始化。运行：
+
+```bash
+npx --yes arkagent@latest login
+```
+
+`login` 会复用当前 App ID、App Secret、方舟 API Key、Vault 和 Credential，只重新执行一次用户 OAuth，并更新本地 OAuth 状态与 Vault 中的 `user_access_token`。它不会创建新的飞书 App、Agent 或 Environment。由于 Credential 只在 Session 创建时注入，登录成功后会自动废弃全部旧 Session 映射；重启 Gateway 后，下一条消息会创建使用新 token 的 Session。
+
 如果准备长期运行，可以全局安装，之后命令更短：
 
 ```bash
@@ -106,6 +114,7 @@ arkagent init
 | refresh token | `~/.arkagent/config.env` | 换取新的用户 access token |
 | user access token | 方舟 Vault Credential | 仅在 Session 运行时以环境变量注入 |
 | App ID | Environment 环境变量 | 供沙箱内的 `lark-cli` 使用 |
+| 用户 open_id | 创建 Session 时的 Environment 覆写 | 取自当前飞书消息发送者，供 Agent 工具和 MCP 读取本次会话用户身份 |
 
 配置目录权限为 `0700`，配置文件权限为 `0600`；Gateway 数据保存在 `~/.arkagent/gateway.db`。不要在 Agent prompt 或日志中打印凭证。
 
@@ -115,7 +124,8 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 
 - 单聊中的文本消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
-- 一个飞书会话复用一个 Managed Agents Session；`/new` 显式重置。
+- 一个飞书用户在一个飞书会话中复用一个 Managed Agents Session；不同发送者不会复用 Session，`/new` 显式重置。
+- 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
 - 新建 Session 会立即回复一次“正在处理”；复用 Session 只有超过 2.5 秒仍未完成时才发送一次提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
@@ -145,8 +155,9 @@ npm pack --dry-run
 
 | 文件 | 职责 |
 |---|---|
-| `src/cli.ts` | `init`、`doctor`、`run` 命令入口 |
+| `src/cli.ts` | `init`、`login`、`doctor`、`run` 命令入口 |
 | `src/init.ts` | 创建 Agent、Vault Credential、Environment 并写入配置 |
+| `src/login.ts` | 复用现有资源重新授权，并更新本地 OAuth 状态和 Vault Credential |
 | `src/oauth.ts` | 飞书 Device OAuth 与 token 刷新 |
 | `src/feishu.ts` | 飞书 WebSocket 事件接入与消息归一化 |
 | `src/gateway.ts` | 去重、Session 复用、进度与最终回复 |

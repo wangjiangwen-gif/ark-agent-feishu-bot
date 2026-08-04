@@ -24,6 +24,11 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
     const path = String(url).replace("https://ark.example/api/v3", "");
     calls.push({ path, method: init?.method || "GET", body: init?.body ? JSON.parse(String(init.body)) : undefined });
     if (path === "/environments") return new Response(JSON.stringify({ id: "env-1", name: "env" }), { status: 200 });
+    if (path === "/environments/env-1") return new Response(JSON.stringify({ id: "env-1", config: {
+      type: "cloud", networking: { type: "unrestricted" },
+      env: { LARKSUITE_CLI_APP_ID: "cli-1", KEEP_ME: "yes" },
+      setup_script: "setup"
+    } }), { status: 200 });
     if (path === "/vaults") return new Response(JSON.stringify({ id: "vlt-1" }), { status: 200 });
     if (path.endsWith("/credentials")) return new Response(JSON.stringify({ id: "vcrd-1" }), { status: 200 });
     if (path.endsWith("/credentials/vcrd-1")) return new Response(JSON.stringify({ id: "vcrd-1" }), { status: 200 });
@@ -33,7 +38,7 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
   const vault = await client.createVault("vault");
   const credential = await client.createEnvironmentCredential(vault, "token", "uat");
   await client.updateEnvironmentCredential(vault, credential, "uat-2");
-  await client.createSession("agent-1", "env-1", [vault]);
+  await client.createSession("agent-1", "env-1", [vault], { FEISHU_USER_OPEN_ID: "ou-message-user" });
   assert.deepEqual(calls[0].body, {
     name: "env",
     config: {
@@ -42,7 +47,20 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
       setup_script: "set -e\nnpm install -g @larksuite/cli\nlark-cli --version"
     }
   });
-  assert.deepEqual(calls.at(-1)?.body, { agent: "agent-1", environment_id: "env-1", vault_ids: ["vlt-1"] });
+  assert.deepEqual(calls.at(-1)?.body, {
+    agent: "agent-1",
+    environment: {
+      id: "env-1",
+      type: "environment_with_overrides",
+      config: {
+        type: "cloud", networking: { type: "unrestricted" },
+        env: { LARKSUITE_CLI_APP_ID: "cli-1", KEEP_ME: "yes", FEISHU_USER_OPEN_ID: "ou-message-user" },
+        setup_script: "setup"
+      }
+    },
+    vault_ids: ["vlt-1"]
+  });
+  assert.equal(calls.at(-1)?.body?.environment_id, undefined);
 });
 
 test("Ark creates an office Agent with the requested tools and system prompt", async () => {
@@ -76,4 +94,24 @@ test("resultFromEvents only recovers a terminal result from the current run", ()
     { type: "session.status_idle", processed_at: "2026-07-21T17:00:02+08:00" }
   ], since);
   assert.deepEqual(result, { terminal: "idle", messages: ["新回复"] });
+});
+
+test("run establishes SSE before sending the user message", async () => {
+  const calls: string[] = [];
+  const client = new ArkClient("key", "https://ark.example/api/v3", async url => {
+    const path = String(url).replace("https://ark.example/api/v3", "");
+    calls.push(path);
+    if (path.endsWith("/events/stream")) {
+      return new Response([
+        'data: {"type":"agent.message","content":[{"type":"text","text":"完成"}]}',
+        "",
+        'data: {"type":"session.status_idle"}',
+        ""
+      ].join("\n"), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
+    return new Response("{}", { status: 200 });
+  });
+  const result = await client.run("session-1", "你好", 5_000);
+  assert.deepEqual(calls, ["/sessions/session-1/events/stream", "/sessions/session-1/events"]);
+  assert.deepEqual(result, { terminal: "idle", messages: ["完成"] });
 });

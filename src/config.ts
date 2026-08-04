@@ -38,3 +38,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     sessionTimeoutMs
   };
 }
+
+export function loadConfigFile(path: string, env: NodeJS.ProcessEnv = process.env): void {
+  // process.loadEnvFile 不覆盖已存在的变量；login 后若终端仍残留旧 token，
+  // Gateway 会继续使用旧值。保存的配置是 arkagent 的权威状态，必须显式覆盖。
+  Object.assign(env, parseEnv(readFileSync(path, "utf8")));
+}
+import { readFileSync } from "node:fs";
+import { parseEnv } from "node:util";

@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "ArkAgent 当前完整流量架构",
+    "subtitle": "飞书用户消息经 Gateway、Managed Agents、lark-cli/MCP 执行后返回飞书",
+    "output": "docs/current-traffic-sequence.html",
+    "viewBox": [1040, 1040],
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "init", "label": "初始化与授权", "focus": ["user", "cli", "session", "feishu"], "note": "API Key、两次扫码、Agent/Environment/Vault 与本地配置建立。" },
+      { "id": "message", "label": "消息进入 Gateway", "focus": ["user", "feishu", "gateway", "session"], "note": "飞书事件携带 open_id，Gateway 做鉴权、会话映射和快速确认。" },
+      { "id": "tools", "label": "Agent 调用工具", "focus": ["session", "agent", "lark", "mcp", "vault"], "note": "Session 创建时注入当前 open_id；Vault 提供 user_access_token。" },
+      { "id": "reply", "label": "结果返回飞书", "focus": ["agent", "session", "gateway", "feishu", "user"], "note": "Gateway 消费 Session 事件，只发送最终业务回复。" }
+    ]
+  },
+  "participants": [
+    { "id": "user", "type": "external", "label": "飞书用户", "sublabel": "扫码授权 / 发消息" },
+    { "id": "feishu", "type": "cloud", "label": "飞书平台", "sublabel": "Bot + WebSocket 事件" },
+    { "id": "cli", "type": "frontend", "label": "arkagent CLI", "sublabel": "init / start" },
+    { "id": "gateway", "type": "backend", "label": "本地 Gateway", "sublabel": "鉴权 + 路由 + 回复" },
+    { "id": "session", "type": "messagebus", "label": "MA Session", "sublabel": "事件流 / 状态机" },
+    { "id": "agent", "type": "cloud", "label": "Managed Agent", "sublabel": "推理 + 工具编排" },
+    { "id": "lark", "type": "backend", "label": "lark-cli", "sublabel": "Environment / 用户身份" },
+    { "id": "mcp", "type": "backend", "label": "自定义 MCP", "sublabel": "外部工具服务" },
+    { "id": "vault", "type": "security", "label": "Vault", "sublabel": "user_access_token" }
+  ],
+  "segments": [
+    { "from": 150, "to": 315, "label": "01 / 初始化" },
+    { "from": 335, "to": 555, "label": "02 / 消息接入" },
+    { "from": 575, "to": 825, "label": "03 / Agent 执行" },
+    { "from": 845, "to": 995, "label": "04 / 回复" }
+  ],
+  "messages": [
+    { "id": "scan-app", "from": "user", "to": "cli", "y": 180, "label": "扫码创建飞书 App", "variant": "security" },
+    { "id": "scan-user", "from": "user", "to": "cli", "y": 220, "label": "扫码授权用户身份", "variant": "security" },
+    { "id": "create-resources", "from": "cli", "to": "session", "y": 260, "label": "创建 / 复用 Agent + Environment + Vault", "variant": "emphasis" },
+    { "id": "persist-config", "from": "cli", "to": "gateway", "y": 300, "label": "写入本地 .env（密钥不展示）", "variant": "dashed" },
+    { "id": "receive-event", "from": "feishu", "to": "gateway", "y": 365, "label": "im.message.receive_v1 + open_id", "variant": "emphasis" },
+    { "id": "ack", "from": "gateway", "to": "feishu", "y": 405, "label": "快速确认已收到", "variant": "return" },
+    { "id": "create-session", "from": "gateway", "to": "session", "y": 455, "label": "创建 Session + env.FEISHU_USER_OPEN_ID", "variant": "security" },
+    { "id": "vault-bind", "from": "session", "to": "vault", "y": 495, "label": "绑定 Vault", "variant": "security" },
+    { "id": "user-message", "from": "gateway", "to": "session", "y": 535, "label": "user.message（文本）", "variant": "emphasis" },
+    { "id": "run-agent", "from": "session", "to": "agent", "y": 615, "label": "运行 Agent", "variant": "emphasis" },
+    { "id": "token-inject", "from": "vault", "to": "lark", "y": 660, "label": "注入 LARKSUITE_CLI_USER_ACCESS_TOKEN", "variant": "security" },
+    { "id": "lark-call", "from": "agent", "to": "lark", "y": 705, "label": "调用 lark-cli（open_id 环境变量）", "variant": "default" },
+    { "id": "mcp-call", "from": "agent", "to": "mcp", "y": 750, "label": "调用自定义 MCP", "variant": "default" },
+    { "id": "tool-result", "from": "mcp", "to": "agent", "y": 795, "label": "工具结果", "variant": "return" },
+    { "id": "agent-result", "from": "agent", "to": "session", "y": 865, "label": "agent.message + terminal status", "variant": "return" },
+    { "id": "stream-events", "from": "session", "to": "gateway", "y": 905, "label": "SSE 事件流（只取最终回复）", "variant": "emphasis" },
+    { "id": "send-reply", "from": "gateway", "to": "feishu", "y": 945, "label": "发送最终文本消息", "variant": "emphasis" },
+    { "id": "show-reply", "from": "feishu", "to": "user", "y": 950, "label": "用户看到结果", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "cli", "from": 175, "to": 310, "type": "frontend" },
+    { "participant": "gateway", "from": 350, "to": 920, "type": "backend" },
+    { "participant": "session", "from": 445, "to": 875, "type": "messagebus" },
+    { "participant": "agent", "from": 605, "to": 810, "type": "cloud" },
+    { "participant": "vault", "from": 485, "to": 675, "type": "security" },
+    { "participant": "lark", "from": 650, "to": 725, "type": "backend" },
+    { "participant": "mcp", "from": 745, "to": 805, "type": "backend" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "身份链路", "items": ["open_id 来源于飞书消息事件", "Session 创建时写入 FEISHU_USER_OPEN_ID", "当前授权校验仍是单用户模式"] },
+    { "dot": "orange", "title": "凭证链路", "items": ["App Secret 仅保存在本地用于刷新 token", "user_access_token 存储在 MA Vault Credential", "刷新后 Gateway 更新 Vault Credential"] },
+    { "dot": "emerald", "title": "MCP 边界", "items": ["MA 到 MCP 的 open_id 不是公开契约中的自动透传字段", "当前 MCP 可读取 Environment 中的 open_id", "多用户场景应升级为上下文代理或短期 context token"] }
+  ]
+}

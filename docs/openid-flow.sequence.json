@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "open_id 端到端流转时序",
+    "subtitle": "飞书事件 → Gateway → Managed Agents Session → Agent → MCP",
+    "output": "docs/openid-flow.html",
+    "viewBox": [720, 760],
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "trusted-ingress",
+        "label": "可信身份入口",
+        "focus": ["feishu", "gateway"],
+        "note": "Gateway 从飞书签名事件中读取 sender.sender_id.open_id，并完成用户鉴权。"
+      },
+      {
+        "id": "session-injection",
+        "label": "Session 环境注入",
+        "focus": ["gateway", "session", "agent"],
+        "note": "创建 Session 时把 open_id 写入 env.FEISHU_USER_OPEN_ID，供 Session 的工具运行环境读取。"
+      },
+      {
+        "id": "mcp-boundary",
+        "label": "MCP 透传边界",
+        "focus": ["agent", "mcp"],
+        "note": "远程 MCP 不会自动继承 Session 环境变量，必须在工具参数或可信 Header 中显式携带。"
+      }
+    ]
+  },
+  "participants": [
+    { "id": "feishu", "type": "cloud", "label": "飞书事件", "sublabel": "平台侧" },
+    { "id": "gateway", "type": "backend", "label": "Gateway", "sublabel": "客户侧" },
+    { "id": "session", "type": "cloud", "label": "MA Session", "sublabel": "平台侧" },
+    { "id": "agent", "type": "cloud", "label": "Agent", "sublabel": "平台侧" },
+    { "id": "mcp", "type": "backend", "label": "MCP", "sublabel": "客户侧" }
+  ],
+  "segments": [
+    { "from": 150, "to": 305, "label": "01 / 获取身份" },
+    { "from": 325, "to": 505, "label": "02 / 注入 Session" },
+    { "from": 525, "to": 670, "label": "03 / 传入 MCP" }
+  ],
+  "messages": [
+    {
+      "id": "event-with-openid",
+      "from": "feishu",
+      "to": "gateway",
+      "y": 190,
+      "label": "im.message.receive_v1",
+      "variant": "emphasis",
+      "note": "event.sender.sender_id.open_id = ou_xxx"
+    },
+    {
+      "id": "verify-openid",
+      "from": "gateway",
+      "to": "feishu",
+      "y": 245,
+      "label": "确认事件来源 / 用户身份",
+      "variant": "security",
+      "note": "Gateway 将 open_id 作为可信调用者身份使用"
+    },
+    {
+      "id": "create-session-with-env",
+      "from": "gateway",
+      "to": "session",
+      "y": 355,
+      "label": "POST /sessions",
+      "variant": "security",
+      "note": "env.FEISHU_USER_OPEN_ID = ou_xxx"
+    },
+    {
+      "id": "start-agent-runtime",
+      "from": "session",
+      "to": "agent",
+      "y": 420,
+      "label": "启动 Agent / 工具运行环境",
+      "variant": "emphasis",
+      "note": "工具进程可读取 FEISHU_USER_OPEN_ID"
+    },
+    {
+      "id": "send-user-message",
+      "from": "gateway",
+      "to": "session",
+      "y": 475,
+      "label": "user.message",
+      "variant": "default",
+      "note": "消息正文不需要重复携带 open_id"
+    },
+    {
+      "id": "call-mcp-with-openid",
+      "from": "agent",
+      "to": "mcp",
+      "y": 565,
+      "label": "调用 MCP + 显式传递 open_id",
+      "variant": "security",
+      "note": "远程 MCP 需通过工具参数或可信 Header 接收；不会自动继承 Session env"
+    },
+    {
+      "id": "mcp-result",
+      "from": "mcp",
+      "to": "agent",
+      "y": 625,
+      "label": "按 open_id 执行业务并返回结果",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    { "participant": "gateway", "from": 185, "to": 490, "type": "backend" },
+    { "participant": "session", "from": 350, "to": 500, "type": "cloud" },
+    { "participant": "agent", "from": 415, "to": 640, "type": "cloud" },
+    { "participant": "mcp", "from": 560, "to": 635, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "当前已实现",
+      "items": [
+        "Gateway 从飞书事件读取 sender.sender_id.open_id",
+        "创建 Session 时注入 env.FEISHU_USER_OPEN_ID",
+        "同一 Session 后续消息复用创建时的 open_id"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "MCP 边界",
+      "items": [
+        "Session 环境变量不会天然出现在远程 MCP 服务中",
+        "远程 MCP 需要 Agent 在工具参数或 Gateway/MCP Proxy Header 中显式透传",
+        "MCP 应校验调用来源，不能只信任模型生成的 open_id"
+      ]
+    }
+  ]
+}

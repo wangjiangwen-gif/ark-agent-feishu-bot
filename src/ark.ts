@@ -16,11 +16,21 @@ export type AgentConfig = {
   metadata?: Record<string, string>;
 };
 
+export type EnvironmentConfig = {
+  type: string;
+  env?: Record<string, string>;
+  networking?: Record<string, unknown>;
+  packages?: Record<string, unknown>;
+  setup_script?: string;
+  [key: string]: unknown;
+};
+
 export class ArkClient {
   private apiKey: string;
   private baseUrl: string;
 
   private fetcher: typeof fetch;
+  private environmentConfigs = new Map<string, EnvironmentConfig>();
 
   constructor(apiKey: string, baseUrl: string, fetcher: typeof fetch = fetch) {
     this.apiKey = apiKey;
@@ -145,8 +155,34 @@ export class ArkClient {
     });
   }
 
-  async createSession(agentId: string, environmentId: string, vaultIds: string[] = []): Promise<string> {
-    const response = await this.request("/sessions", { method: "POST", body: JSON.stringify({ agent: agentId, environment_id: environmentId, ...(vaultIds.length ? { vault_ids: vaultIds } : {}) }) });
+  async getEnvironmentConfig(environmentId: string): Promise<EnvironmentConfig> {
+    const cached = this.environmentConfigs.get(environmentId);
+    if (cached) return cached;
+    const response = await this.request(`/environments/${encodeURIComponent(environmentId)}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const data = (payload.data || payload) as Record<string, unknown>;
+    const config = data.config as EnvironmentConfig | undefined;
+    if (!config || typeof config !== "object" || typeof config.type !== "string") throw new Error("Environment 响应缺少有效 config");
+    this.environmentConfigs.set(environmentId, config);
+    return config;
+  }
+
+  async createSession(agentId: string, environmentId: string, vaultIds: string[] = [], envOverrides: Record<string, string> = {}): Promise<string> {
+    const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(environmentId) : undefined;
+    const response = await this.request("/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        agent: agentId,
+        ...(environmentConfig ? {
+          environment: {
+            id: environmentId,
+            type: "environment_with_overrides",
+            config: { ...environmentConfig, env: { ...(environmentConfig.env || {}), ...envOverrides } }
+          }
+        } : { environment_id: environmentId }),
+        ...(vaultIds.length ? { vault_ids: vaultIds } : {})
+      })
+    });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
     const id = String(data.id || data.session_id || "");
@@ -163,13 +199,16 @@ export class ArkClient {
 
   async run(sessionId: string, text: string, timeoutMs: number, onProgress?: (progress: string) => Promise<void>): Promise<RunResult> {
     const startedAt = Date.now();
-    await this.sendMessage(sessionId, text);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
     const messages: string[] = [];
     const seen = new Set<string>();
     try {
-      for await (const event of this.streamEvents(sessionId, controller.signal)) {
+      // 先建立事件流再发送消息，避免快速完成的 Agent 在 SSE 订阅建立前
+      // 已经产生 message + idle，导致 Gateway 永久等待下一条事件。
+      const eventStream = await this.openEventStream(sessionId, controller.signal);
+      await this.sendMessage(sessionId, text);
+      for await (const event of eventStream) {
         if (event.id && seen.has(event.id)) continue;
         if (event.id) seen.add(event.id);
         if (event.type === "agent.message") {
@@ -206,13 +245,22 @@ export class ArkClient {
   }
 
   async *streamEvents(sessionId: string, signal: AbortSignal): AsyncGenerator<ArkEvent> {
+    yield* await this.openEventStream(sessionId, signal);
+  }
+
+  private async openEventStream(sessionId: string, signal: AbortSignal): Promise<AsyncGenerator<ArkEvent>> {
     const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}/events/stream`, {
       headers: { Accept: "text/event-stream", Authorization: `Bearer ${this.apiKey}` }, signal
     });
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
+    return parseEventStream(response.body);
+  }
+}
+
+async function* parseEventStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ArkEvent> {
     const decoder = new TextDecoder();
     let buffer = "";
-    for await (const chunk of response.body) {
+    for await (const chunk of body) {
       buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
       const parsed = drainEventBuffer(buffer);
       buffer = parsed.rest;
@@ -220,7 +268,6 @@ export class ArkClient {
     }
     const tail = buffer.trim();
     if (tail) for (const event of parseEventBlock(tail)) yield event;
-  }
 }
 
 function responseId(payload: unknown, resource: string): string {

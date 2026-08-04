@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { chmod, readFile, rename, writeFile } from "node:fs/promises";
-import { loadEnvFile, stdin, stdout } from "node:process";
+import { stdin, stdout } from "node:process";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface, type Interface } from "node:readline/promises";
-import { loadConfig } from "./config.ts";
+import { loadConfig, loadConfigFile } from "./config.ts";
+import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths } from "./paths.ts";
 
 const command = process.argv[2] || "run";
@@ -14,6 +14,7 @@ async function main(): Promise<void> {
     if (command === "run") await run();
     else if (command === "doctor") await doctor();
     else if (command === "init") await guidedInit();
+    else if (command === "login") await login();
     else printHelp();
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
@@ -40,7 +41,7 @@ async function run(): Promise<void> {
     if (!refreshing) refreshing = (async () => {
       tokens = await oauth.refresh(tokens.refreshToken);
       await ark.updateEnvironmentCredential(config.arkVaultId, config.arkCredentialId, tokens.accessToken);
-      await persistOAuthState(paths.configPath, tokens.refreshToken, tokens.expiresAt);
+      await persistOAuthState(paths.configPath, tokens);
     })().finally(() => { refreshing = undefined; });
     await refreshing;
   };
@@ -61,8 +62,18 @@ async function run(): Promise<void> {
     beforeCreateSession: ensureCredentialFresh,
     timeoutMs: config.sessionTimeoutMs
   });
+  console.log("Gateway 配置：");
+  console.log(`- 飞书 App ID：${config.feishuAppId}`);
+  console.log(`- 方舟 Agent ID：${config.arkAgentId}`);
+  console.log(`- 方舟 Environment ID：${config.arkEnvironmentId}`);
+  console.log(`- 授权用户 open_id：${maskIdentity(config.feishuUserOpenId)}`);
+  console.log("正在连接飞书 WebSocket；请在该 App 对应的 Bot 会话中发送消息。");
   await startFeishuGateway({ appId: config.feishuAppId, appSecret: config.feishuAppSecret, gateway });
-  console.log("Gateway 已启动，正在通过飞书 WebSocket 接收消息。");
+}
+
+function maskIdentity(value: string): string {
+  if (value.length <= 8) return "***";
+  return `${value.slice(0, 5)}***${value.slice(-3)}`;
 }
 
 function assertLarkResponse(response: { code?: number; msg?: string }, action: string): void {
@@ -77,6 +88,43 @@ async function doctor(): Promise<void> {
   const agent = await ark.getAgent(config.arkAgentId);
   console.log(`配置有效；已连接 Agent ${agent.id}${agent.version ? ` v${agent.version}` : ""}。`);
   console.log("飞书连接将在 run 命令启动时由官方 SDK 完成鉴权。");
+}
+
+async function login(): Promise<void> {
+  const paths = loadSavedEnvironment();
+  const config = loadConfig();
+  const [{ ArkClient }, { FeishuOAuth }, { runLoginFlow }, { resolveLarkUserScopes }, { DEFAULT_LARK_DOMAINS }, { GatewayStore }, qrModule] = await Promise.all([
+    import("./ark.ts"), import("./oauth.ts"), import("./login.ts"), import("./scopes.ts"), import("./init.ts"), import("./store.ts"), import("qrcode-terminal")
+  ]);
+  const qr = qrModule.default || qrModule;
+  const oauth = new FeishuOAuth(config.feishuAppId, config.feishuAppSecret);
+  const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
+  const domains = process.env.LARK_CLI_DOMAINS || DEFAULT_LARK_DOMAINS;
+  const scopes = resolveLarkUserScopes(domains);
+  console.log(`正在复用飞书 App ${config.feishuAppId} 重新授权，不会创建新的 App、Agent 或 Environment。`);
+  const result = await runLoginFlow({
+    oauth,
+    ark,
+    vaultId: config.arkVaultId,
+    credentialId: config.arkCredentialId,
+    configPath: paths.configPath,
+    scopes,
+    onAuthorizationReady: device => {
+      console.log("请使用飞书扫码，重新授权 lark-cli 以你的用户身份访问飞书：");
+      qr.generate(device.verificationUrl, { small: true });
+      console.log(`如果二维码无法扫描，请打开：${device.verificationUrl}`);
+      const expiresIn = Math.max(0, Math.ceil((device.expiresAt - Date.now()) / 1000));
+      console.log(`链接将在约 ${expiresIn} 秒后失效。`);
+    },
+    invalidateSessions: () => {
+      const store = new GatewayStore(config.databasePath);
+      try { return store.resetAllSessions(); }
+      finally { store.close(); }
+    }
+  });
+  console.log(`登录完成；授权用户 open_id：${maskIdentity(result.userOpenId)}`);
+  console.log(`本地 OAuth 状态和方舟 Vault Credential 已更新；已废弃 ${result.invalidatedSessions} 个旧 Session 映射。`);
+  console.log("请重启正在运行的 Gateway，或运行 arkagent 启动；下一条消息会创建新 Session。");
 }
 
 async function guidedInit(): Promise<void> {
@@ -146,7 +194,7 @@ async function guidedInit(): Promise<void> {
 
 function loadSavedEnvironment(): ReturnType<typeof getArkagentPaths> {
   const paths = getArkagentPaths();
-  if (existsSync(paths.configPath)) loadEnvFile(paths.configPath);
+  if (existsSync(paths.configPath)) loadConfigFile(paths.configPath);
   return paths;
 }
 
@@ -185,23 +233,8 @@ async function readMaskedInput(prompt: string): Promise<string> {
   });
 }
 
-async function persistOAuthState(path: string, refreshToken: string, expiresAt: number): Promise<void> {
-  let content = await readFile(path, "utf8");
-  const replace = (key: string, value: string): void => {
-    const line = `${key}=${JSON.stringify(value)}`;
-    const pattern = new RegExp(`^${key}=.*$`, "m");
-    content = pattern.test(content) ? content.replace(pattern, line) : `${content.trimEnd()}\n${line}\n`;
-  };
-  replace("FEISHU_REFRESH_TOKEN", refreshToken);
-  replace("FEISHU_ACCESS_TOKEN_EXPIRES_AT", String(expiresAt));
-  const temp = `${path}.tmp`;
-  await writeFile(temp, content, { encoding: "utf8", mode: 0o600 });
-  await chmod(temp, 0o600);
-  await rename(temp, path);
-}
-
 function printHelp(): void {
-  console.log(`arkagent [command]\n\n  init    交互式认领办公助手\n  doctor  检查配置并验证方舟 Agent\n  run     启动本地 Gateway（默认）`);
+  console.log(`arkagent [command]\n\n  init    交互式认领办公助手\n  login   复用当前 App 重新执行用户 OAuth\n  doctor  检查配置并验证方舟 Agent\n  run     启动本地 Gateway（默认）`);
 }
 
 await main();
