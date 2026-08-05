@@ -109,6 +109,20 @@ class ArkClient:
         version = data.get("version")
         return {"id": ident, "name": str(data.get("name") or config.get("name", "")), "version": None if version is None else str(version)}
 
+    async def update_agent(self, agent_id: str, config: dict, version: int) -> dict:
+        """原地更新 Agent（生成新版本，Agent ID 不变）。方舟的更新语义是 POST 到具体资源
+        （POST /agents/{id}，非 PUT/PATCH——后两者返回 404）；body 须携带当前 version，
+        不匹配则更新失败——用于改 system prompt / tools / mcp_servers 而无需新建 Agent。"""
+        body = {**config, "version": version}
+        payload = await self._request("POST", f"/agents/{quote(agent_id, safe='')}", body)
+        data = _unwrap(payload)
+        new_version = data.get("version")
+        return {
+            "id": str(data.get("id") or agent_id),
+            "name": str(data.get("name") or config.get("name", "")),
+            "version": None if new_version is None else str(new_version),
+        }
+
     # ---- environments ----
     async def list_environments(self) -> list[dict]:
         payload = await self._request("GET", "/environments?limit=100")

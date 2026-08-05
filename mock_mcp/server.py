@@ -51,16 +51,46 @@ def build_server() -> FastMCP:
 
     @server.tool(description="查询指定用户（open_id）的销售线索与业绩看板；只能查自己有权限的数据。")
     def get_my_sales_data(open_id: str) -> str:
+        # 卡点 B 证据：完整打印透传进来的 open_id 与白名单命中结果（open_id 非密钥，故不掩码）。
         if not data.is_authorized(open_id):
+            logger.warning("[MCP] 工具 get_my_sales_data  open_id=%s  ❌ 不在白名单，拒绝返回数据", open_id or "<空>")
             return json.dumps({"error": "unauthorized", "message": f"open_id {open_id} 不在白名单，无权访问"}, ensure_ascii=False)
-        return json.dumps(data.get_user_bucket(open_id), ensure_ascii=False)
+        bucket = data.get_user_bucket(open_id)
+        logger.info("[MCP] 工具 get_my_sales_data  open_id=%s  ✅ 命中白名单 → %s（%s）",
+                    open_id, bucket.get("name", "?"), bucket.get("role", "?"))
+        return json.dumps(bucket, ensure_ascii=False)
 
     @server.tool(description="查询蔚来车型的定位、续航与卖点，用于话术与客户答疑。")
     def get_vehicle_info(model: str) -> str:
         info = data.VEHICLE_CATALOG.get(model.upper())
         if not info:
+            logger.warning("[MCP] 工具 get_vehicle_info  model=%s  ❌ 未找到车型", model)
             return json.dumps({"error": "not_found", "message": f"未找到车型 {model}", "available": list(data.VEHICLE_CATALOG)}, ensure_ascii=False)
+        logger.info("[MCP] 工具 get_vehicle_info  model=%s  ✅ 命中车型库", model.upper())
         return json.dumps({"model": model.upper(), **info}, ensure_ascii=False)
+
+    @server.tool(description="查询本门店团队销售漏斗（各阶段数量与成员业绩）；仅销售经理有权查看，普通顾问会被拒绝。")
+    def get_team_pipeline(open_id: str) -> str:
+        # 卡点 C 硬拦截：权限以后端 data.permissions 为权威源，不认对话层声称的岗位。
+        if not data.is_authorized(open_id):
+            logger.warning("[MCP] 工具 get_team_pipeline  open_id=%s  ❌ 不在白名单，拒绝", open_id or "<空>")
+            return json.dumps({"error": "unauthorized", "message": f"open_id {open_id} 不在白名单，无权访问"}, ensure_ascii=False)
+        if not data.has_permission(open_id, data.PERM_VIEW_TEAM_PIPELINE):
+            bucket = data.get_user_bucket(open_id)
+            logger.warning("[MCP] 工具 get_team_pipeline  open_id=%s（%s/%s）  ❌ 无 view_team_pipeline 权限，后端拒绝",
+                           open_id, bucket.get("name", "?"), bucket.get("role", "?"))
+            return json.dumps({
+                "error": "forbidden",
+                "message": f"{bucket.get('role', '当前岗位')}无权查看团队销售漏斗，仅销售经理可查。",
+            }, ensure_ascii=False)
+        bucket = data.get_user_bucket(open_id)
+        pipeline = data.get_team_pipeline_for_store(bucket.get("store", ""))
+        if not pipeline:
+            logger.warning("[MCP] 工具 get_team_pipeline  open_id=%s  ❌ 门店 %s 无漏斗数据", open_id, bucket.get("store"))
+            return json.dumps({"error": "not_found", "message": f"门店 {bucket.get('store')} 无漏斗数据"}, ensure_ascii=False)
+        logger.info("[MCP] 工具 get_team_pipeline  open_id=%s（%s/%s）  ✅ 权限校验通过 → 返回 %s 漏斗",
+                    open_id, bucket.get("name", "?"), bucket.get("role", "?"), bucket.get("store"))
+        return json.dumps(pipeline, ensure_ascii=False)
 
     return server
 

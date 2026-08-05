@@ -38,6 +38,66 @@ async def test_get_vehicle_info_known_and_unknown():
     assert json.loads(unknown)["error"] == "not_found"
 
 
+# ---- 卡点 C: 后端硬拦截（权限以 data.permissions 为权威源） ----
+def test_has_permission_authoritative():
+    assert data.has_permission("ou-demo-manager", data.PERM_VIEW_TEAM_PIPELINE) is True
+    assert data.has_permission("ou-demo-sales", data.PERM_VIEW_TEAM_PIPELINE) is False
+    assert data.has_permission("ou-nobody", data.PERM_VIEW_TEAM_PIPELINE) is False
+
+
+async def test_team_pipeline_allowed_for_manager():
+    server = build_server()
+    ok = await _call_tool(server, "get_team_pipeline", {"open_id": "ou-demo-manager"})
+    payload = json.loads(ok)
+    assert payload["store"] == "上海浦东蔚来中心"
+    assert any(s["stage"] == "下定" for s in payload["funnel"])
+
+
+async def test_team_pipeline_forbidden_for_consultant():
+    server = build_server()
+    denied = await _call_tool(server, "get_team_pipeline", {"open_id": "ou-demo-sales"})
+    payload = json.loads(denied)
+    # 后端硬拦截：顾问即使声称是经理也拿不到，返回 forbidden 而非数据
+    assert payload["error"] == "forbidden"
+    assert "funnel" not in payload
+
+
+async def test_team_pipeline_unauthorized_for_unknown():
+    server = build_server()
+    denied = await _call_tool(server, "get_team_pipeline", {"open_id": "ou-nobody"})
+    assert json.loads(denied)["error"] == "unauthorized"
+
+
+async def test_team_pipeline_logs_permission_decision(caplog):
+    server = build_server()
+    with caplog.at_level(logging.WARNING, logger="mock_mcp"):
+        await _call_tool(server, "get_team_pipeline", {"open_id": "ou-demo-sales"})
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ou-demo-sales" in logged
+    assert "view_team_pipeline" in logged
+    assert "后端拒绝" in logged
+
+
+# ---- 卡点 B: 工具层证据日志（open_id 完整、命中/未命中） ----
+async def test_sales_tool_logs_openid_and_hit(caplog):
+    server = build_server()
+    with caplog.at_level(logging.INFO, logger="mock_mcp"):
+        await _call_tool(server, "get_my_sales_data", {"open_id": "ou-demo-manager"})
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "get_my_sales_data" in logged
+    assert "ou-demo-manager" in logged  # open_id 完整打印，不掩码
+    assert "王经理" in logged
+
+
+async def test_sales_tool_logs_openid_when_denied(caplog):
+    server = build_server()
+    with caplog.at_level(logging.WARNING, logger="mock_mcp"):
+        await _call_tool(server, "get_my_sales_data", {"open_id": "ou-nobody"})
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ou-nobody" in logged
+    assert "不在白名单" in logged
+
+
 # ---- 卡点 A: Bearer 中间件 ----
 def test_missing_bearer_is_rejected():
     app = build_app(token="secret-token")

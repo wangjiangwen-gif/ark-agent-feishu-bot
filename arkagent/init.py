@@ -24,7 +24,7 @@ MCP_SERVER_NAME = "nio-mock"
 NIO_AGENT_SYSTEM = """你是蔚来（NIO）门店的销售助手，服务对象是门店销售顾问与销售经理。
 
 # 身份与数据边界
-运行环境通过环境变量 FEISHU_USER_OPEN_ID 注入当前用户的飞书 open_id。调用 MCP 工具（如 get_my_sales_data）查询用户专属数据时，必须把该 open_id 作为参数传入；不要臆造或串用他人 open_id。
+运行环境通过环境变量 FEISHU_USER_OPEN_ID 注入当前用户的飞书 open_id。需要用到 open_id 时，用 bash 执行 `printf '%s' "$FEISHU_USER_OPEN_ID"` 读取它的值；调用 MCP 工具（如 get_my_sales_data）查询用户专属数据时，必须把该 open_id 作为参数传入；不要臆造或串用他人 open_id。
 
 # 岗位信息
 运行时会通过 system.message 事件收到「当前用户岗位信息」的 JSON 声明。处理规则：
@@ -35,10 +35,14 @@ NIO_AGENT_SYSTEM = """你是蔚来（NIO）门店的销售助手，服务对象�
 # 长期记忆
 若挂载了记忆目录（/mnt/memory/），任务开始前先读取其中的用户画像与历史客户跟进笔记，据此个性化回答；记忆只读。
 
-# 工具使用
+# 工具使用（重要）
 - get_my_sales_data(open_id)：查询当前用户的销售线索与业绩看板。
 - get_vehicle_info(model)：查询车型定位、续航与卖点，用于话术与答疑。
-不要打印任何 token、密钥或环境变量原文。命令失败先分析原因，不要原样重试。"""
+- get_team_pipeline(open_id)：查询本门店团队销售漏斗（各阶段数量、成员业绩）。此接口由后端按数据权限校验——仅销售经理有权，普通顾问会收到 forbidden 错误。用户问「团队漏斗/整体业绩/成员完成情况」时调用它。
+这些工具已作为可直接调用的函数注入到你的工具列表中。查询业务数据时，**直接调用它们**并以返回结果为准。
+若工具返回 forbidden/unauthorized 等错误，说明后端判定当前用户无权限，如实向用户说明「你当前岗位无权查看该数据」，不要伪造数据绕过，也不要声称是系统故障。
+严禁把它们当成沙箱内的本地服务去寻找：不要用 bash/read 去列插件目录、扫描 localhost 端口、翻找可执行文件或配置。bash 的唯一合法用途是读取 FEISHU_USER_OPEN_ID 环境变量与读写 /mnt/memory 记忆文件。
+不要凭记忆编造数据。不要打印任何 token、密钥或环境变量原文。命令失败先分析原因，不要原样重试。"""
 
 
 @dataclass(frozen=True)
@@ -59,8 +63,23 @@ def build_nio_agent_config(mcp_server_url: str) -> dict:
         "model": {"id": "doubao-seed-2-1-pro-260628"},
         "system": NIO_AGENT_SYSTEM,
         "tools": [
-            {"type": "agent_toolset_20260701"},  # 硬前提：Memory Store 需要 agent_toolset 才能读
-            {"type": "mcp_toolset", "mcp_server_name": MCP_SERVER_NAME},
+            # 卡点 D 需要 agent_toolset 的 read/glob/grep 读 /mnt/memory/；卡点 B 需要 bash 读
+            # 环境变量 FEISHU_USER_OPEN_ID 拿到当前用户 open_id。所以 bash 必须保留，但要靠 system
+            # prompt 强约束用途——否则 doubao 面对"查数据"会拿 bash 去沙箱瞎找远程 MCP（翻 plugins、
+            # 扫端口），不直接调 mcp_toolset。web_search/web_fetch 本场景用不到，关掉减少干扰。
+            {
+                "type": "agent_toolset_20260701",
+                "default_config": {"enabled": True},
+                "configs": [
+                    {"name": "web_search", "enabled": False},
+                    {"name": "web_fetch", "enabled": False},
+                ],
+            },
+            {
+                "type": "mcp_toolset",
+                "mcp_server_name": MCP_SERVER_NAME,
+                "default_config": {"permission_policy": {"type": "always_allow"}},
+            },
         ],
         "skills": [],
         "mcp_servers": [

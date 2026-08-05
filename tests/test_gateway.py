@@ -250,3 +250,54 @@ async def test_whoami_reports_role():
     await asyncio.sleep(0.05)
     assert "销售经理" in replies[0]
     assert ark.creates == 0
+
+
+async def test_remember_command_writes_memory_without_session():
+    store = GatewayStore(":memory:")
+    ark = FakeArk()
+    replies: list[str] = []
+    role_mgr = RoleManager(store, lambda oid: RoleInfo(role="销售经理", store="门店A"), ttl_ms=86_400_000)
+
+    class MemArk:
+        def __init__(self):
+            self.count = 0
+            self.written: list[dict] = []
+
+        async def create_memory_store(self, name, description):
+            self.count += 1
+            return f"memstore-{self.count}"
+
+        async def create_memory(self, store_id, path, content):
+            self.written.append({"store_id": store_id, "path": path, "content": content})
+
+    mem_ark = MemArk()
+    mem_mgr = MemoryManager(mem_ark, store)
+    gw = _gateway(store, ark, replies, role_manager=role_mgr, memory_manager=mem_mgr)
+    gw.accept(message(text="/remember 重点客户张先生，倾向 ET9"))
+    await asyncio.sleep(0.05)
+    # /remember 不创建 Agent Session，只写记忆
+    assert ark.creates == 0
+    notes = [w for w in mem_ark.written if w["path"].startswith("/notes/")]
+    assert len(notes) == 1
+    assert notes[0]["content"] == "重点客户张先生，倾向 ET9"
+    assert "已记住" in replies[0]
+
+
+async def test_remember_command_without_content_shows_usage():
+    store = GatewayStore(":memory:")
+    ark = FakeArk()
+    replies: list[str] = []
+
+    class MemArk:
+        async def create_memory_store(self, name, description):
+            raise AssertionError("空内容不应写记忆")
+
+        async def create_memory(self, store_id, path, content):
+            raise AssertionError("空内容不应写记忆")
+
+    mem_mgr = MemoryManager(MemArk(), store)
+    gw = _gateway(store, ark, replies, memory_manager=mem_mgr)
+    gw.accept(message(text="/remember"))
+    await asyncio.sleep(0.05)
+    assert "用法" in replies[0]
+    assert ark.creates == 0

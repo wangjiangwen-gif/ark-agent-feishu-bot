@@ -71,3 +71,24 @@ async def test_role_change_reuses_same_user_store(deps):
     sid2 = await mgr.ensure_user_store("ou-1", RoleInfo(role="销售经理", store="门店B"))
     assert sid1 == sid2
     assert len(ark.stores) == 1
+
+
+async def test_remember_writes_note_into_user_store(deps):
+    ark, store = deps
+    mgr = MemoryManager(ark, store)
+    path = await mgr.remember("ou-1", "重点客户张先生，倾向 ET9", RoleInfo(role="销售经理", store="门店A"))
+    # 写入的是一条 note（非 /profile/basic.md 预置画像）
+    assert path.startswith("/notes/")
+    notes = [m for m in ark.memories if m["path"].startswith("/notes/")]
+    assert len(notes) == 1
+    assert notes[0]["content"] == "重点客户张先生，倾向 ET9"
+    assert notes[0]["store_id"] == "memstore-1"
+
+
+async def test_remember_reuses_existing_store(deps):
+    ark, store = deps
+    mgr = MemoryManager(ark, store)
+    await mgr.ensure_user_store("ou-1", RoleInfo(role="销售经理", store="门店A"))
+    await mgr.remember("ou-1", "笔记一")
+    # 复用既有 Store，不再新建
+    assert len(ark.stores) == 1

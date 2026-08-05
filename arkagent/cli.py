@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
             asyncio.run(_doctor())
         elif command == "init":
             asyncio.run(_init())
+        elif command == "update-agent":
+            asyncio.run(_update_agent())
         else:
             _print_help()
         return 0
@@ -109,7 +111,7 @@ def _run() -> None:
         print(f"- 授权用户白名单：{masked}")
     else:
         print("- 授权用户白名单：未设置（对话鉴权交给 MCP 白名单）")
-    print("聊天指令：/new 开新会话 · /role <岗位>[/门店] 模拟岗位调动 · /whoami 查看当前岗位")
+    print("聊天指令：/new 开新会话 · /remember <内容> 记入长期记忆 · /role <岗位>[/门店] 模拟岗位调动 · /whoami 查看当前岗位")
     print("正在连接飞书 WebSocket；请在该 Bot 会话中发送消息。")
     # 阻塞运行 WS 客户端（主线程）。回调里 gateway.accept 会投递到后台事件循环。
     start_feishu_gateway(config.feishu_app_id, config.feishu_app_secret, gateway)
@@ -171,12 +173,34 @@ async def _init() -> None:
     print("初始化完成。运行 `arkagent run` 启动 Gateway。")
 
 
+async def _update_agent() -> None:
+    from .ark import ArkClient
+    from .init import build_nio_agent_config
+
+    _load_saved_environment()
+    config = load_config()
+    ark = ArkClient(config.ark_api_key, config.ark_base_url)
+    try:
+        current = await ark.get_agent(config.ark_agent_id)
+        if current.get("version") is None:
+            raise RuntimeError(f"无法获取 Agent {config.ark_agent_id} 的当前版本，无法更新")
+        version = int(current["version"])
+        new_config = build_nio_agent_config(config.mcp_server_url)
+        updated = await ark.update_agent(config.ark_agent_id, new_config, version)
+        print(f"已更新 Agent {updated['id']}：v{version} → v{updated['version']}")
+        print(f"MCP Server：{config.mcp_server_url}")
+        print("Agent ID 不变，飞书 bot 无需重建。运行 `arkagent run` 即用新配置。")
+    finally:
+        await ark.aclose()
+
+
 def _print_help() -> None:
     print(
         "arkagent [command]\n\n"
-        "  init    交互式创建 NIO 销售助手 Agent + 飞书应用（扫码）+ static_bearer 凭据\n"
-        "  doctor  检查配置并验证方舟 Agent\n"
-        "  run     启动本地 Gateway（默认）"
+        "  init          交互式创建 NIO 销售助手 Agent + 飞书应用（扫码）+ static_bearer 凭据\n"
+        "  update-agent  用最新的 system prompt/工具配置更新现有 Agent（不重扫码、不新建 bot）\n"
+        "  doctor        检查配置并验证方舟 Agent\n"
+        "  run           启动本地 Gateway（默认）"
     )
 
 

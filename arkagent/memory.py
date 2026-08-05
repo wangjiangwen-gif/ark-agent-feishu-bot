@@ -6,10 +6,13 @@
   - 岗位调动：不新建 Store，只开新 Session 挂同一 Store，老对话摘要天然带入。
   - 可选（TEAM_STORE_ENABLED）：同岗位额外挂一个团队共享 Store（D-3）。
 
-Memory Store 依赖 Agent 定义启用 agent_toolset，Agent 通过 /mnt/memory/ 只读访问。
+写入链路（客户侧适配）：方舟不自动抽取对话、Agent 对 /mnt/memory 只读，写记忆只能由应用侧
+调 API（POST /memory_stores/{id}/memories）。本 demo 用 /remember 显式指令触发 remember()，
+把用户指定内容写成一条 note；下个 Session 挂载同一 Store 即可读到，实现跨会话记忆。
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from .ark import ArkClient
@@ -18,6 +21,7 @@ from .store import GatewayStore
 
 USER_STORE_INSTRUCTIONS = "开始任务前先读取 /mnt/memory/ 下的用户画像与历史跟进笔记，据此个性化回答。"
 TEAM_STORE_INSTRUCTIONS = "同时参考团队共享 SOP 与话术规范。"
+NOTES_DIR = "/notes"
 
 
 class MemoryManager:
@@ -46,6 +50,18 @@ class MemoryManager:
             )
         self._store.save_memory_store_id(open_id, store_id)
         return store_id
+
+    async def remember(self, open_id: str, note: str, role: Optional[RoleInfo] = None) -> str:
+        """把用户显式指定的内容写成一条 note 存入其专属 Store（/remember 触发）。
+
+        方舟不自动抽取记忆、Agent 对 /mnt/memory 只读，故写入必须由应用侧调 API 完成。
+        每条 note 用时间戳命名，避免同路径不覆盖（create 语义：路径已存在则不覆盖）。
+        返回写入的 memory 路径，便于回执与运维反查。
+        """
+        store_id = await self.ensure_user_store(open_id, role)
+        path = f"{NOTES_DIR}/{time.strftime('%Y%m%d-%H%M%S', time.localtime())}.md"
+        await self._ark.create_memory(store_id, path, note)
+        return path
 
     async def ensure_team_store(self, role_name: str) -> str:
         """返回同岗位团队共享 Store id（D-3）；不存在则创建。"""

@@ -5,7 +5,7 @@
   - 卡点 C：RoleManager 判是否挂 system.message（动态岗位注入）。
   - 卡点 D：MemoryManager 组装 resources（挂用户专属 Memory Store）。
 
-聊天指令：/new 开新会话、/role <描述> 模拟岗位调动、/whoami 查看当前岗位。
+聊天指令：/new 开新会话、/remember <内容> 写入长期记忆、/role <描述> 模拟岗位调动、/whoami 查看当前岗位。
 WS 回调（可能来自其它线程）只做去重与入队，满足飞书 3 秒处理约束。
 """
 from __future__ import annotations
@@ -137,6 +137,9 @@ class Gateway:
         if text == "/whoami":
             await self._reply(message.chat_id, self._describe_role(message.user_open_id))
             return
+        if text.startswith("/remember"):
+            await self._handle_remember_command(message, text)
+            return
         if text.startswith("/role"):
             await self._handle_role_command(message, text)
             return
@@ -181,6 +184,28 @@ class Gateway:
             vault_ids=[self._vault_id] if self._vault_id else [],
             env_overrides={"FEISHU_USER_OPEN_ID": message.user_open_id},  # 卡点 B
             resources=resources,  # 卡点 D
+        )
+
+    async def _handle_remember_command(self, message: IncomingMessage, text: str) -> None:
+        # 卡点 D 写入链路：方舟不自动记忆，写记忆须应用侧调 API。/remember <内容> 把内容
+        # 写入用户专属 Memory Store，下个 Session（含 /new 后）挂载同一 Store 即可读到。
+        if not self._memory:
+            await self._reply(message.chat_id, "当前未启用长期记忆功能。")
+            return
+        note = text[len("/remember"):].strip()
+        if not note:
+            await self._reply(
+                message.chat_id,
+                "用法：/remember <要记住的内容>，例如 /remember 我负责的重点客户是张先生，倾向 ET9，本周要跟进试驾。",
+            )
+            return
+        role_info: Optional[RoleInfo] = None
+        if self._role:
+            role_info = RoleInfo.from_dict(self._role.ensure_fresh_role(message.user_open_id))
+        path = await self._memory.remember(message.user_open_id, note, role_info)
+        await self._reply(
+            message.chat_id,
+            f"已记住并写入长期记忆（{path}）。开新会话（/new）或以后再来，我都能读到这条笔记。",
         )
 
     async def _handle_role_command(self, message: IncomingMessage, text: str) -> None:

@@ -145,6 +145,24 @@ async def test_static_bearer_handshake_failure_propagates():
     assert "req-9" in str(excinfo.value)
 
 
+# ---- agent update (更新 Agent，不新建) ----
+@respx.mock
+async def test_update_agent_sends_version_and_returns_new_version():
+    # 方舟更新语义是 POST /agents/{id}（非 PUT/PATCH）。
+    route = respx.post(f"{BASE}/agents/agent-1").mock(
+        return_value=httpx.Response(200, json={"id": "agent-1", "name": "NIO", "version": 3})
+    )
+    client = _client()
+    result = await client.update_agent("agent-1", {"name": "NIO", "system": "hi"}, version=2)
+    await client.aclose()
+    assert result == {"id": "agent-1", "name": "NIO", "version": "3"}
+    import json
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["version"] == 2
+    assert sent["name"] == "NIO"
+    assert sent["system"] == "hi"
+
+
 # ---- memory store (卡点 D) ----
 @respx.mock
 async def test_create_memory_store_and_memory():
