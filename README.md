@@ -8,16 +8,18 @@
 
 ## 四个卡点如何落地
 
-| 卡点                        | 客户问题                                               | 本 Demo 方案                                                                                                                            | 归属                       |
-| --------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| **A** 身份鉴权        | NIO 私有签名接入 MCP                                   | **安全降级**：`static_bearer` 凭据 + open_id 白名单（**不是** NIO 私有签名，仅演示鉴权链路）                              | 客户侧适配                 |
-| **B** 用户身份透传    | 把对话用户（非 Bot）的 open_id 透传到 MCP 做数据权限   | **会话级环境变量**：创建 Session 时用 `environment_with_overrides` 注入 `FEISHU_USER_OPEN_ID`，Agent 把它作为工具入参传给 MCP | 客户侧适配                 |
-| **C** 岗位信息注入    | 岗位信息注入 system prompt 层，缓存 1 天，Session 不变 | Gateway 维护`(open_id, roleInfo, refreshedAt)` 缓存（24h TTL）；仅首轮 / 缓存 miss 后首访挂一次 `system.message`                    | C-1 客户侧 / C-2 MA 已支持 |
+| 卡点                        | 客户问题                                               | 本 Demo 方案                                                                                                                            | 归属                                                                                        |
+| --------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| **A** 身份鉴权        | NIO 私有签名接入 MCP                                   | **安全降级**：`static_bearer` 凭据 + open_id 白名单（**不是** NIO 私有签名，仅演示鉴权链路）                              | 客户侧适配                                                                                  |
+| **B** 用户身份透传    | 把对话用户（非 Bot）的 open_id 透传到 MCP 做数据权限   | **会话级环境变量**：创建 Session 时用 `environment_with_overrides` 注入 `FEISHU_USER_OPEN_ID`，Agent 把它作为工具入参传给 MCP | 客户侧适配                                                                                  |
+| **C** 岗位信息注入    | 岗位信息注入 system prompt 层，缓存 1 天，Session 不变 | Gateway 维护`(open_id, roleInfo, refreshedAt)` 缓存（24h TTL）；仅首轮 / 缓存 miss 后首访挂一次 `system.message`                    | C-1 客户侧 / C-2 MA 已支持                                                                  |
 | **D** 跨 Session 记忆 | 岗位调动 / 换场景后记忆延续                            | 每用户专属 Memory Store，创建 Session 时经`resources` 挂到 `/mnt/memory/`（只读）；写入用 `/remember` 显式指令由应用侧调 API 写回 | 只读挂载/API 增删改 MA 已支持；「记什么、何时写」客户侧适配；对话自动抽取属 MA 未来 Feature |
 
 > **卡点 B 的字段来源说明**：会话级环境变量注入未在方舟官方文档正文明写，但已由 MA 平台负责人口头确认「创建 Session 接口能传环境变量」且线下跑通。本 Demo 照此实现（见 [ark.py](arkagent/ark.py) 的 `create_session`）。若平台后续改为标准字段，改回对应字段即可。
 >
 > **卡点 A 是安全降级，不是 NIO 私有签名**：仅用 `static_bearer` + 白名单演示鉴权链路，勿向客户表述为「已实现 NIO 私有签名」。
+
+> 📘 **想看每个卡点的数据怎么流转**（时序图 + Gateway 入口 + mock 数据 + 预期结果 + 日志验证）：见 [四卡点数据流转说明](docs/MA迁移Demo-四卡点数据流转说明.md)。
 
 ## 架构
 
@@ -71,7 +73,40 @@ MCP_STATIC_BEARER="demo-bearer-token" MCP_HOST=127.0.0.1 MCP_PORT=8765 nio-mock-
 # 或：python -m mock_mcp
 ```
 
-再用内网穿透把 `http://127.0.0.1:8765` 暴露成公网 HTTPS。以 cpolar 为例（首次使用需先 `cpolar authtoken <你的token>`，在 [cpolar 后台](https://dashboard.cpolar.com/auth) 获取，只需配置一次）：
+再用内网穿透把 `http://127.0.0.1:8765` 暴露成公网 HTTPS。本文用 cpolar，首次使用分三步：
+
+**1) 安装 cpolar**（任选其一，macOS 推荐 Homebrew）：
+
+```bash
+# 方式 A：Homebrew（macOS）
+brew tap probezy/core
+brew trust probezy/core        # 新版 Homebrew 需先授信第三方 tap，否则拒绝加载
+brew install probezy/core/cpolar
+
+# 方式 B：官方一键脚本（macOS / Linux 通用）
+curl -L https://www.cpolar.com/static/downloads/install-release-cpolar.sh | sudo bash
+
+# 验证安装
+cpolar version
+```
+
+> **`brew install` 报「tap 未受信任 / refusing to load」**：新版 Homebrew 会拦截未授信的第三方 tap，先跑 `brew trust probezy/core`（对应可用 `brew untrust` 撤销）再重试即可。官方脚本安装（方式 B）不涉及此问题。
+>
+> Windows 用户到 [cpolar 下载页](https://www.cpolar.com/download) 下载安装包。
+>
+> **macOS 信任问题（Gatekeeper）**：若用官方脚本 / 手动下载安装，cpolar 二进制未经 Apple 公证，首次运行可能被拦截，报「无法打开，因为 Apple 无法检查其是否包含恶意软件」。两种解法任选：
+>
+> - 命令行去掉隔离属性（推荐，一次即可）：`sudo xattr -rd com.apple.quarantine $(which cpolar)`；
+> - 或图形界面放行：**系统设置 → 隐私与安全性**，在底部「已阻止 cpolar」处点**仍要允许**，再重跑一次命令。
+>   Homebrew 安装（方式 A）的二进制无此隔离属性，一般不会触发。
+
+**2) 配置 authtoken**（只需一次，在 [cpolar 后台](https://dashboard.cpolar.com/auth) 注册后获取）：
+
+```bash
+cpolar authtoken <你的token>
+```
+
+**3) 开隧道**把本地 8765 暴露成公网 HTTPS：
 
 ```bash
 cpolar http 8765
