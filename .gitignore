@@ -1,5 +1,15 @@
 node_modules/
-dist/
 data/
 .env
 npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+build/
+dist/
+docs/context/*
+.trae/

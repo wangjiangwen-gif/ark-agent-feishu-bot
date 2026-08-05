@@ -1,176 +1,217 @@
-# Ark Agent Feishu Bot
+# 蔚来 MA 迁移 Demo · 飞书 Bot → 火山方舟 Managed Agents
 
-> 一个方舟 API Key，两次飞书扫码，认领一个能以你的身份使用 `lark-cli` 的办公助手。
+> 一份「喂到嘴边」的可运行 Demo：把 FDE 建议清单里的四个客户卡点，直接在飞书对话界面里演示出来。
 
-这不是一个要求你手工配置 Agent、Environment、Vault 和飞书应用的 Bot 框架。初始化向导会直接创建一套个人专属资源，把飞书用户凭证安全地交给 Managed Agents Session，并启动一个通过 WebSocket 收消息的本地 Gateway。
+飞书用户 @ Bot → 本地 Gateway → 火山方舟 Managed Agents Session → mock NIO MCP Server。四个卡点全程在**与 Bot 的飞书会话**中演示，无需额外前端。
 
-## 你会得到什么
+主体是 Python；只有「扫码创建飞书应用」这一步没有 Python 等价物，保留为一个 Node 小岛（子进程调用）。
 
-运行一次 `npx --yes arkagent@latest init` 后，工具会自动完成四件事：
+## 四个卡点如何落地
 
-| 自动完成 | 结果 |
-|---|---|
-| 创建 Managed Agent | 新建“飞书办公助手（方舟 MA 版）”，内置 `lark-cli` 使用规则 |
-| 创建飞书应用 | 配置机器人、消息事件和办公权限，不要求手填 App ID / App Secret |
-| 配置用户身份 | 将短期 `user_access_token` 写入方舟 Vault Credential |
-| 创建运行环境 | 安装 `lark-cli`，注入 App ID，并让新 Session 引用用户 Vault |
+| 卡点                        | 客户问题                                               | 本 Demo 方案                                                                                                                            | 归属                       |
+| --------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| **A** 身份鉴权        | NIO 私有签名接入 MCP                                   | **安全降级**：`static_bearer` 凭据 + open_id 白名单（**不是** NIO 私有签名，仅演示鉴权链路）                              | 客户侧适配                 |
+| **B** 用户身份透传    | 把对话用户（非 Bot）的 open_id 透传到 MCP 做数据权限   | **会话级环境变量**：创建 Session 时用 `environment_with_overrides` 注入 `FEISHU_USER_OPEN_ID`，Agent 把它作为工具入参传给 MCP | 客户侧适配                 |
+| **C** 岗位信息注入    | 岗位信息注入 system prompt 层，缓存 1 天，Session 不变 | Gateway 维护`(open_id, roleInfo, refreshedAt)` 缓存（24h TTL）；仅首轮 / 缓存 miss 后首访挂一次 `system.message`                    | C-1 客户侧 / C-2 MA 已支持 |
+| **D** 跨 Session 记忆 | 岗位调动 / 换场景后记忆延续                            | 每用户专属 Memory Store，创建 Session 时经`resources` 挂到 `/mnt/memory/`（需 Agent 启用 `agent_toolset`）                        | MA 已支持                  |
 
-初始化完成后，你可以直接在飞书里让它创建文档、整理云空间内容，或执行其他已经授权的 `lark-cli` 办公任务。
+> **卡点 B 的字段来源说明**：会话级环境变量注入未在方舟官方文档正文明写，但已由 MA 平台负责人口头确认「创建 Session 接口能传环境变量」且线下跑通。本 Demo 照此实现（见 [ark.py](arkagent/ark.py) 的 `create_session`）。若平台后续改为标准字段，改回对应字段即可。
+>
+> **卡点 A 是安全降级，不是 NIO 私有签名**：仅用 `static_bearer` + 白名单演示鉴权链路，勿向客户表述为「已实现 NIO 私有签名」。
 
-## Quickstart
+## 架构
 
-### 1. 准备
-
-只需要：
-
-- Node.js 22.13 或更高版本；
-- 一个可用的火山方舟 Managed Agents API Key；
-- 一个能够创建企业自建应用的飞书账号。
-
-不需要提前准备 Agent、Environment、Vault、飞书 App ID 或 App Secret。
-
-### 2. 一条命令初始化
-
-```bash
-npx --yes arkagent@latest init
+```text
+飞书用户 ──@──> Bot（长连接收消息）
+                 │
+                 ▼
+          本地 Gateway（Python）
+   去重 · Session 复用 · /new /role /whoami 指令
+                 │
+                 ├── 创建 Session：environment_with_overrides={FEISHU_USER_OPEN_ID}  ← 卡点 B
+                 │                 vault_ids=[static_bearer vault]                   ← 卡点 A
+                 │                 resources=[memory_store → /mnt/memory/]           ← 卡点 D
+                 ├── 发消息：user.message ＋（按需）system.message 岗位声明          ← 卡点 C
+                 ▼
+      火山方舟 Managed Agents Session
+                 │  连 MCP 时注入 static Bearer（卡点 A）
+                 ▼
+        mock NIO MCP Server（公网可达）
+     get_my_sales_data(open_id) · get_vehicle_info(model)
 ```
 
-向导只询问方舟 API Key，输入时以 `•` 提供反馈但不会显示原文。Base URL、`docs,drive` 权限域和 Environment 名称全部使用默认值。
+## 准备
 
-随后完成两次扫码：
+- **conda**（管理 Python 环境）；
+- 一个可用的**火山方舟 Managed Agents API Key**（验证时你需要提供，`init` 掩码输入）；
+- 一个能创建企业自建应用的**飞书账号**（用于扫码建应用）；
+- 一个**内网穿透工具**（本文用 [cpolar](https://www.cpolar.com)，国内节点更稳；ngrok / frp 亦可），把本地 mock MCP 暴露成公网 HTTPS 地址——方舟创建 `static_bearer` 凭据时会**立即握手探测** MCP，不可达会直接失败。
 
-| 扫码 | 你确认什么 | 工具拿到什么 |
-|---|---|---|
-| 第一次 | 创建飞书智能体应用，并开通机器人、事件与用户权限 | App ID、App Secret、当前飞书用户 |
-| 第二次 | 允许这个应用以你的用户身份调用 `lark-cli` | access token、refresh token、用户 open_id |
-
-> 第一次扫码的页面可能把部分宽权限显示为“不支持自动开通”。可以继续下一步；第二个用户授权页面会展示并开通常用权限包。最终是否可用，以第二次授权完成后的实际调用为准。
-
-每次执行 `init` 都会新建一个个人办公助手 Agent，不会搜索或复用已有 Agent。配置会直接覆盖写入 `~/.arkagent/config.env`。
-
-### 3. 开始使用
-
-初始化完成后，CLI 会自动启动 Gateway。看到“Gateway 已启动，正在通过飞书 WebSocket 接收消息”后，在飞书中找到刚创建的应用并发送消息。
-
-以后需要重新启动时运行 `npx --yes arkagent@latest`；需要检查配置时运行 `npx --yes arkagent@latest doctor`。
-
-如果飞书 `refresh_token` 过期，或需要换一个用户重新授权，不要再次初始化。运行：
+## 一、创建环境
 
 ```bash
-npx --yes arkagent@latest login
+conda env create -f environment.yml
+conda activate nio-ma-demo
+pip install -e ".[dev]"          # 安装本包（arkagent / nio-mock-mcp 命令）
+(cd node-helper && npm install)  # 装 Node 小岛依赖（registerApp 扫码用）
 ```
 
-`login` 会复用当前 App ID、App Secret、方舟 API Key、Vault 和 Credential，只重新执行一次用户 OAuth，并更新本地 OAuth 状态与 Vault 中的 `user_access_token`。它不会创建新的飞书 App、Agent 或 Environment。由于 Credential 只在 Session 创建时注入，登录成功后会自动废弃全部旧 Session 映射；重启 Gateway 后，下一条消息会创建使用新 token 的 Session。
-
-如果准备长期运行，可以全局安装，之后命令更短：
+跑一遍测试确认环境就绪：
 
 ```bash
-npm install -g arkagent
+pytest -q
+```
+
+## 二、启动 mock NIO MCP 并暴露公网
+
+先在一个终端起 mock MCP（自带 A/B 演示数据）：
+
+```bash
+MCP_STATIC_BEARER="demo-bearer-token" MCP_HOST=127.0.0.1 MCP_PORT=8765 nio-mock-mcp
+# 或：python -m mock_mcp
+```
+
+再用内网穿透把 `http://127.0.0.1:8765` 暴露成公网 HTTPS。以 cpolar 为例（首次使用需先 `cpolar authtoken <你的token>`，在 [cpolar 后台](https://dashboard.cpolar.com/auth) 获取，只需配置一次）：
+
+```bash
+cpolar http 8765
+# 输出里找 Forwarding 的 https:// 地址，形如 https://xxxx.r6.cpolar.top
+```
+
+那么 **MCP Server 地址** = `https://xxxx.r6.cpolar.top/mcp`（注意末尾 `/mcp` 路径），**static Bearer** = 上面设置的 `demo-bearer-token`。
+
+> cpolar 免费版每次重启隧道公网域名会变；换了地址需重新 `arkagent init`，或直接改 `~/.arkagent/config.env` 里的 `MCP_SERVER_URL`。
+
+## 三、初始化（只扫一次码）
+
+```bash
 arkagent init
 ```
 
-可以先试：
+`init` 会依次：
 
-```text
-创建一篇标题为“办公助手测试”的飞书文档，正文写“lark-cli 已可用”，完成后把链接发给我。
+1. 掩码输入**方舟 API Key**（以 `•` 回显，不显示原文）；
+2. 输入 **mock MCP 公网地址** 与 **static Bearer token**；
+3. 创建「蔚来销售助手（方舟 MA 版）」Agent（挂 `mcp_servers` + `mcp_toolset` 连 mock MCP，并启用 `agent_toolset` 以读 Memory Store）；
+4. **扫码创建飞书应用**（Node 小岛，仅 tenant 身份 `im:message:send_as_bot` + `im.message.receive_v1` 事件，**无用户 OAuth**）；
+5. 创建 / 复用 Vault，并创建 `static_bearer` 凭据（此时方舟会握手探测 MCP，所以第二步的地址必须已公网可达）；
+6. 创建 / 复用 Environment；
+7. 把配置安全写入 `~/.arkagent/config.env`（目录 `0700`、文件 `0600`）。
+
+> 本 Demo 去掉了原 TS 项目的用户 OAuth——整个初始化**只扫一次码**（建应用）。运行时用户 open_id 直接从飞书消息事件取。原 `lark-cli` + 用户 OAuth 能力如需可回看 git 历史。
+
+检查配置：
+
+```bash
+arkagent doctor
 ```
 
-`/new` 会清除当前飞书会话到方舟 Session 的映射；下一条消息将创建新 Session。
+## 四、启动 Gateway 并演示
 
-## 两次扫码为什么不能合并
-
-第一次扫码是在飞书开放平台创建并配置应用，解决“谁来接收消息”。第二次扫码是用户 OAuth，解决“Agent 代表谁操作文档和云空间”。
-
-这两个身份不能混为一谈：Bot 身份可以收发消息，但看不到你的个人资源；用户身份可以访问你授权的办公数据，却不负责承载消息入口。
-
-```text
-飞书用户
-  ├─ 扫码 1：创建应用 ──> Bot 接收消息
-  └─ 扫码 2：用户授权 ──> lark-cli 操作个人资源
-
-消息 ──> 本地 Gateway ──> Managed Agents Session
-                              └─ Vault 注入 user_access_token
-                                  └─ lark-cli --as user
+```bash
+arkagent run
 ```
 
-## 默认权限
+看到「正在连接飞书 WebSocket」后，在飞书中找到刚创建的 Bot，按下面脚本逐个演示四个卡点。
 
-初始化默认选择 `docs,drive` 两个 `lark-cli` 业务域：
+### 聊天指令
 
-| 业务域 | OAuth scopes | 用途 |
-|---|---|---|
-| 基础 | `offline_access`、`auth:user.id:read` | 刷新 token、确认授权用户 |
-| docs | `docx:document`、`docx:document:create`、`docx:document:readonly`、`docx:document:write_only` | 创建、回读与更新飞书文档 |
-| drive | `drive:drive`、`drive:file` | 访问云空间文件 |
+| 指令                                | 作用                                                     |
+| ----------------------------------- | -------------------------------------------------------- |
+| `/whoami`                         | 查看当前缓存的岗位信息                                   |
+| `/role 销售经理/上海浦东蔚来中心` | 模拟 HR 岗位调动（`岗位[/门店]`）→ 下一轮强制重注入   |
+| `/new`                            | 开启新 Agent Session（演示卡点 D 的跨 Session 记忆延续） |
 
-当前版本只内置 `docs` 与 `drive`。如果办公助手返回 `missing_scopes`，需要扩展 `src/scopes.ts` 后重新运行初始化，以完成应用开通和用户增量授权。
+### 演示脚本
 
-## 凭证如何保存
+**卡点 A（static_bearer 鉴权）**——问业务问题即可，Bot 用配好的 `static_bearer` 访问 MCP 拿到数据；这条链路本身就是 A。
 
-| 凭证 | 保存位置 | 原因 |
-|---|---|---|
-| 方舟 API Key | `~/.arkagent/config.env` | Gateway 调用 Managed Agents API |
-| App Secret | `~/.arkagent/config.env` | WebSocket 鉴权与 refresh token 刷新 |
-| refresh token | `~/.arkagent/config.env` | 换取新的用户 access token |
-| user access token | 方舟 Vault Credential | 仅在 Session 运行时以环境变量注入 |
-| App ID | Environment 环境变量 | 供沙箱内的 `lark-cli` 使用 |
-| 用户 open_id | 创建 Session 时的 Environment 覆写 | 取自当前飞书消息发送者，供 Agent 工具和 MCP 读取本次会话用户身份 |
+```text
+ET9 的续航和定位是多少？
+```
 
-配置目录权限为 `0700`，配置文件权限为 `0600`；Gateway 数据保存在 `~/.arkagent/gateway.db`。不要在 Agent prompt 或日志中打印凭证。
+**卡点 B（OpenID 透传，按用户隔离数据）**——Bot 会用**你的** open_id 调 `get_my_sales_data` 拿到你专属的数据桶：
 
-Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新方舟 Credential，再原子更新本地 refresh token。
+```text
+帮我看看我这个月的销售线索和业绩。
+```
+
+> 要直观展示「不同人拿到不同数据」，用**两个飞书账号**分别发同一句，看到各自的线索/KPI 不同即证明隔离。mock 数据里 `ou-demo-manager`（销售经理）与 `ou-demo-sales`（销售顾问）数据不同。
+
+**卡点 C（岗位信息注入 system prompt）**——先看当前岗位，再模拟调动，观察回答按新岗位权限/话术变化，且 **Session 不变**：
+
+```text
+/whoami
+/role 销售经理/上海浦东蔚来中心
+作为我现在的岗位，我能看团队整体的销售漏斗吗？
+```
+
+**卡点 D（跨 Session 记忆延续）**——先让它记住点东西，再 `/new` 开新 Session，验证仍能从 `/mnt/memory/` 读到：
+
+```text
+记住：我负责的重点客户是张先生，倾向 ET9，本周要跟进试驾。
+/new
+我上次说的重点客户是谁？倾向什么车型？
+```
+
+## 配置项（`~/.arkagent/config.env`）
+
+`init` 自动写入；也可参考 [.env.example](.env.example)。
+
+| Key                                                          | 说明                                                                                |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `ARK_API_KEY`                                              | 方舟 API Key，Gateway 调用 MA API                                                   |
+| `ARK_AGENT_ID` / `ARK_ENVIRONMENT_ID` / `ARK_VAULT_ID` | init 创建的资源 ID                                                                  |
+| `ARK_BASE_URL`                                             | 方舟 API 基址（默认北京）                                                           |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET`                    | 扫码创建的飞书应用凭证（WebSocket 鉴权 + 发消息）                                   |
+| `MCP_SERVER_URL`                                           | mock MCP 公网地址（含`/mcp`）                                                     |
+| `GATEWAY_DB_PATH`                                          | SQLite 状态库（会话映射 / 事件去重 / 岗位缓存），默认`./data/gateway.db`          |
+| `SESSION_TIMEOUT_MS`                                       | 单次运行超时，默认 600000                                                           |
+| `ROLE_TTL_MS`                                              | 岗位缓存 TTL，默认 86400000（24h）                                                  |
+| `AUTHORIZED_OPEN_IDS`                                      | 允许对话的 open_id 白名单（逗号分隔；**留空 = 不限制**，鉴权交给 MCP 白名单） |
+| `TEAM_STORE_ENABLED`                                       | 是否为同岗位挂载团队共享 Memory Store（卡点 D-3，可选）                             |
+
+配置目录 `0700`、文件 `0600`；不要在 Agent prompt 或日志中打印凭证。
 
 ## 消息与 Session 行为
 
-- 单聊中的文本消息会发送给绑定的 Agent。
-- 群聊只处理明确 `@Bot` 的文本消息。
-- 一个飞书用户在一个飞书会话中复用一个 Managed Agents Session；不同发送者不会复用 Session，`/new` 显式重置。
-- 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
-- 新建 Session 会立即回复一次“正在处理”；复用 Session 只有超过 2.5 秒仍未完成时才发送一次提示。
-- Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
-- Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
-- 图片、文件、富文本与交互卡片暂不处理。
+- 单聊处理文本消息；群聊只处理明确 `@Bot` 的文本消息。
+- 一个用户在一个飞书会话中复用一个 MA Session；不同发送者不复用；`/new` 显式重置。
+- 新建 Session 会立即回复「正在处理」；复用 Session 仅在超过 ~2.5 秒未完成时提示一次。
+- Gateway 不转发工具执行过程，只发处理中提示和最终结果。
+- 图片、文件、富文本、交互卡片暂不处理。
 
-## Docker
+## 项目结构
 
-```bash
-docker build -t ark-agent-feishu-bot .
-docker run --rm \
-  --env-file .env \
-  -v ark-feishu-data:/app/data \
-  ark-agent-feishu-bot
+```text
+arkagent/            # Python 主体
+  cli.py             # init / doctor / run 命令入口
+  init.py            # 创建 NIO 销售助手 Agent + Vault + static_bearer 凭据 + Environment，写 config
+  node_helper.py     # 以子进程调用 node-helper/register_app.mjs（扫码建应用）
+  gateway.py         # 编排：去重 / Session 复用 / 指令 / 组装 B·C·D
+  ark.py             # 火山方舟 Managed Agents httpx 客户端 + SSE
+  feishu.py          # 飞书长连接接入与消息归一化、发送
+  role.py            # 卡点 C：岗位缓存 + system.message 注入
+  memory.py          # 卡点 D：每用户 / 团队 Memory Store
+  store.py           # SQLite 状态
+  config.py / paths.py / masked_input.py
+mock_mcp/            # mock NIO MCP Server（streamable-http）
+  server.py          # get_my_sales_data / get_vehicle_info + static_bearer 中间件
+  data.py            # 按 open_id 分桶的演示数据
+node-helper/         # 唯一保留的 Node 小岛
+  register_app.mjs   # registerApp 扫码建飞书应用，把凭证写回 JSON
+tests/               # pytest（asyncio_mode=auto）
 ```
-
-必须持久化 `/app/data`。否则容器重建后会丢失会话映射和事件去重记录。
 
 ## 开发
 
 ```bash
-npm install
-npm test
-npm run check
-npm run build
-npm pack --dry-run
+pytest -q            # 全量单测
+python -m mock_mcp   # 本地起 mock MCP（不带 token 则不校验，仅本地调试）
 ```
-
-| 文件 | 职责 |
-|---|---|
-| `src/cli.ts` | `init`、`login`、`doctor`、`run` 命令入口 |
-| `src/init.ts` | 创建 Agent、Vault Credential、Environment 并写入配置 |
-| `src/login.ts` | 复用现有资源重新授权，并更新本地 OAuth 状态和 Vault Credential |
-| `src/oauth.ts` | 飞书 Device OAuth 与 token 刷新 |
-| `src/feishu.ts` | 飞书 WebSocket 事件接入与消息归一化 |
-| `src/gateway.ts` | 去重、Session 复用、进度与最终回复 |
-| `src/ark.ts` | Managed Agents API 与 SSE 客户端 |
-| `src/store.ts` | SQLite 会话映射和事件处理记录 |
-
-## 当前边界
-
-这是单用户 MVP：只有初始化时授权的 `open_id` 可以驱动 Agent。它适合个人认领和本地验证，不是多租户托管服务，也不会代替企业管理员完成应用审批或可用范围配置。
 
 ## 参考资料
 
-- [飞书文档版：一个 API Key，两次扫码，认领你的飞书办公助手](https://bytedance.larkoffice.com/docx/M2mGdkHIHoGFYVx1nLzch6TvnIb)
+- [火山方舟：Managed Agents API](https://docs.volcengine.com/docs/82379/2555910?lang=zh)
 - [飞书：一键创建飞书智能体应用](https://open.feishu.cn/document/mcp_open_tools/integrating-agents-with-feishu/overview)
 - [飞书：使用长连接接收事件](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case)
-- [火山方舟：Managed Agents API](https://docs.volcengine.com/docs/82379/2555910?lang=zh)
