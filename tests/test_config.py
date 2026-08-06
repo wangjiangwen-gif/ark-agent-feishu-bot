@@ -1,6 +1,9 @@
+import os
+import stat
+
 import pytest
 
-from arkagent.config import load_config, parse_env_text, serialize_env
+from arkagent.config import load_config, parse_env_text, serialize_env, update_env_file
 
 
 def _base_env(**overrides):
@@ -59,3 +62,24 @@ def test_serialize_and_parse_roundtrip_quotes_values():
     text = serialize_env({"TOKEN": "a b#c"})
     assert text == 'TOKEN="a b#c"\n'
     assert parse_env_text(text) == {"TOKEN": "a b#c"}
+
+
+def test_update_env_file_updates_key_and_preserves_others(tmp_path):
+    path = os.path.join(str(tmp_path), "config.env")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(serialize_env({
+            "MCP_SERVER_URL": "https://old.example.com/mcp",
+            "MCP_STATIC_BEARER": "demo-bearer-token",
+            "ARK_API_KEY": "ark-key",
+        }))
+
+    update_env_file(path, {"MCP_SERVER_URL": "https://new.example.com/mcp"})
+
+    result = parse_env_text(open(path, encoding="utf-8").read())
+    # 目标键被更新
+    assert result["MCP_SERVER_URL"] == "https://new.example.com/mcp"
+    # 其余键原样保留
+    assert result["MCP_STATIC_BEARER"] == "demo-bearer-token"
+    assert result["ARK_API_KEY"] == "ark-key"
+    # 权限被收敛到 0600
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600

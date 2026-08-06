@@ -51,6 +51,68 @@ sequenceDiagram
 
 ---
 
+## 0.5 关键机制深挖 · 凭证与 OpenID 的存储与传递
+
+演示前先把两个最容易被问到的机制吃透：**卡点 A 的 static Bearer 凭证**、**卡点 B 的 OpenID**。它俩是两条完全不同的链路（一条走传输层、一条走应用层），下面按"是什么 / 给谁用 / 怎么存 / 怎么传 / 怎么验证"逐条说清。
+
+### 一、`MCP_STATIC_BEARER` 到底是什么？凭证给谁用？
+
+- **它是什么**：一个**你自己定的固定字符串密码**（demo 用 `demo-bearer-token`），充当"**方舟客户端**访问 mock MCP 的门禁口令"。它**不是**飞书 token、**不是**某个用户的身份、**不是** 客户A 私有签名——就是一把静态的对称密钥。
+- **给谁用**：代表"**方舟编排层这个调用方**"去敲 mock MCP 的门。和"哪个飞书用户在对话"无关——不管张三李四发消息，方舟连这台 MCP 用的都是**同一个** Bearer token。（区分"是哪个用户"是卡点 B 的 openid 干的事，不是这个 token。）
+- **一处配、两处用**（两边必须一致，否则 401）：
+  | 位置 | 角色 | 代码 |
+  | --- | --- | --- |
+  | 启动 mock 时 `MCP_STATIC_BEARER=demo-bearer-token` | **服务端**：middleware 拿它当"正确答案"逐请求比对 | [StaticBearerMiddleware](../mock_mcp/server.py#L98-L125) |
+  | init/换址时写入方舟 Vault 凭据的 `token` 字段 | **客户端**：方舟连 MCP 时用它拼 `Authorization` 头 | [create_static_bearer_credential](../arkagent/ark.py#L188-L198) |
+
+### 二、这个凭证在 MA 系统里怎么存？（Vault → Credential）
+
+方舟侧不是把 token 散在 Agent 定义里，而是有一套**独立的密钥保管结构**：
+
+```text
+Vault（金库，本 demo 一个）
+  └── Credential（凭据，名叫 customer-a-mcp-static-bearer）
+        auth.type          = "static_bearer"
+        auth.mcp_server_url = https://<公网地址>/mcp   ← 这把钥匙配哪扇门（结构性字段，创建后锁定）
+        auth.token          = demo-bearer-token         ← 敲门口令（方舟加密保管，API 不回显明文）
+```
+
+- **谁把它交给运行时**：建 Session 时传 `vault_ids=[vault_id]`（[gateway.py:184](../arkagent/gateway.py#L184)），等于告诉这次会话"能用这个金库里的钥匙"。
+- **方舟怎么用它**：运行时方舟要连 Agent 定义里的 `mcp_servers[].url`，就去挂到本 Session 的 Vault 里，**按 `mcp_server_url` 匹配**找到对应 Credential，取出 token 自动拼 `Authorization: Bearer <token>` 发出去。**匹配是按 URL 的**——这也是"换 cpolar 地址后必须重建凭据"的根因：凭据 URL 若还指向旧址，方舟按新址找不到匹配凭据 → 干脆匿名连接（不带头）→ mock 打 `auth=<缺失> 401`。
+- **`mcp_server_url` 创建后不可改**：它是结构性字段，换地址只能"删旧建新"（[delete_credential](../arkagent/ark.py#L200-L206) 注释 + `arkagent update-agent --mcp-url` 已封装这套删建）。
+
+### 三、怎么验证这个凭证真的在起作用？
+
+三个层次，从强到弱：
+
+1. **建凭据这一步就是一次线上验证**：方舟创建 static_bearer 凭据时会**立即握手探测** MCP（带上 token 发一次 initialize）。token 错 → 直接 `401 MCPInvalidCredential`；地址不可达 → `424`。所以 `arkagent init` / `update-agent --mcp-url` **不报错** = 方舟公网能连上且 token 校验已通过。
+2. **mock 日志逐请求留证**（最直接）：每个入站请求打一行掩码日志——
+   ```text
+   [MCP] POST /mcp  auth=Bearer demo…oken  ✅ static_bearer 校验通过
+   ```
+   看到 `✅` 且 `auth=Bearer …` 有值 = 凭证在用且正确；看到 `auth=<缺失>` = 方舟没带头（凭据 URL 不匹配）；看到 `❌ token 不匹配` = 带了但值不对。
+3. **反证**：故意把 mock 的 `MCP_STATIC_BEARER` 改成别的值重启（不动方舟凭据）→ 再问业务数据 → mock 打 `❌ 401 拒绝`、模型侧工具失败。能复现"改坏就断" = 证明这道门禁真的在拦。
+
+### 四、OpenID 在数据流里怎么存、怎么传？
+
+先记住一句：**OpenID 全程不走 HTTP 传输层**（传输层只有卡点 A 的 Bearer 头），它是**应用层数据**，一路当"值"被搬运，最后由**模型主动读出、当工具入参填进去**。逐跳看它"住在哪"：
+
+| 跳 | OpenID 以什么形态存在 | 代码 |
+| --- | --- | --- |
+| ① 飞书事件 | 事件体 `sender.sender_id.open_id`（对话用户，非 bot） | [normalize_feishu_message](../arkagent/feishu.py#L45-L54) |
+| ② Gateway 内存 | 归一化成 `IncomingMessage.user_open_id`，并作为**会话四元组的一段**参与 Session 隔离 | [to_conversation_key](../arkagent/gateway.py#L244-L250) |
+| ③ 建 Session（关键一跳） | 作为**会话级环境变量** `FEISHU_USER_OPEN_ID` 注入方舟运行环境 | [gateway.py:185](../arkagent/gateway.py#L185) |
+| ④ 方舟环境 | 经 `environment_with_overrides` 合并进 Environment 的 `env`，成为沙箱里的一个环境变量 | [ark.py create_session:235-243](../arkagent/ark.py#L235-L243) |
+| ⑤ 模型运行时 | 模型按 system prompt 指示，用 `bash printf '%s' "$FEISHU_USER_OPEN_ID"` **读出它的值** | [init.py:27](../arkagent/init.py#L27) |
+| ⑥ 调工具 | 模型把读到的值作为 JSON 入参 `get_my_sales_data(open_id="ou…")` 填入 | 模型行为（受 prompt 约束） |
+| ⑦ MCP 侧 | 工具函数拿到 `open_id` 参数，查白名单/权限、返回该用户专属数据 | [get_my_sales_data](../mock_mcp/server.py#L52-L61) |
+
+> **两个要点**：
+> - **为什么不落库、每 Session 一注入**：openid 属于"这次对话是谁"，随 Session 创建当场注入即可；它已进了会话四元组做隔离，无需额外持久化。（对比：卡点 C 的岗位、D 的 store 映射才需要落 SQLite。）
+> - **为什么模型是链路的一环**：openid 不是框架自动塞进工具的，是**模型读环境变量→自己填参数**。所以这条链依赖模型执行 bash——这正是历史上"bash 抢戏"坑的由来（模型可能拿 bash 去沙箱瞎找 MCP 而不直接调工具），已靠 system prompt 强约束修正（[init.py:44](../arkagent/init.py#L44)）。
+
+---
+
 ## 卡点 A · static_bearer 鉴权 + 模型直调 MCP
 
 ### 一句话
@@ -417,5 +479,52 @@ sequenceDiagram
 - **mock MCP 日志**（`arkagent run` 或起 mock 的终端）：每次工具调用打一行，含工具名 + open_id（完整）+ token（掩码）+ `✅/❌` 结论。分别对应卡点 A（`static_bearer 校验`）、B（`get_my_sales_data … 命中白名单`）、C 硬层（`get_team_pipeline … 权限校验通过/后端拒绝`）。
 - **Gateway 回执**：`/role`、`/remember`、`/new` 均有明确回执文案，可据此确认指令被正确分发。
 - **改了 system prompt / tools / mcp_servers 后**：需 `arkagent update-agent` 把新配置烧进 Agent（生成新版本，Agent ID 不变）才生效——仅改 mock 数据/权限则重启 mock 即可，无需 update。
+
+## 附录 D · 每个卡点的验收清单（演示时关注什么）
+
+下表把每个卡点的**演示动作 → 该盯哪里 → 看到什么算通过（✅）→ 看到什么是没通过（❌）→ 怎么排查**收拢到一处。演示时对照着走即可。
+
+### 卡点 A · static_bearer 鉴权
+
+| 项 | 内容 |
+| --- | --- |
+| 演示动作 | 用**授权账号**问私有数据：「查我的销售线索和本月业绩」（**别问车型续航**，那不调工具） |
+| 盯哪里 | mock MCP 终端日志 |
+| ✅ 通过 | 出现 `[MCP] POST /mcp  auth=Bearer demo…oken  ✅ static_bearer 校验通过`，随后有 `CallToolRequest`；模型给出真实线索/KPI |
+| ❌ 没通过 | `auth=<缺失>`（凭据 URL 不匹配 → 匿名连接）／`❌ token 不匹配`（token 值不对）／`❌ 401 拒绝`；模型说"MCP 未连接/工具不可用" |
+| 怎么排查 | 三方 URL 是否一致（Agent 定义 = Vault 凭据 `mcp_server_url` = config.env）；两边 token 是否一致；地址末尾无 `/`。换址用 `arkagent update-agent --mcp-url <新址>` 一键重建凭据 |
+
+### 卡点 B · OpenID 透传
+
+| 项 | 内容 |
+| --- | --- |
+| 演示动作 | 同一句「查我的销售线索和本月业绩」，**换两个飞书账号**各问一次对比 |
+| 盯哪里 | mock 日志的 `open_id=…` 字段 + 两账号返回的数据是否不同 |
+| ✅ 通过 | 日志打**完整 open_id** 且两账号各不相同：`get_my_sales_data  open_id=ou_…  ✅ 命中白名单 → 俞麟（销售经理）`；两账号拿到各自的线索/KPI = 隔离成立 |
+| ❌ 没通过 | 日志 `open_id=<空>`（没透传进来）／两账号数据相同（串号）／`❌ 不在白名单`（真机账号首次正常现象，见下） |
+| 怎么排查 | `<空>`：查 [gateway.py:185](../arkagent/gateway.py#L185) 是否注入、system prompt 是否要求 bash 读；真机账号被拒是**预期**——把日志里的真实 open_id 加进 [USER_DATA](../mock_mcp/data.py#L14-L50) 重启 mock 即可（这条"被拒"本身也证明 openid 已正确透传） |
+
+### 卡点 C · 岗位注入（软层话术 + 硬层权限）
+
+| 项 | 内容 |
+| --- | --- |
+| 演示动作（软层） | `/whoami` →（若已是经理，先 `/role 销售顾问/上海浦东蔚来中心` 回退）→ `/role 销售经理/上海浦东蔚来中心` → 再问审批口径/话术 |
+| ✅ 通过（软层） | `/role` 回执"已更新岗位为「销售经理」，下一轮自动声明"；后续回答口径随岗位变；**全程不新建 Session** |
+| 演示动作（硬层） | **经理账号**问「看看我们门店团队整体的销售漏斗」；再用**顾问账号**问同一句 |
+| ✅ 通过（硬层） | 经理：日志 `✅ 权限校验通过 → 返回漏斗`，模型给真实漏斗；顾问：日志 `❌ 无 view_team_pipeline 权限，后端拒绝`，模型如实答"你当前岗位无权查看" |
+| ❌ 没通过 | 顾问账号 `/role 销售经理` 后竟拿到漏斗（说明硬层被绕过——这是**严重错误**）；或模型对 `forbidden` 编造漏斗数据 |
+| 关键验收点 | **用顾问账号先 `/role 销售经理` 再问漏斗，仍必须被 `forbidden` 拒**——证明硬层认后端 permissions、不认对话层声称的岗位。这是卡点 C 最该演示的"安全正确"边界 |
+
+### 卡点 D · 跨 Session 记忆
+
+| 项 | 内容 |
+| --- | --- |
+| 演示动作 | `/remember 我负责的重点客户是张先生，倾向 ET9` → `/new` → 「我上次说的重点客户是谁？倾向什么车型？」（**必须用 `/remember`，不能用自然语言"记住…"**） |
+| 盯哪里 | `/remember` 回执路径 + `/new` 后的回答 |
+| ✅ 通过 | `/remember` 回执带实际写入路径 `/notes/…`；`/new` 开新会话后仍答出"张先生 / ET9" = 跨会话记忆成立 |
+| ❌ 没通过 | `/new` 后答不出/说不知道（多半是用了自然语言"记住"而非 `/remember`，没真正写回 Store）；或回"当前未启用长期记忆功能"（Gateway 未挂载 MemoryManager） |
+| 怎么排查 | 确认用的是 `/remember` 指令（走 [remember](../arkagent/memory.py#L54-L64) 才真正写 Store）；确认 Gateway 已挂 memory；同一 open_id 每次挂的是[同一个 Store](../arkagent/store.py#L184-L202)（`TEAM_STORE_ENABLED` 只额外控制团队共享 Store D-3，与用户记忆无关） |
+
+> **一句话串起来**：A 看 mock 日志的 `✅ static_bearer`，B 看日志 `open_id` 且两账号数据不同，C 的关键是"顾问改软层仍被硬层拒"，D 的关键是"`/new` 后仍记得"。这四个现象都出现 = 四卡点全部打通。
 </content>
 </invoke>

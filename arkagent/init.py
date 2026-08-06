@@ -20,6 +20,7 @@ from .node_helper import FeishuAppCredentials
 
 CUSTOMER_A_AGENT_NAME = "客户A销售助手（方舟 MA 版）"
 MCP_SERVER_NAME = "customer-a-mock"
+CREDENTIAL_NAME = "customer-a-mcp-static-bearer"
 
 CUSTOMER_A_AGENT_SYSTEM = """你是客户A门店的销售助手，服务对象是门店销售顾问与销售经理。
 
@@ -121,7 +122,7 @@ async def run_guided_init(
     vault_id = vault["id"] if vault else await ark.create_vault(vault_name)
 
     # 卡点 A：static_bearer 凭据。创建时方舟握手探测 MCP，不可达会直接 4xx 失败。
-    credential_name = "customer-a-mcp-static-bearer"
+    credential_name = CREDENTIAL_NAME
     existing = next(
         (c for c in await ark.list_credentials(vault_id) if c["display_name"] == credential_name and c["auth_type"] == "static_bearer"),
         None,
@@ -156,6 +157,7 @@ async def run_guided_init(
             "FEISHU_APP_ID": feishu_app.app_id,
             "FEISHU_APP_SECRET": feishu_app.app_secret,
             "MCP_SERVER_URL": mcp_server_url,
+            "MCP_STATIC_BEARER": mcp_static_bearer,
             "GATEWAY_DB_PATH": gateway_database_path,
             "SESSION_TIMEOUT_MS": "600000",
             "ROLE_TTL_MS": str(role_ttl_ms),

@@ -107,6 +107,8 @@ async def test_guided_init_creates_environment_and_static_bearer_when_missing():
         assert mode == 0o600
         content = open(env_path, encoding="utf-8").read()
         assert 'FEISHU_APP_ID="cli-2"' in content
+        # 卡点 A token 落盘，供 update-agent --mcp-url 换地址时重建凭据用
+        assert 'MCP_STATIC_BEARER="mcp-token"' in content
 
 
 def _fake_app(app_id):

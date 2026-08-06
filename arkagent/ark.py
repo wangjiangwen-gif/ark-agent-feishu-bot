@@ -197,6 +197,14 @@ class ArkClient:
         )
         return _response_id(payload, "Credential")
 
+    async def delete_credential(self, vault_id: str, credential_id: str) -> None:
+        """硬删除凭据。mcp_server_url 是结构性字段、创建后锁定，换 MCP 地址只能删旧建新
+        （官方「轮换凭据」：结构性字段不可改，删除旧凭据再创建新的）。"""
+        await self._request(
+            "DELETE",
+            f"/vaults/{quote(vault_id, safe='')}/credentials/{quote(credential_id, safe='')}",
+        )
+
     # ---- memory stores (卡点 D) ----
     async def create_memory_store(self, name: str, description: str) -> str:
         payload = await self._request("POST", "/memory_stores", {"name": name, "description": description})

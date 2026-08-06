@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "init":
             asyncio.run(_init())
         elif command == "update-agent":
-            asyncio.run(_update_agent())
+            asyncio.run(_update_agent(argv[1:]))
         else:
             _print_help()
         return 0
@@ -173,11 +173,14 @@ async def _init() -> None:
     print("初始化完成。运行 `arkagent run` 启动 Gateway。")
 
 
-async def _update_agent() -> None:
+async def _update_agent(args: list[str] | None = None) -> None:
     from .ark import ArkClient
-    from .init import build_customer_a_agent_config
+    from .config import update_env_file
+    from .init import CREDENTIAL_NAME, build_customer_a_agent_config
 
-    _load_saved_environment()
+    new_mcp_url = _parse_mcp_url_arg(args or [])
+
+    paths = _load_saved_environment()
     config = load_config()
     ark = ArkClient(config.ark_api_key, config.ark_base_url)
     try:
@@ -185,13 +188,75 @@ async def _update_agent() -> None:
         if current.get("version") is None:
             raise RuntimeError(f"无法获取 Agent {config.ark_agent_id} 的当前版本，无法更新")
         version = int(current["version"])
-        new_config = build_customer_a_agent_config(config.mcp_server_url)
+
+        # 换 MCP 地址：static_bearer 凭据的 mcp_server_url 创建后锁定，只能删旧建新。
+        # 安全顺序——先用新地址建凭据（方舟会握手探测，不可达即 4xx 中止，旧配置无损），
+        # 再更新 Agent 指向新地址，写回 .env，最后删旧凭据。
+        target_mcp_url = config.mcp_server_url
+        if new_mcp_url and new_mcp_url != config.mcp_server_url:
+            if _looks_like_placeholder_token(config.mcp_static_bearer):
+                raise RuntimeError(
+                    "换 MCP 地址需要有效的 static_bearer token，但 config.env 中的 MCP_STATIC_BEARER "
+                    "缺失或疑似占位/误填（为空、形如 'xxx' 或被填成了 URL）。请在 config.env 补上 mock "
+                    "实际校验的 token（与启动 mock 时的 MCP_STATIC_BEARER 一致），或重新运行 arkagent init。"
+                )
+            target_mcp_url = new_mcp_url
+            # 清理所有 URL 与新地址不一致的旧 static_bearer 凭据——不按名字匹配，
+            # 以兼容历史遗留的异名凭据（如脱敏前的 nio-mcp-static-bearer），避免留下
+            # 指向旧地址的残留导致方舟找不到匹配凭据、退化成匿名连接（auth 缺失 → 401）。
+            old_credentials = [
+                c for c in await ark.list_credentials(config.ark_vault_id)
+                if c["auth_type"] == "static_bearer" and c.get("mcp_server_url") != target_mcp_url
+            ]
+            new_credential_id = await ark.create_static_bearer_credential(
+                config.ark_vault_id, CREDENTIAL_NAME, target_mcp_url, config.mcp_static_bearer
+            )
+            print(f"已用新地址创建 static_bearer 凭据：{new_credential_id}（创建时已握手探测 MCP 可达）")
+
+        new_config = build_customer_a_agent_config(target_mcp_url)
         updated = await ark.update_agent(config.ark_agent_id, new_config, version)
+
+        if target_mcp_url != config.mcp_server_url:
+            update_env_file(paths.config_path, {"MCP_SERVER_URL": target_mcp_url})
+            # Agent 已切到新凭据，旧凭据（指向旧地址）可安全删除。
+            for old in old_credentials:
+                await ark.delete_credential(config.ark_vault_id, old["id"])
+                print(f"已删除指向旧地址的凭据：{old['id']}")
+
         print(f"已更新 Agent {updated['id']}：v{version} → v{updated['version']}")
-        print(f"MCP Server：{config.mcp_server_url}")
+        print(f"MCP Server：{target_mcp_url}")
         print("Agent ID 不变，飞书 bot 无需重建。运行 `arkagent run` 即用新配置。")
     finally:
         await ark.aclose()
+
+
+def _looks_like_placeholder_token(token: str | None) -> bool:
+    """判断 static_bearer token 是否缺失/疑似占位或误填，用于换址前早失败。
+
+    命中任一即视为无效：为空、纯占位（如 xxx/changeme/placeholder/todo）、
+    或被误填成了 URL（http/https 开头）——这些都无法通过方舟对 MCP 的握手鉴权探测。
+    """
+    value = (token or "").strip()
+    if not value:
+        return True
+    lowered = value.lower()
+    if lowered.startswith(("http://", "https://")):
+        return True
+    if set(lowered) <= {"x"}:  # 全是 x，如 "xxx"
+        return True
+    return lowered in {"changeme", "placeholder", "todo", "your-token", "token"}
+
+
+def _parse_mcp_url_arg(args: list[str]) -> str | None:
+    """从 update-agent 的参数里解析 --mcp-url <地址> / --mcp-url=<地址>。未提供返回 None。"""
+    for index, token in enumerate(args):
+        if token == "--mcp-url":
+            if index + 1 >= len(args):
+                raise RuntimeError("--mcp-url 需要一个地址参数，例如 --mcp-url https://xxx/mcp")
+            return args[index + 1].strip()
+        if token.startswith("--mcp-url="):
+            return token[len("--mcp-url="):].strip()
+    return None
 
 
 def _print_help() -> None:
@@ -199,6 +264,7 @@ def _print_help() -> None:
         "arkagent [command]\n\n"
         "  init          交互式创建 客户A 销售助手 Agent + 飞书应用（扫码）+ static_bearer 凭据\n"
         "  update-agent  用最新的 system prompt/工具配置更新现有 Agent（不重扫码、不新建 bot）\n"
+        "                加 --mcp-url <新地址> 可一并换 MCP 公网地址：重建 static_bearer 凭据 + 写回 config.env\n"
         "  doctor        检查配置并验证方舟 Agent\n"
         "  run           启动本地 Gateway（默认）"
     )

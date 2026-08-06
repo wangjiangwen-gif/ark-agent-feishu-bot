@@ -36,6 +36,7 @@ class GatewayConfig:
     feishu_app_id: str
     feishu_app_secret: str
     mcp_server_url: str
+    mcp_static_bearer: str
     database_path: str
     session_timeout_ms: int
     role_ttl_ms: int
@@ -93,6 +94,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> GatewayConfig:
         feishu_app_id=environ["FEISHU_APP_ID"],
         feishu_app_secret=environ["FEISHU_APP_SECRET"],
         mcp_server_url=environ["MCP_SERVER_URL"],
+        mcp_static_bearer=environ.get("MCP_STATIC_BEARER") or "",
         database_path=environ.get("GATEWAY_DB_PATH") or DEFAULT_DB_PATH,
         session_timeout_ms=session_timeout_ms,
         role_ttl_ms=role_ttl_ms,
@@ -114,3 +116,18 @@ def _positive_int(value: Optional[str], fallback: int) -> int:
 def serialize_env(values: Mapping[str, str]) -> str:
     """把配置写成 KEY="json-quoted-value"（与原 serializeEnv 一致，避免注入可执行 shell）。"""
     return "".join(f"{key}={json.dumps(value, ensure_ascii=False)}\n" for key, value in values.items())
+
+
+def update_env_file(path: str, updates: Mapping[str, str]) -> None:
+    """就地更新 config.env 中的若干键，保留其余键与文件权限（0600）。
+
+    仅用于机器生成的 config.env（无注释/无手写格式），故 parse→merge→serialize 无损。
+    """
+    import stat
+
+    with open(path, "r", encoding="utf-8") as fh:
+        current = parse_env_text(fh.read())
+    current.update(updates)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(serialize_env(current))
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
