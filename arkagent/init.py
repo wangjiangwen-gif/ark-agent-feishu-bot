@@ -1,7 +1,7 @@
-"""交互式初始化：创建 NIO 销售助手 Agent + Environment + Vault + static_bearer 凭据，并写 config.env。
+"""交互式初始化：创建 客户A 销售助手 Agent + Environment + Vault + static_bearer 凭据，并写 config.env。
 
 与原 TS init 的差异：
-  - Agent 从「lark-cli 办公助手」改为「NIO 销售助手」：挂 mcp_servers + mcp_toolset（连 mock MCP）+ agent_toolset（读 Memory Store）。
+  - Agent 从「lark-cli 办公助手」改为「客户A 销售助手」：挂 mcp_servers + mcp_toolset（连 mock MCP）+ agent_toolset（读 Memory Store）。
   - 去掉用户 OAuth：飞书应用仅需 tenant 身份；OpenID 在运行时从消息事件直接取。
   - 新增 static_bearer 凭据（卡点 A）：创建时方舟会握手探测 MCP，故 MCP 必须先公网可达。
   - Environment 只放通用配置（透传 FEISHU_USER_OPEN_ID 靠会话级 override，卡点 B）。
@@ -18,10 +18,10 @@ from .ark import ArkClient
 from .config import serialize_env
 from .node_helper import FeishuAppCredentials
 
-NIO_AGENT_NAME = "蔚来销售助手（方舟 MA 版）"
-MCP_SERVER_NAME = "nio-mock"
+CUSTOMER_A_AGENT_NAME = "客户A销售助手（方舟 MA 版）"
+MCP_SERVER_NAME = "customer-a-mock"
 
-NIO_AGENT_SYSTEM = """你是蔚来（NIO）门店的销售助手，服务对象是门店销售顾问与销售经理。
+CUSTOMER_A_AGENT_SYSTEM = """你是客户A门店的销售助手，服务对象是门店销售顾问与销售经理。
 
 # 身份与数据边界
 运行环境通过环境变量 FEISHU_USER_OPEN_ID 注入当前用户的飞书 open_id。需要用到 open_id 时，用 bash 执行 `printf '%s' "$FEISHU_USER_OPEN_ID"` 读取它的值；调用 MCP 工具（如 get_my_sales_data）查询用户专属数据时，必须把该 open_id 作为参数传入；不要臆造或串用他人 open_id。
@@ -55,13 +55,13 @@ class InitResult:
     env_path: str
 
 
-def build_nio_agent_config(mcp_server_url: str) -> dict:
-    """NIO 销售助手 Agent 定义：mcp_servers/mcp_toolset 一一对应 + agent_toolset 读记忆。"""
+def build_customer_a_agent_config(mcp_server_url: str) -> dict:
+    """客户A 销售助手 Agent 定义：mcp_servers/mcp_toolset 一一对应 + agent_toolset 读记忆。"""
     return {
-        "name": NIO_AGENT_NAME,
-        "description": "蔚来门店销售助手：按用户身份查线索/业绩，读长期记忆，答车型话术",
+        "name": CUSTOMER_A_AGENT_NAME,
+        "description": "客户A门店销售助手：按用户身份查线索/业绩，读长期记忆，答车型话术",
         "model": {"id": "doubao-seed-2-1-pro-260628"},
-        "system": NIO_AGENT_SYSTEM,
+        "system": CUSTOMER_A_AGENT_SYSTEM,
         "tools": [
             # 卡点 D 需要 agent_toolset 的 read/glob/grep 读 /mnt/memory/；卡点 B 需要 bash 读
             # 环境变量 FEISHU_USER_OPEN_ID 拿到当前用户 open_id。所以 bash 必须保留，但要靠 system
@@ -85,7 +85,7 @@ def build_nio_agent_config(mcp_server_url: str) -> dict:
         "mcp_servers": [
             {"type": "url", "name": MCP_SERVER_NAME, "url": mcp_server_url},
         ],
-        "metadata": {"created_via": "nio-ma-demo", "scenario": "nio-sales-assistant"},
+        "metadata": {"created_via": "customer-a-ma-demo", "scenario": "customer-a-sales-assistant"},
     }
 
 
@@ -110,18 +110,18 @@ async def run_guided_init(
     ark = create_ark(ark_api_key, ark_base_url.rstrip("/"))
 
     # 创建是非幂等操作，失败后不自动重试。
-    agent = await ark.create_agent(build_nio_agent_config(mcp_server_url))
+    agent = await ark.create_agent(build_customer_a_agent_config(mcp_server_url))
 
     feishu_app = await create_feishu_app()
 
     # Vault：稳定命名，便于重跑 init 复用。
-    vault_name = f"nio-ma-{_sanitize(agent['id'])}"[:100]
+    vault_name = f"customer-a-ma-{_sanitize(agent['id'])}"[:100]
     vaults = await ark.list_vaults()
     vault = next((v for v in vaults if v["display_name"] == vault_name), None)
     vault_id = vault["id"] if vault else await ark.create_vault(vault_name)
 
     # 卡点 A：static_bearer 凭据。创建时方舟握手探测 MCP，不可达会直接 4xx 失败。
-    credential_name = "nio-mcp-static-bearer"
+    credential_name = "customer-a-mcp-static-bearer"
     existing = next(
         (c for c in await ark.list_credentials(vault_id) if c["display_name"] == credential_name and c["auth_type"] == "static_bearer"),
         None,
@@ -132,7 +132,7 @@ async def run_guided_init(
         credential_id = await ark.create_static_bearer_credential(vault_id, credential_name, mcp_server_url, mcp_static_bearer)
 
     # Environment：稳定命名（含 App ID，避免误复用旧应用的 Environment）。
-    environment_name = f"nio-ma-{_sanitize(agent['id'])}-{_sanitize(feishu_app.app_id)}"[:60]
+    environment_name = f"customer-a-ma-{_sanitize(agent['id'])}-{_sanitize(feishu_app.app_id)}"[:60]
     environments = await ark.list_environments()
     environment = next((e for e in environments if e["name"] == environment_name), None)
     environment_created = False

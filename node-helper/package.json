@@ -1,5 +1,5 @@
 {
-  "name": "nio-ma-demo-node-helper",
+  "name": "customer-a-ma-demo-node-helper",
   "version": "0.1.0",
   "private": true,
   "description": "Node 小岛：仅保留飞书 registerApp（扫码一键建应用），供 Python 主体子进程调用",

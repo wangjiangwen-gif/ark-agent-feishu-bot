@@ -3,16 +3,16 @@ import tempfile
 
 from arkagent.init import (
     MCP_SERVER_NAME,
-    NIO_AGENT_NAME,
-    build_nio_agent_config,
+    CUSTOMER_A_AGENT_NAME,
+    build_customer_a_agent_config,
     run_guided_init,
 )
 from arkagent.node_helper import FeishuAppCredentials
 
 
-def test_nio_agent_config_pairs_mcp_server_and_toolset():
-    config = build_nio_agent_config("https://mcp.example.com/mcp")
-    assert config["name"] == NIO_AGENT_NAME
+def test_customer_a_agent_config_pairs_mcp_server_and_toolset():
+    config = build_customer_a_agent_config("https://mcp.example.com/mcp")
+    assert config["name"] == CUSTOMER_A_AGENT_NAME
     server_names = [s["name"] for s in config["mcp_servers"]]
     toolset_refs = [t["mcp_server_name"] for t in config["tools"] if t["type"] == "mcp_toolset"]
     # mcp_servers 与 mcp_toolset 必须一一对应
@@ -63,9 +63,9 @@ async def test_guided_init_reuses_environment_with_stable_name():
     with tempfile.TemporaryDirectory() as tmp:
         env_path = os.path.join(tmp, "config.env")
         ark = FakeArk(
-            environments=[{"id": "env-existing", "name": "nio-ma-agent-1-cli-1"}],
-            vaults=[{"id": "vlt-1", "display_name": "nio-ma-agent-1"}],
-            credentials=[{"id": "vcrd-1", "display_name": "nio-mcp-static-bearer", "auth_type": "static_bearer"}],
+            environments=[{"id": "env-existing", "name": "customer-a-ma-agent-1-cli-1"}],
+            vaults=[{"id": "vlt-1", "display_name": "customer-a-ma-agent-1"}],
+            credentials=[{"id": "vcrd-1", "display_name": "customer-a-mcp-static-bearer", "auth_type": "static_bearer"}],
         )
         result = await run_guided_init(
             ark_api_key="ark-secret",

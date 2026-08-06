@@ -1,4 +1,4 @@
-# 蔚来 MA 迁移 Demo · 四卡点数据流转说明
+# 客户A MA 迁移 Demo · 四卡点数据流转说明
 
 > 面向：交付 / 二次开发同学。本文逐个拆解 A/B/C/D 四个卡点的**数据流转、Gateway 入口、mock 数据、预期结果**。
 > 配套代码在本仓库；演示脚本见 [README](../README.md) 的「演示脚本」小节。
@@ -54,7 +54,7 @@ sequenceDiagram
 ## 卡点 A · static_bearer 鉴权 + 模型直调 MCP
 
 ### 一句话
-给 MCP 加一道 `Authorization: Bearer <token>` 门禁；方舟编排层调 MCP 时自动带上凭据里的 token，mock 校验通过才返回数据。**这是"安全降级"演示，不是 NIO 私有签名**。
+给 MCP 加一道 `Authorization: Bearer <token>` 门禁；方舟编排层调 MCP 时自动带上凭据里的 token，mock 校验通过才返回数据。**这是"安全降级"演示，不是 客户A 私有签名**。
 
 ### Gateway 入口
 Gateway 本身对 A **不做特殊处理**，只在建 Session 时把 `vault_id` 传下去——凭据存在 Vault 里，方舟编排层调 MCP 时自动附加 Bearer。
@@ -349,7 +349,7 @@ sequenceDiagram
 
 ### 二、mock 数据设计（data.py）
 
-真实环境这些数据来自 NIO 内部系统；demo 用**内存字典** mock（无需真库）。共四张表 + 一套权限模型：
+真实环境这些数据来自 客户A 内部系统；demo 用**内存字典** mock（无需真库）。共四张表 + 一套权限模型：
 
 | 数据 | 结构 | 说明 |
 | --- | --- | --- |

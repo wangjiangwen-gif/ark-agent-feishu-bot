@@ -22,9 +22,9 @@ async function main() {
 
   console.error("即将创建飞书机器人应用，请使用飞书扫码确认。");
   const credentials = await Lark.registerApp({
-    source: "nio-ma-demo",
+    source: "customer-a-ma-demo",
     appPreset: {
-      name: "蔚来 MA Demo Bot",
+      name: "客户A MA Demo Bot",
       desc: "由火山方舟 Managed Agents 驱动的飞书机器人（迁移方案演示）"
     },
     addons: {

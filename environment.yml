@@ -1,4 +1,4 @@
-name: nio-ma-demo
+name: customer-a-ma-demo
 channels:
   - conda-forge
 dependencies:

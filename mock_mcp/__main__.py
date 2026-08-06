@@ -1,4 +1,4 @@
-"""启动 mock NIO MCP Server。
+"""启动 mock 客户A MCP Server。
 
     MCP_STATIC_BEARER=<token> MCP_HOST=0.0.0.0 MCP_PORT=8765 python -m mock_mcp
 """
@@ -20,7 +20,7 @@ def main() -> None:
     if not token:
         print("[warn] 未设置 MCP_STATIC_BEARER，服务将不校验 Bearer（仅限本地调试）。")
     app = build_app(token=token)
-    print(f"mock NIO MCP 监听 http://{host}:{port}/mcp")
+    print(f"mock 客户A MCP 监听 http://{host}:{port}/mcp")
     uvicorn.run(app, host=host, port=port)
 
 

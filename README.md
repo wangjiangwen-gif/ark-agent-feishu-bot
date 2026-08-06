@@ -10,7 +10,7 @@
 
 | 案例                        | 涉及能力                                                                  | 文档                                                                                                             |
 | --------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| **蔚来 MA 迁移 Demo** | 身份鉴权(static_bearer) · OpenID 透传 · 岗位信息注入 · 跨 Session 记忆 | [方案与运行说明](docs/MA迁移Demo-四卡点方案与运行说明.md) · [数据流转说明](docs/MA迁移Demo-四卡点数据流转说明.md) |
+| **客户A MA 迁移 Demo** | 身份鉴权(static_bearer) · OpenID 透传 · 岗位信息注入 · 跨 Session 记忆 | [方案与运行说明](docs/MA迁移Demo-四卡点方案与运行说明.md) · [数据流转说明](docs/MA迁移Demo-四卡点数据流转说明.md) |
 
 > 新增客户场景：在 [docs/](docs/) 下新建案例文档，并在本表登记。通用骨架（下面几节）保持稳定，案例只描述“在骨架的哪一环加了什么”。
 
@@ -48,8 +48,8 @@
 ```bash
 # 1) 环境
 conda env create -f environment.yml
-conda activate nio-ma-demo
-pip install -e ".[dev]"          # 安装本包（arkagent / nio-mock-mcp 命令）
+conda activate customer-a-ma-demo
+pip install -e ".[dev]"          # 安装本包（arkagent / customer-a-mock-mcp 命令）
 (cd node-helper && npm install)  # 装 Node 小岛依赖（registerApp 扫码用）
 pytest -q                        # 确认环境就绪
 
@@ -61,7 +61,7 @@ arkagent doctor                  # 检查配置
 arkagent run
 ```
 
-各案例可能需要先起自己的 MCP（如蔚来案例的 mock）并暴露公网，再 `init`——以案例文档为准。
+各案例可能需要先起自己的 MCP（如客户A案例的 mock）并暴露公网，再 `init`——以案例文档为准。
 
 ## `arkagent` CLI
 

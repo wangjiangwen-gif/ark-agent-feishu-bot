@@ -1,6 +1,6 @@
-"""mock NIO 业务数据：按 open_id 分桶，演示「OpenID 透传后按用户返回专属数据」。
+"""mock 客户A 业务数据：按 open_id 分桶，演示「OpenID 透传后按用户返回专属数据」。
 
-真实环境这些数据来自 NIO 内部系统；这里用内存字典 mock。
+真实环境这些数据来自 客户A 内部系统；这里用内存字典 mock。
 """
 from __future__ import annotations
 

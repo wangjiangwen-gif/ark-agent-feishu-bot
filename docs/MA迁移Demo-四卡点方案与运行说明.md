@@ -2,7 +2,7 @@
 
 > 一份「喂到嘴边」的可运行 Demo：把 FDE 建议清单里的四个客户卡点，直接在飞书对话界面里演示出来。
 
-飞书用户 @ Bot → 本地 Gateway → 火山方舟 Managed Agents Session → mock NIO MCP Server。四个卡点全程在**与 Bot 的飞书会话**中演示，无需额外前端。
+飞书用户 @ Bot → 本地 Gateway → 火山方舟 Managed Agents Session → mock 客户A MCP Server。四个卡点全程在**与 Bot 的飞书会话**中演示，无需额外前端。
 
 主体是 Python；只有「扫码创建飞书应用」这一步没有 Python 等价物，保留为一个 Node 小岛（子进程调用）。
 
@@ -10,14 +10,14 @@
 
 | 卡点                        | 客户问题                                               | 本 Demo 方案                                                                                                                            | 归属                                                                                        |
 | --------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| **A** 身份鉴权        | NIO 私有签名接入 MCP                                   | **安全降级**：`static_bearer` 凭据 + open_id 白名单（**不是** NIO 私有签名，仅演示鉴权链路）                              | 客户侧适配                                                                                  |
+| **A** 身份鉴权        | 客户A 私有签名接入 MCP                                   | **安全降级**：`static_bearer` 凭据 + open_id 白名单（**不是** 客户A 私有签名，仅演示鉴权链路）                              | 客户侧适配                                                                                  |
 | **B** 用户身份透传    | 把对话用户（非 Bot）的 open_id 透传到 MCP 做数据权限   | **会话级环境变量**：创建 Session 时用 `environment_with_overrides` 注入 `FEISHU_USER_OPEN_ID`，Agent 把它作为工具入参传给 MCP | 客户侧适配                                                                                  |
 | **C** 岗位信息注入    | 岗位信息注入 system prompt 层，缓存 1 天，Session 不变 | Gateway 维护`(open_id, roleInfo, refreshedAt)` 缓存（24h TTL）；仅首轮 / 缓存 miss 后首访挂一次 `system.message`                    | C-1 客户侧 / C-2 MA 已支持                                                                  |
 | **D** 跨 Session 记忆 | 岗位调动 / 换场景后记忆延续                            | 每用户专属 Memory Store，创建 Session 时经`resources` 挂到 `/mnt/memory/`（只读）；写入用 `/remember` 显式指令由应用侧调 API 写回 | 只读挂载/API 增删改 MA 已支持；「记什么、何时写」客户侧适配；对话自动抽取属 MA 未来 Feature |
 
 > **卡点 B 的字段来源说明**：会话级环境变量注入未在方舟官方文档正文明写，但已由 MA 平台负责人口头确认「创建 Session 接口能传环境变量」且线下跑通。本 Demo 照此实现（见 [ark.py](../arkagent/ark.py) 的 `create_session`）。若平台后续改为标准字段，改回对应字段即可。
 >
-> **卡点 A 是安全降级，不是 NIO 私有签名**：仅用 `static_bearer` + 白名单演示鉴权链路，勿向客户表述为「已实现 NIO 私有签名」。
+> **卡点 A 是安全降级，不是 客户A 私有签名**：仅用 `static_bearer` + 白名单演示鉴权链路，勿向客户表述为「已实现 客户A 私有签名」。
 
 > 📘 **想看每个卡点的数据怎么流转**（时序图 + Gateway 入口 + mock 数据 + 预期结果 + 日志验证）：见 [四卡点数据流转说明](MA迁移Demo-四卡点数据流转说明.md)。
 
@@ -38,7 +38,7 @@
       火山方舟 Managed Agents Session
                  │  连 MCP 时注入 static Bearer（卡点 A）
                  ▼
-        mock NIO MCP Server（公网可达）
+        mock 客户A MCP Server（公网可达）
      get_my_sales_data(open_id) · get_vehicle_info(model)
 ```
 
@@ -53,8 +53,8 @@
 
 ```bash
 conda env create -f environment.yml
-conda activate nio-ma-demo
-pip install -e ".[dev]"          # 安装本包（arkagent / nio-mock-mcp 命令）
+conda activate customer-a-ma-demo
+pip install -e ".[dev]"          # 安装本包（arkagent / customer-a-mock-mcp 命令）
 (cd node-helper && npm install)  # 装 Node 小岛依赖（registerApp 扫码用）
 ```
 
@@ -64,12 +64,12 @@ pip install -e ".[dev]"          # 安装本包（arkagent / nio-mock-mcp 命令
 pytest -q
 ```
 
-## 二、启动 mock NIO MCP 并暴露公网
+## 二、启动 mock 客户A MCP 并暴露公网
 
 先在一个终端起 mock MCP（自带 A/B 演示数据）：
 
 ```bash
-MCP_STATIC_BEARER="demo-bearer-token" MCP_HOST=127.0.0.1 MCP_PORT=8765 nio-mock-mcp
+MCP_STATIC_BEARER="demo-bearer-token" MCP_HOST=127.0.0.1 MCP_PORT=8765 customer-a-mock-mcp
 # 或：python -m mock_mcp
 ```
 
@@ -131,7 +131,7 @@ arkagent init
 
 1. 掩码输入**方舟 API Key**（以 `•` 回显，不显示原文）；
 2. 输入 **mock MCP 公网地址** 与 **static Bearer token**；
-3. 创建「蔚来销售助手（方舟 MA 版）」Agent（挂 `mcp_servers` + `mcp_toolset` 连 mock MCP，并启用 `agent_toolset` 以读 Memory Store）；
+3. 创建「客户A销售助手（方舟 MA 版）」Agent（挂 `mcp_servers` + `mcp_toolset` 连 mock MCP，并启用 `agent_toolset` 以读 Memory Store）；
 4. **扫码创建飞书应用**（Node 小岛，仅 tenant 身份 `im:message:send_as_bot` + `im.message.receive_v1` 事件，**无用户 OAuth**）；
 5. 创建 / 复用 Vault，并创建 `static_bearer` 凭据（此时方舟会握手探测 MCP，所以第二步的地址必须已公网可达）；
 6. 创建 / 复用 Environment；
@@ -147,7 +147,7 @@ arkagent doctor
 
 ### 日常迭代：只更新 Agent（不重扫码）
 
-改了 Agent 的 system prompt 或工具配置（[init.py](../arkagent/init.py) 的 `build_nio_agent_config`）后，**不需要**重跑 `init` 重新扫码建应用——那样只会堆出一个新 Bot。直接：
+改了 Agent 的 system prompt 或工具配置（[init.py](../arkagent/init.py) 的 `build_customer_a_agent_config`）后，**不需要**重跑 `init` 重新扫码建应用——那样只会堆出一个新 Bot。直接：
 
 ```bash
 arkagent update-agent
@@ -244,7 +244,7 @@ arkagent run
 ```text
 arkagent/            # Python 主体
   cli.py             # init / doctor / run 命令入口
-  init.py            # 创建 NIO 销售助手 Agent + Vault + static_bearer 凭据 + Environment，写 config
+  init.py            # 创建 客户A 销售助手 Agent + Vault + static_bearer 凭据 + Environment，写 config
   node_helper.py     # 以子进程调用 node-helper/register_app.mjs（扫码建应用）
   gateway.py         # 编排：去重 / Session 复用 / 指令 / 组装 B·C·D
   ark.py             # 火山方舟 Managed Agents httpx 客户端 + SSE
@@ -253,7 +253,7 @@ arkagent/            # Python 主体
   memory.py          # 卡点 D：每用户 / 团队 Memory Store
   store.py           # SQLite 状态
   config.py / paths.py / masked_input.py
-mock_mcp/            # mock NIO MCP Server（streamable-http）
+mock_mcp/            # mock 客户A MCP Server（streamable-http）
   server.py          # get_my_sales_data / get_vehicle_info + static_bearer 中间件
   data.py            # 按 open_id 分桶的演示数据
 node-helper/         # 唯一保留的 Node 小岛

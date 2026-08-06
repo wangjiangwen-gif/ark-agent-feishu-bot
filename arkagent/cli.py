@@ -146,7 +146,7 @@ async def _init() -> None:
     ark_api_key = read_masked_input("火山方舟 API Key（输入内容以 • 显示）: ").strip()
     if not ark_api_key:
         raise RuntimeError("方舟 API Key 不能为空")
-    mcp_server_url = input("mock NIO MCP 公网地址（形如 https://xxx/mcp）: ").strip()
+    mcp_server_url = input("mock 客户A MCP 公网地址（形如 https://xxx/mcp）: ").strip()
     if not mcp_server_url:
         raise RuntimeError("MCP Server 地址不能为空")
     mcp_static_bearer = read_masked_input("mock MCP 的 static Bearer token（输入内容以 • 显示）: ").strip()
@@ -166,7 +166,7 @@ async def _init() -> None:
         env_path=paths.config_path,
         gateway_database_path=paths.database_path,
     )
-    print(f"已创建蔚来销售助手 Agent：{result.agent_id}")
+    print(f"已创建客户A销售助手 Agent：{result.agent_id}")
     print(f"{'已创建' if result.environment_created else '已复用'} Environment：{result.environment_id}")
     print(f"已配置 static_bearer 凭据：{result.credential_id}（创建时已握手探测 MCP）")
     print(f"配置已安全写入 {result.env_path}。")
@@ -175,7 +175,7 @@ async def _init() -> None:
 
 async def _update_agent() -> None:
     from .ark import ArkClient
-    from .init import build_nio_agent_config
+    from .init import build_customer_a_agent_config
 
     _load_saved_environment()
     config = load_config()
@@ -185,7 +185,7 @@ async def _update_agent() -> None:
         if current.get("version") is None:
             raise RuntimeError(f"无法获取 Agent {config.ark_agent_id} 的当前版本，无法更新")
         version = int(current["version"])
-        new_config = build_nio_agent_config(config.mcp_server_url)
+        new_config = build_customer_a_agent_config(config.mcp_server_url)
         updated = await ark.update_agent(config.ark_agent_id, new_config, version)
         print(f"已更新 Agent {updated['id']}：v{version} → v{updated['version']}")
         print(f"MCP Server：{config.mcp_server_url}")
@@ -197,7 +197,7 @@ async def _update_agent() -> None:
 def _print_help() -> None:
     print(
         "arkagent [command]\n\n"
-        "  init          交互式创建 NIO 销售助手 Agent + 飞书应用（扫码）+ static_bearer 凭据\n"
+        "  init          交互式创建 客户A 销售助手 Agent + 飞书应用（扫码）+ static_bearer 凭据\n"
         "  update-agent  用最新的 system prompt/工具配置更新现有 Agent（不重扫码、不新建 bot）\n"
         "  doctor        检查配置并验证方舟 Agent\n"
         "  run           启动本地 Gateway（默认）"

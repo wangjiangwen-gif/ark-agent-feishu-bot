@@ -1,4 +1,4 @@
-"""mock NIO MCP Server（FastMCP streamable-http）。
+"""mock 客户A MCP Server（FastMCP streamable-http）。
 
 演示两个卡点的服务端配合：
   - 卡点 A：入站请求必须带 static Bearer token（Authorization: Bearer <token>），否则 401。
@@ -45,7 +45,7 @@ def build_server() -> FastMCP:
     # 经内网穿透（ngrok/cpolar）访问时外部域名会被判非法 Host → 421 Misdirected Request。
     # 本 mock 本就设计为被方舟经公网探测/调用，故关闭该保护（demo 场景）。
     server = FastMCP(
-        name="nio-mock-mcp",
+        name="customer-a-mock-mcp",
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -60,7 +60,7 @@ def build_server() -> FastMCP:
                     open_id, bucket.get("name", "?"), bucket.get("role", "?"))
         return json.dumps(bucket, ensure_ascii=False)
 
-    @server.tool(description="查询蔚来车型的定位、续航与卖点，用于话术与客户答疑。")
+    @server.tool(description="查询客户A车型的定位、续航与卖点，用于话术与客户答疑。")
     def get_vehicle_info(model: str) -> str:
         info = data.VEHICLE_CATALOG.get(model.upper())
         if not info:

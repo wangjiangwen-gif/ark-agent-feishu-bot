@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nio-ma-demo"
+name = "customer-a-ma-demo"
 version = "0.1.0"
-description = "蔚来 MA 迁移 Demo：飞书 Bot 通过火山方舟 Managed Agents 演示身份透传/岗位注入/跨 Session 记忆/静态 Bearer 鉴权"
+description = "客户A MA 迁移 Demo：飞书 Bot 通过火山方舟 Managed Agents 演示身份透传/岗位注入/跨 Session 记忆/静态 Bearer 鉴权"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
@@ -26,7 +26,7 @@ dev = [
 
 [project.scripts]
 arkagent = "arkagent.cli:main"
-nio-mock-mcp = "mock_mcp.__main__:main"
+customer-a-mock-mcp = "mock_mcp.__main__:main"
 
 [tool.setuptools]
 packages = ["arkagent", "mock_mcp"]
