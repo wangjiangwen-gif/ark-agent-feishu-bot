@@ -19,6 +19,8 @@ from urllib.parse import quote
 
 import httpx
 
+from .timing import Stopwatch, time_block, timing_logger
+
 REQUEST_TIMEOUT = 30.0
 
 
@@ -234,7 +236,8 @@ class ArkClient:
         body: dict = {"agent": agent_id}
         if env_overrides:
             # 卡点 B：会话级环境变量透传（environment_with_overrides）。
-            environment_config = await self.get_environment_config(environment_id)
+            with time_block("ark.get_environment_config", env=environment_id):
+                environment_config = await self.get_environment_config(environment_id)
             merged_env = {**(environment_config.get("env") or {}), **env_overrides}
             body["environment"] = {
                 "id": environment_id,
@@ -248,7 +251,8 @@ class ArkClient:
         if resources:
             body["resources"] = resources
 
-        payload = await self._request("POST", "/sessions", body)
+        with time_block("ark.create_session.post"):
+            payload = await self._request("POST", "/sessions", body)
         data = _unwrap(payload)
         ident = str(data.get("id") or data.get("session_id") or "")
         if not ident:
@@ -280,9 +284,19 @@ class ArkClient:
         try:
             # 先建流再发消息，避免秒回 Agent 在 SSE 订阅建立前就 message+idle。
             async def _drive() -> RunResult:
+                first_event_logged = False
+                first_message_logged = False
                 async with self._open_event_stream(session_id) as stream:
-                    await self.send_message(session_id, text, system_message=system_message)
+                    with time_block("ark.run.send_message", session=session_id):
+                        await self.send_message(session_id, text, system_message=system_message)
+                    # 从「消息已发出」开始计时，衡量方舟侧首字节/首条消息/到终态的等待。
+                    sw = Stopwatch()
                     async for event in stream:
+                        if not first_event_logged:
+                            first_event_logged = True
+                            timing_logger.info(
+                                "[timing] ark.run.first_event=%.1fms session=%s", sw.total_ms(), session_id
+                            )
                         eid = event.get("id")
                         if eid and eid in seen:
                             continue
@@ -291,13 +305,20 @@ class ArkClient:
                         if event.get("type") == "agent.message":
                             body = event_text(event)
                             if body:
+                                if not first_message_logged:
+                                    first_message_logged = True
+                                    timing_logger.info(
+                                        "[timing] ark.run.first_message=%.1fms session=%s", sw.total_ms(), session_id
+                                    )
                                 messages.append(body)
                         progress = event_progress(event)
                         if progress and on_progress:
                             await on_progress(progress)
                         if event.get("type") in ("session.error", "session.status_failed"):
+                            sw.mark("ark.run.to_terminal", session=session_id, terminal="failed")
                             return RunResult(terminal="failed", messages=messages)
                         if event.get("type") == "session.status_idle":
+                            sw.mark("ark.run.to_terminal", session=session_id, terminal="idle")
                             return RunResult(terminal="idle", messages=messages)
                 raise ArkError("事件流结束，但未观察到 Session 终态")
 

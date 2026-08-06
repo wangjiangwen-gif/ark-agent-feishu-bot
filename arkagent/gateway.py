@@ -19,6 +19,7 @@ from .feishu import IncomingMessage
 from .memory import MemoryManager
 from .role import RoleInfo, RoleManager
 from .store import ConversationKey, GatewayStore
+from .timing import Stopwatch, time_block
 
 Reply = Callable[[str, str], Awaitable[None]]
 DEFAULT_PROGRESS_DELAY_MS = 2_500
@@ -147,11 +148,14 @@ class Gateway:
         if self._before_create_session:
             await self._before_create_session()
 
+        sw = Stopwatch()
         session_id = self._store.get_session(key)
         progress_task: Optional[asyncio.Task] = None
+        first_message = not session_id
         if not session_id:
             await self._reply(message.chat_id, "已收到，正在处理。首次启动可能需要几分钟。")
-            session_id = await self._create_session(message)
+            with time_block("gateway.create_session", user=message.user_open_id, first=True):
+                session_id = await self._create_session(message)
             self._store.save_session(key, session_id, self._agent_id)
         else:
             progress_task = asyncio.get_event_loop().create_task(self._delayed_progress(message.chat_id))
@@ -159,32 +163,39 @@ class Gateway:
         # 卡点 C：仅在本 session 尚未注入过岗位时挂 system.message。
         system_message = None
         if self._role:
-            system_message = self._role.system_message_for(message.user_open_id, session_id)
+            with time_block("gateway.role_system_message", user=message.user_open_id):
+                system_message = self._role.system_message_for(message.user_open_id, session_id)
 
         try:
             # 不传 on_progress：避免把 tool_use/tool_result 转成进度消息刷屏。
-            result = await self._ark.run(session_id, message.text, self._timeout_ms, system_message=system_message)
+            with time_block("gateway.run", session=session_id, first=first_message):
+                result = await self._ark.run(session_id, message.text, self._timeout_ms, system_message=system_message)
         finally:
             if progress_task is not None:
                 progress_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await progress_task
-        await self._reply(message.chat_id, result_to_reply(result))
+        with time_block("gateway.reply", chat=message.chat_id):
+            await self._reply(message.chat_id, result_to_reply(result))
+        sw.mark("gateway.total", user=message.user_open_id, first=first_message)
 
     async def _create_session(self, message: IncomingMessage) -> str:
         resources: list[dict] = []
         role_info: Optional[RoleInfo] = None
         if self._role:
-            role_info = RoleInfo.from_dict(self._role.ensure_fresh_role(message.user_open_id))
+            with time_block("gateway.ensure_fresh_role", user=message.user_open_id):
+                role_info = RoleInfo.from_dict(self._role.ensure_fresh_role(message.user_open_id))
         if self._memory:
-            resources = await self._memory.build_session_resources(message.user_open_id, role_info)
-        return await self._ark.create_session(
-            self._agent_id,
-            self._environment_id,
-            vault_ids=[self._vault_id] if self._vault_id else [],
-            env_overrides={"FEISHU_USER_OPEN_ID": message.user_open_id},  # 卡点 B
-            resources=resources,  # 卡点 D
-        )
+            with time_block("gateway.build_session_resources", user=message.user_open_id):
+                resources = await self._memory.build_session_resources(message.user_open_id, role_info)
+        with time_block("gateway.ark_create_session", user=message.user_open_id):
+            return await self._ark.create_session(
+                self._agent_id,
+                self._environment_id,
+                vault_ids=[self._vault_id] if self._vault_id else [],
+                env_overrides={"FEISHU_USER_OPEN_ID": message.user_open_id},  # 卡点 B
+                resources=resources,  # 卡点 D
+            )
 
     async def _handle_remember_command(self, message: IncomingMessage, text: str) -> None:
         # 卡点 D 写入链路：方舟不自动记忆，写记忆须应用侧调 API。/remember <内容> 把内容

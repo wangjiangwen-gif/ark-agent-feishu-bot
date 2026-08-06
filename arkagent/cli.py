@@ -7,6 +7,7 @@ Gateway 的异步编排与方舟调用。WS 回调（主线程）通过 loop.cal
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -68,6 +69,12 @@ def _run() -> None:
     from .feishu import FeishuSender, start_feishu_gateway
     from .gateway import Gateway
     from .store import GatewayStore
+
+    # 配置日志：默认 INFO，输出 [timing] 打点等；可用 ARKAGENT_LOG_LEVEL 覆盖（如 DEBUG/WARNING）。
+    logging.basicConfig(
+        level=os.environ.get("ARKAGENT_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
     _load_saved_environment()
     config = load_config()
