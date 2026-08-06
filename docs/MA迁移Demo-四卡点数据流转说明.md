@@ -185,6 +185,28 @@ sequenceDiagram
 ### Gateway 入口（硬层）
 硬层**不在 Gateway**，在 MCP 后端：[get_team_pipeline(open_id)](../mock_mcp/server.py#L72-L93) 三层校验：白名单 → `view_team_pipeline` 权限位 → 返回漏斗。Gateway 只负责把 open_id 透传（同卡点 B）。
 
+### 软层岗位的生命周期（`/role` 到底改了什么）
+理解这一节才能正确演示"顾问 → 经理"的切换：
+
+- **初始岗位从哪来**：软层岗位不是写死的。首次收到某 open_id 的消息时，由 [mock_hr_provider](../arkagent/role.py#L91-L100) 按 open_id **后缀**决定 —— `…manager` → 销售经理、`…sales` → 销售顾问、**其余一律默认「销售顾问」**。真机 demo 账号 `ou_237bfabd…3017` 不含这两个后缀，故**初始就是销售顾问**。
+- **岗位存在哪**：写进 SQLite 的 [role_cache](../arkagent/store.py#L62-L67) 表（落在 `gateway.db` 文件里），带 `refreshed_at` 时间戳。**持久化 —— 重启 Gateway 也不丢**。
+- **`/role` 改的是缓存、不是 HR 源**：[on_role_change](../arkagent/role.py#L86-L88) 把新岗位 upsert 进 `role_cache`、刷新 `refreshed_at`、清空 `injected_for_session`。此后每轮 [ensure_fresh_role](../arkagent/role.py#L67-L75) 判 `now - refreshed_at > 24h TTL`？**未过期就一直返回缓存里的岗位**。
+- **结论**：一旦 `/role 销售经理`，就会**一直是销售经理**，直到满足以下任一条件才变——① 满 24h TTL 自动回 HR（默认账号又变回销售顾问）；② 再手动发一次 `/role`。
+- **`/new` 不会重置岗位**：[reset_session](../arkagent/store.py#L108-L118) 只 `DELETE FROM conversations`（会话映射），**不碰 `role_cache`**。这是有意为之——岗位属于用户身份，不应随开新会话丢失。
+
+**岗位状态转移表：**
+
+| 触发 | 岗位缓存变化 | 说明 |
+| --- | --- | --- |
+| 首次对话 | → HR 初始值 | 默认账号 = 销售顾问 |
+| `/role 销售经理/…` | → 销售经理 | 清 `injected_for_session` → 下一轮重注入，**Session 不变** |
+| 后续对话（< 24h） | 保持销售经理 | 未过期，直接读缓存 |
+| 重启 Gateway | 保持 | `role_cache` 持久化在 `gateway.db` |
+| `/new` | 保持 | 只删会话映射，不碰岗位 |
+| 满 24h TTL | 重新拉 HR → 销售顾问 | 自动回退 |
+
+> ⚠️ **演示前置**：要演示出"顾问 → 经理"的**变化**，得先确保当前是**销售顾问**。若上次演示已 `/role` 成经理且未过 24h，请先发 `/role 销售顾问/上海浦东蔚来中心` 回退（**务必带门店**，否则门店会被填成「未知门店」），再用 `/whoami` 确认已回到销售顾问，然后开始正式演示。
+
 ### mock 了哪些数据
 - 后端权威权限位：[USER_DATA[*].permissions](../mock_mcp/data.py#L14-L50)（经理=`view_own_leads`+`view_team_pipeline`+`approve_discount`；顾问=仅 `view_own_leads`），常量定义见 [data.py:8-10](../mock_mcp/data.py#L8-L10)。
 - 门店级团队漏斗 [TEAM_PIPELINE](../mock_mcp/data.py#L53-L71)（上海浦东蔚来中心：线索 128 → 到店 76 → 试驾 52 → 下定 31 → 交付 24 + 三成员业绩）。
