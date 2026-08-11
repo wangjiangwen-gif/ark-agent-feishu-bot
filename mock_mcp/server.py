@@ -44,8 +44,16 @@ def build_server() -> FastMCP:
     # FastMCP 默认开启 DNS rebinding 保护，只放行 127.0.0.1/localhost 的 Host，
     # 经内网穿透（ngrok/cpolar）访问时外部域名会被判非法 Host → 421 Misdirected Request。
     # 本 mock 本就设计为被方舟经公网探测/调用，故关闭该保护（demo 场景）。
+    #
+    # stateless_http=True：关闭 streamable-http 的有状态会话。默认（有状态）模式下
+    # 首个 initialize 会创建会话并下发 Mcp-Session-Id，后续调用须回带该 id；一旦
+    # mock 进程重启或隧道（cpolar/ngrok）重连到新后端，方舟编排层手里的旧 id 就失效，
+    # 服务端按 MCP 规范返回 404 {"error":{"message":"Session not found"}}，模型据此
+    # 报“连接异常/session not found”而查不到数据。无状态模式每个请求自包含、无需握手，
+    # 重启与重连都不会让方舟连接失效——这正是隧道后端 demo MCP 应有的姿势。
     server = FastMCP(
         name="customer-a-mock-mcp",
+        stateless_http=True,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 

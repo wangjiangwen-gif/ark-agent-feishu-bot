@@ -128,6 +128,33 @@ def test_correct_bearer_passes_middleware():
     assert resp.status_code != 401
 
 
+# ---- 无状态传输：不依赖 Mcp-Session-Id，隧道重连/进程重启不会 “Session not found” ----
+def test_server_is_stateless_http():
+    # 有状态模式下 mock 重启或隧道换后端会让方舟旧 session id 失效 → 404 Session not found。
+    # 固定为无状态传输，规避该回归。
+    server = build_server()
+    assert server.settings.stateless_http is True
+
+
+def test_tools_list_without_session_handshake():
+    # 无状态模式：直接 tools/list（不先 initialize、不带 Mcp-Session-Id）应成功，
+    # 绝不能返回 404 "Session not found"（这正是用户遇到的连接异常症状）。
+    app = build_app(token="secret-token")
+    with TestClient(app) as client:
+        resp = client.post(
+            "/mcp",
+            headers={
+                "Authorization": "Bearer secret-token",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+            },
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+    assert resp.status_code == 200
+    assert "Session not found" not in resp.text
+    assert "get_my_sales_data" in resp.text
+
+
 # ---- 卡点 A: 掩码日志（证据） ----
 def test_mask_token_hides_middle():
     assert mask_token("demo-bearer-token-1234") == "demo…1234"
