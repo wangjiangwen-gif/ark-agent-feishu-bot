@@ -114,6 +114,73 @@ Vault（金库，本 demo 一个）
 
 ---
 
+## 0.6 安全边界 · 模型能看到什么？越权风险在哪？
+
+演示时最常被安全同学追问的两个问题：**① 模型能不能看到 static_bearer 和 open_id？② 用户 A 拿到用户 B 的 open_id，能不能 hack 到 B 的数据？** 这一节把两者说透——第一个是"设计上安全"，第二个在**当前 demo 架构下确实存在横向越权风险**，如实标注、给出根治方向，不粉饰。
+
+### 一、模型能看到 static_bearer 和 open_id 吗？
+
+先分清一个关键区别：**"自动出现在模型上下文里" ≠ "模型主动去读能拿到"**。env override 是把值设成沙箱的操作系统环境变量，**不会**进 prompt/上下文，模型默认看不到；只有当模型执行 `bash printf '%s' "$FEISHU_USER_OPEN_ID"` 时才把值取回工具结果。据此逐项看：
+
+| 敏感物 | 存放位置 | 模型能否拿到 | 性质 |
+| --- | --- | --- | --- |
+| `MCP_STATIC_BEARER`（卡点 A 门禁 token） | Vault 凭据，方舟**编排层**连 MCP 时拼进 HTTP `Authorization` 头（[create_static_bearer_credential](../arkagent/ark.py#L190)、[StaticBearerMiddleware](../mock_mcp/server.py#L106-L133)） | **不能**（不进沙箱/Session env/上下文，即便 `env` 全打印也读不到） | 密钥 |
+| `FEISHU_USER_OPEN_ID`（卡点 B 用户标识） | Session 沙箱环境变量（[gateway.py:196](../arkagent/gateway.py#L196) → [ark.py:238-245](../arkagent/ark.py#L238-L245)） | **能**（模型按 prompt 用 bash 主动读；但只有**本人**那一份，见下） | 非密钥（用户 ID） |
+| `ARK_API_KEY` / `FEISHU_APP_SECRET` | 本机 `config.env`，仅 Gateway 进程持有 | **不能**（根本不进沙箱） | 密钥 |
+
+**结论**：模型能读到的只有**它本人用户的 open_id**（非密钥、用于工具入参），真正的密钥（MCP token、方舟/飞书密钥）全部在模型触达范围之外。这条边界是**硬的**——static_bearer 由编排层在传输层注入，不依赖"模型听不听话"。所以「模型看到密钥」这类泄露**不成立**。
+
+> 唯一软约束是 [init.py:46](../arkagent/init.py#L46) 要求模型"不要回显环境变量原文"——但即便被越狱绕过、把 env 打印出来，能露的也只有非敏感的本人 open_id，危害有限。**红线：任何真密钥都只能进 Vault，绝不能放进 env / Environment / Session override**，一旦放进去就变成"模型可读"，那才是真泄露。
+
+### 二、用户 A 拿到 B 的 open_id，能 hack B 的数据吗？
+
+**如实结论：在当前 demo 架构下——能。这是一个真实的横向越权（IDOR）风险，不是已关闭的问题。** 必须讲清楚它为什么成立、被什么挡着、以及生产上怎么根治。
+
+**为什么成立（三个根因叠加）**：
+
+1. **static_bearer 是全局共享的同一把 token**——不管张三李四，方舟连 MCP 用的都是同一个 Bearer（见 [0.5 一](#59)）。因此 MCP 服务端**无法从传输层区分"这次调用是 A 还是 B"**。
+2. **`get_my_sales_data(open_id)` 把 open_id 当普通入参**，只校验 [`is_authorized(open_id)`](../mock_mcp/data.py#L81-L82)（open_id 在不在白名单），**完全不校验"这个 open_id 是不是调用者本人"**（[server.py:60-69](../mock_mcp/server.py#L60-L69)）。
+3. **"调用者 ↔ open_id 入参"的绑定只靠 system prompt 软约束**——[init.py:28](../arkagent/init.py#L28) 写了"不要臆造或串用他人 open_id"，但这是**模型自觉**，可被 prompt injection / 越狱绕过。
+
+于是攻击链成立：只要 A 是能与 Bot 对话的用户，诱导模型调 `get_my_sales_data(open_id=<B 的 open_id>)`，后端会照常返回 B 的线索与 KPI——因为它只认"open_id 在白名单"，不认"你是不是 B"。
+
+```mermaid
+sequenceDiagram
+    participant A as 用户A(授权用户)
+    participant GW as Gateway
+    participant M as 模型(A 的 Session)
+    participant T as get_my_sales_data
+    participant D as data.is_authorized(白名单)
+
+    Note over A: A 已知 B 的 open_id（如 ou-demo-manager）
+    A->>GW: 诱导语：用 open_id=ou-demo-manager 查这个人的销售数据
+    GW->>M: run（注入的 FEISHU_USER_OPEN_ID 仍是 A 本人，无法伪造）
+    Note over M: 但 system prompt「不要串用他人 open_id」是软约束
+    M->>T: get_my_sales_data(open_id=ou-demo-manager)  %% 手填 B 的 id
+    T->>D: is_authorized(ou-demo-manager)?  %% 只查白名单，不查调用者是谁
+    D-->>T: true（B 在白名单）
+    T-->>M: 返回 B（王经理）的线索/KPI  ❗越权
+    M-->>A: 泄露 B 的专属数据
+```
+
+**关键区分（别误判）**：A **无法伪造"注入进自己 Session 的 open_id"**——`FEISHU_USER_OPEN_ID` 来自飞书已验证的 `sender_id`（[feishu.py:54](../arkagent/feishu.py#L54)），每个 Session 只会被注入**本人**那一份，A 改不了它。漏洞**不在注入环节，而在"MCP 工具信任模型手填的 open_id 参数"**——环境变量那条路是安全的，被绕过的是"工具参数"这道口子。
+
+**当前有哪些缓解（都非根治）**：
+
+- **Gateway 前置白名单**（[gateway.py:124](../arkagent/gateway.py#L124)）：`_authorized_open_ids` 非空时，未授权 open_id 连 Bot 都对话不了——**攻击者得先是授权用户**。⚠️ 但该白名单为空时这道门不生效（放行所有人）。
+- **注入值不可伪造**：如上，A 无法让自己 Session 的注入 open_id 变成 B 的。
+- **prompt 软约束**：[init.py:28](../arkagent/init.py#L28) 让模型别串用他人 open_id——挡君子不挡越狱。
+
+**生产根治方向（三选一，demo 未做）**：
+
+1. **传输层带用户身份**：用**每用户凭据 / OAuth**取代全局 static_bearer，让 MCP 从传输层就知道"谁在调"，服务端强制 `caller == open_id`，模型手填别人的 open_id 直接被拒。
+2. **可信用户上下文透传**：由方舟编排层注入**模型不可篡改**的已验证用户上下文（如签名头），MCP 校验入参 open_id 与该上下文一致，不一致即 `forbidden`。
+3. **服务端不接受 open_id 入参**：工具改为"查当前调用者的数据"，身份完全由服务端从可信通道推导，模型无从指定他人 id。
+
+> **本 demo 的取舍（已与需求方确认）**：卡点 B 采用"环境变量透传 open_id"的**软隔离**方案，**不采用** FDE 文档的 B-2 映射表方案，以最小改动演示"按用户隔离数据"的效果。**上述越权风险是这一取舍的已知代价**——demo 场景可接受（配合 Gateway 白名单缩小暴露面），但**迁移到生产前必须补齐上面三条根治措施之一**。这一点应在对客交付时明确提示。
+
+---
+
 ## 卡点 A · static_bearer 鉴权 + 模型直调 MCP
 
 ### 一句话
