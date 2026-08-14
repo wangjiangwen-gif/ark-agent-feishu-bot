@@ -1,6 +1,6 @@
 {
   "name": "arkagent",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Turn a Volcano Ark Managed Agent into a Feishu office assistant with one API key and two QR scans.",
   "type": "module",
   "bin": {
