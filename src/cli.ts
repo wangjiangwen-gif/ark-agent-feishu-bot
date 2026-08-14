@@ -28,7 +28,7 @@ async function main(): Promise<void> {
 async function run(): Promise<void> {
   const paths = loadSavedEnvironment();
   const config = loadConfig();
-  const [{ ArkClient }, { startFeishuGateway }, { Gateway }, { GatewayStore }, { FeishuOAuth }] = await Promise.all([
+  const [{ ArkClient }, { startFeishuGateway, createFeishuResourceDownloader }, { Gateway }, { GatewayStore }, { FeishuOAuth }] = await Promise.all([
     import("./ark.ts"), import("./feishu.ts"), import("./gateway.ts"), import("./store.ts"), import("./oauth.ts")
   ]);
   const store = new GatewayStore(config.databasePath);
@@ -59,6 +59,7 @@ async function run(): Promise<void> {
     environmentId: config.arkEnvironmentId,
     vaultId: config.arkVaultId,
     authorizedUserOpenId: config.feishuUserOpenId,
+    downloadAttachment: createFeishuResourceDownloader(client),
     beforeCreateSession: ensureCredentialFresh,
     timeoutMs: config.sessionTimeoutMs
   });
@@ -158,7 +159,7 @@ async function guidedInit(): Promise<void> {
           source: "ark-agent-feishu-bot",
           appPreset: { name: "方舟 Agent Bot", desc: "由方舟 Managed Agents 驱动的飞书机器人" },
           addons: {
-            scopes: { tenant: ["im:message:send_as_bot"], user: userScopes },
+            scopes: { tenant: ["im:message:send_as_bot", "im:message:readonly"], user: userScopes },
             events: { items: { tenant: ["im.message.receive_v1"] } }
           },
           onQRCodeReady(info) {

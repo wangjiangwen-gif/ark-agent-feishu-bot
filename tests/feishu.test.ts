@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeFeishuMessage } from "../src/feishu.ts";
+import { createFeishuResourceDownloader, normalizeFeishuMessage } from "../src/feishu.ts";
 
 test("normalizeFeishuMessage extracts text and removes mention tokens", () => {
   const result = normalizeFeishuMessage({
@@ -17,6 +17,43 @@ test("normalizeFeishuMessage extracts text and removes mention tokens", () => {
   assert.equal(result?.mentionedBot, true);
 });
 
-test("normalizeFeishuMessage ignores non-text messages", () => {
-  assert.equal(normalizeFeishuMessage({ message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "image" } }), undefined);
+test("normalizeFeishuMessage extracts file resources", () => {
+  const result = normalizeFeishuMessage({
+    event_id: "evt-file",
+    sender: { sender_id: { open_id: "ou-user" } },
+    message: {
+      message_id: "om-file", chat_id: "oc-1", chat_type: "p2p", message_type: "file",
+      content: JSON.stringify({ file_key: "file-v3", file_name: "季度计划.pdf" })
+    }
+  });
+  assert.equal(result?.text, "");
+  assert.deepEqual(result?.attachments, [{ key: "file-v3", name: "季度计划.pdf", type: "file" }]);
+});
+
+test("normalizeFeishuMessage extracts image resources and ignores unsupported messages", () => {
+  const image = normalizeFeishuMessage({
+    message: {
+      message_id: "om-image", chat_id: "oc-1", chat_type: "p2p", message_type: "image",
+      content: JSON.stringify({ image_key: "img-v3" })
+    }
+  });
+  assert.deepEqual(image?.attachments, [{ key: "img-v3", name: "img-v3.jpg", type: "image" }]);
+  assert.equal(normalizeFeishuMessage({ message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "sticker" } }), undefined);
+});
+
+test("resource downloader enforces the byte limit while streaming", async () => {
+  const client = {
+    im: { messageResource: { get: async () => ({
+      headers: { "content-type": "application/pdf" },
+      async *getReadableStream() { yield new Uint8Array([1, 2]); yield new Uint8Array([3, 4]); }
+    }) } }
+  };
+  const attachment = { key: "file-v3", name: "report.pdf", type: "file" as const };
+  const message = normalizeFeishuMessage({
+    message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "file", content: JSON.stringify({ file_key: attachment.key, file_name: attachment.name }) }
+  })!;
+  const result = await createFeishuResourceDownloader(client, 4)(attachment, message);
+  assert.deepEqual([...result.bytes], [1, 2, 3, 4]);
+  assert.equal(result.mimeType, "application/pdf");
+  await assert.rejects(() => createFeishuResourceDownloader(client, 3)(attachment, message), /超过.*限制/);
 });
