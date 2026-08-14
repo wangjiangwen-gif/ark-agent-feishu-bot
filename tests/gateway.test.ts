@@ -5,7 +5,7 @@ import { Gateway, resultToReply, shouldHandleMessage, toConversationKey, type In
 import { GatewayStore } from "../src/store.ts";
 
 function message(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
-  return { eventId: "event-1", messageId: "message-1", chatId: "chat-1", chatType: "p2p", threadId: "", userOpenId: "user-1", tenantKey: "tenant-1", text: "你好", mentionedBot: false, ...overrides };
+  return { eventId: "event-1", messageId: "message-1", chatId: "chat-1", chatType: "p2p", threadId: "", userOpenId: "user-1", tenantKey: "tenant-1", text: "你好", attachments: [], mentionedBot: false, ...overrides };
 }
 
 test("group messages require an explicit bot mention", () => {
@@ -141,5 +141,52 @@ test("/new resets the session without refreshing an expired credential", async (
   assert.equal(refreshAttempts, 0);
   assert.equal(store.getSession(key), undefined);
   assert.match(replies[0], /已开启新会话/);
+  store.close();
+});
+
+test("gateway downloads, uploads and mounts a Feishu file before running the Agent", async () => {
+  const store = new GatewayStore(":memory:");
+  const operations: string[] = [];
+  let prompt = "";
+  const gateway = new Gateway(store, {
+    createSession: async () => { operations.push("session"); return "session-1"; },
+    uploadFile: async (name, mimeType, bytes) => {
+      operations.push(`upload:${name}:${mimeType}:${bytes.byteLength}`);
+      return { id: "file-1", name };
+    },
+    addSessionFile: async (_sessionId, _fileId, mountPath) => { operations.push(`mount:${mountPath}`); },
+    run: async (_sessionId, text) => { prompt = text; operations.push("run"); return { terminal: "idle" as const, messages: ["文件摘要"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000,
+    downloadAttachment: async attachment => ({ bytes: new Uint8Array([1, 2]), mimeType: attachment.type === "image" ? "image/jpeg" : "application/pdf" })
+  });
+  gateway.accept(message({ text: "", attachments: [{ key: "file-key", name: "季度计划.pdf", type: "file" }] }));
+  await delay(30);
+  assert.deepEqual(operations, ["session", "upload:季度计划.pdf:application/pdf:2", "mount:/mnt/data/季度计划.pdf", "run"]);
+  assert.match(prompt, /\/mnt\/data\/季度计划\.pdf/);
+  store.close();
+});
+
+test("gateway sends Markdown source inline without uploading it to Ark Files", async () => {
+  const store = new GatewayStore(":memory:");
+  let uploads = 0;
+  let mounts = 0;
+  let prompt = "";
+  const source = "# 计划\n\n- 第一项\n- 第二项";
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-1",
+    uploadFile: async () => { uploads++; return { id: "never", name: "never" }; },
+    addSessionFile: async () => { mounts++; },
+    run: async (_sessionId, text) => { prompt = text; return { terminal: "idle" as const, messages: ["摘要"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000,
+    downloadAttachment: async () => ({ bytes: new TextEncoder().encode(source), mimeType: "text/plain" })
+  });
+  gateway.accept(message({ text: "", attachments: [{ key: "file-key", name: "计划.md", type: "file" }] }));
+  await delay(30);
+  assert.equal(uploads, 0);
+  assert.equal(mounts, 0);
+  assert.match(prompt, /以下是用户发送的纯文本文件原文/);
+  assert.match(prompt, /# 计划\n\n- 第一项\n- 第二项/);
   store.close();
 });

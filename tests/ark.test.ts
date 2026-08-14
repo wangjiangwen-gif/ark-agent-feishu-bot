@@ -115,3 +115,22 @@ test("run establishes SSE before sending the user message", async () => {
   assert.deepEqual(calls, ["/sessions/session-1/events/stream", "/sessions/session-1/events"]);
   assert.deepEqual(result, { terminal: "idle", messages: ["完成"] });
 });
+
+test("Ark uploads a file and mounts it read-only in a Session", async () => {
+  const calls: Array<{ path: string; method: string; body?: unknown }> = [];
+  const client = new ArkClient("key", "https://ark.example/api/v3", async (url, init) => {
+    const path = String(url).replace("https://ark.example/api/v3", "");
+    calls.push({ path, method: init?.method || "GET", body: init?.body });
+    if (path === "/files") return new Response(JSON.stringify({ id: "file-1", filename: "report.pdf" }), { status: 200 });
+    return new Response(JSON.stringify({ id: "res-1" }), { status: 200 });
+  });
+  const file = await client.uploadFile("report.pdf", "application/pdf", new Uint8Array([1, 2, 3]));
+  await client.addSessionFile("session-1", file.id, "/mnt/data/report.pdf");
+  assert.equal(file.id, "file-1");
+  assert.equal(calls[0].path, "/files");
+  assert.ok(calls[0].body instanceof FormData);
+  assert.equal((calls[0].body as FormData).get("purpose"), "user_data");
+  assert.deepEqual(JSON.parse(String(calls[1].body)), {
+    type: "file", file_id: "file-1", access: "read_only", mount_path: "/mnt/data/report.pdf"
+  });
+});

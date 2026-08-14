@@ -15,7 +15,7 @@
 | 配置用户身份 | 将短期 `user_access_token` 写入方舟 Vault Credential |
 | 创建运行环境 | 安装 `lark-cli`，注入 App ID，并让新 Session 引用用户 Vault |
 
-初始化完成后，你可以直接在飞书里让它创建文档、整理云空间内容，或执行其他已经授权的 `lark-cli` 办公任务。
+初始化完成后，你可以直接在飞书里让它创建文档、整理云空间内容、总结发送给 Bot 的文件，或执行其他已经授权的 `lark-cli` 办公任务。
 
 ## Quickstart
 
@@ -75,6 +75,8 @@ arkagent init
 创建一篇标题为“办公助手测试”的飞书文档，正文写“lark-cli 已可用”，完成后把链接发给我。
 ```
 
+也可以在与 Bot 的单聊中直接发送 PDF、Office 文档、Markdown、TXT 或图片。Markdown/TXT 会按 UTF-8 提取原文并直接放入本次消息（上限 256 KB）；其他文件会上传到方舟 Files，并以只读方式挂载到当前 Managed Agents Session。未附带文字指令时默认总结文件。二进制文件上限为 20 MB，实际可解析格式仍以方舟 Files API 支持范围为准。
+
 `/new` 会清除当前飞书会话到方舟 Session 的映射；下一条消息将创建新 Session。
 
 ## 两次扫码为什么不能合并
@@ -99,6 +101,7 @@ arkagent init
 
 | 业务域 | OAuth scopes | 用途 |
 |---|---|---|
+| Bot 消息 | `im:message:send_as_bot`、`im:message:readonly` | 回复消息、下载用户发送的文件 |
 | 基础 | `offline_access`、`auth:user.id:read` | 刷新 token、确认授权用户 |
 | docs | `docx:document`、`docx:document:create`、`docx:document:readonly`、`docx:document:write_only` | 创建、回读与更新飞书文档 |
 | drive | `drive:drive`、`drive:file` | 访问云空间文件 |
@@ -122,14 +125,15 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 
 ## 消息与 Session 行为
 
-- 单聊中的文本消息会发送给绑定的 Agent。
+- 单聊中的文本、文件和图片消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
 - 一个飞书用户在一个飞书会话中复用一个 Managed Agents Session；不同发送者不会复用 Session，`/new` 显式重置。
 - 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
 - 新建 Session 会立即回复一次“正在处理”；复用 Session 只有超过 2.5 秒仍未完成时才发送一次提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
-- 图片、文件、富文本与交互卡片暂不处理。
+- Markdown/TXT 原文直接内联到本次 Session 消息；其他单聊文件上传到方舟 Files，再只读挂载到 `/mnt/data/`。文件本体不写入 Gateway 数据库。
+- 群聊文件、音视频、富文本与交互卡片暂不处理。
 
 ## Docker
 

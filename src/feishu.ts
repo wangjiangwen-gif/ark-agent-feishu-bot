@@ -1,5 +1,7 @@
 import type { Gateway, IncomingMessage } from "./gateway.ts";
 
+export const MAX_FEISHU_FILE_BYTES = 20 * 1024 * 1024;
+
 type FeishuEvent = {
   event_id?: string;
   tenant_key?: string;
@@ -37,11 +39,17 @@ export async function startFeishuGateway(options: {
 
 export function normalizeFeishuMessage(event: FeishuEvent): IncomingMessage | undefined {
   const message = event.message;
-  if (!message?.message_id || !message.chat_id || message.message_type !== "text") return undefined;
+  if (!message?.message_id || !message.chat_id) return undefined;
   let text = "";
+  let attachments: IncomingMessage["attachments"] = [];
   try {
-    const content = JSON.parse(message.content || "{}") as { text?: string };
-    text = String(content.text || "");
+    const content = JSON.parse(message.content || "{}") as { text?: string; file_key?: string; file_name?: string; image_key?: string };
+    if (message.message_type === "text") text = String(content.text || "");
+    else if (message.message_type === "file" && content.file_key) {
+      attachments = [{ key: content.file_key, name: content.file_name || content.file_key, type: "file" }];
+    } else if (message.message_type === "image" && content.image_key) {
+      attachments = [{ key: content.image_key, name: `${content.image_key}.jpg`, type: "image" }];
+    } else return undefined;
   } catch {
     return undefined;
   }
@@ -57,6 +65,53 @@ export function normalizeFeishuMessage(event: FeishuEvent): IncomingMessage | un
     userOpenId: event.sender?.sender_id?.open_id || "",
     tenantKey: event.tenant_key || "default",
     text: text.trim(),
+    attachments,
     mentionedBot: Boolean(message.mentions?.length)
   };
+}
+
+export type FeishuResourceClient = {
+  im: { messageResource: { get(payload: {
+    params: { type: string };
+    path: { message_id: string; file_key: string };
+  }): Promise<{ getReadableStream(): AsyncIterable<Uint8Array | Buffer>; headers?: Record<string, unknown> }> } };
+};
+
+export function createFeishuResourceDownloader(client: FeishuResourceClient, maxBytes = MAX_FEISHU_FILE_BYTES) {
+  return async (attachment: IncomingMessage["attachments"][number], message: IncomingMessage): Promise<{ bytes: Uint8Array; mimeType: string }> => {
+    const response = await client.im.messageResource.get({
+      params: { type: attachment.type },
+      path: { message_id: message.messageId, file_key: attachment.key }
+    });
+    const declaredSize = Number(headerValue(response.headers, "content-length") || 0);
+    if (declaredSize > maxBytes) throw new Error(`文件 ${attachment.name} 超过 ${formatBytes(maxBytes)} 限制`);
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of response.getReadableStream()) {
+      const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      size += bytes.byteLength;
+      if (size > maxBytes) throw new Error(`文件 ${attachment.name} 超过 ${formatBytes(maxBytes)} 限制`);
+      chunks.push(bytes);
+    }
+    const combined = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+    return { bytes: combined, mimeType: headerValue(response.headers, "content-type") || inferMimeType(attachment.name, attachment.type) };
+  };
+}
+
+function headerValue(headers: Record<string, unknown> | undefined, key: string): string {
+  if (!headers) return "";
+  const value = headers[key] ?? headers[key.toLowerCase()] ?? headers[key.toUpperCase()];
+  return Array.isArray(value) ? String(value[0] || "") : String(value || "").split(";")[0].trim();
+}
+
+function inferMimeType(name: string, type: "file" | "image"): string {
+  if (type === "image") return "image/jpeg";
+  const extension = name.toLowerCase().split(".").pop();
+  return ({ pdf: "application/pdf", doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", csv: "text/csv", txt: "text/plain", md: "text/markdown" } as Record<string, string>)[extension || ""] || "application/octet-stream";
+}
+
+function formatBytes(bytes: number): string {
+  return `${Math.floor(bytes / 1024 / 1024)} MB`;
 }

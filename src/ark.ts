@@ -44,7 +44,7 @@ export class ArkClient {
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${this.apiKey}`,
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
         ...init.headers
       },
       signal: init.signal || AbortSignal.timeout(30_000)
@@ -188,6 +188,25 @@ export class ArkClient {
     const id = String(data.id || data.session_id || "");
     if (!id) throw new Error("创建 Session 成功，但响应中没有 Session ID");
     return id;
+  }
+
+  async uploadFile(name: string, mimeType: string, bytes: Uint8Array): Promise<{ id: string; name: string }> {
+    const form = new FormData();
+    form.set("purpose", "user_data");
+    form.set("file", new Blob([bytes], { type: mimeType || "application/octet-stream" }), name);
+    const response = await this.request("/files", { method: "POST", body: form });
+    const payload = await response.json() as Record<string, unknown>;
+    const data = (payload.data || payload) as Record<string, unknown>;
+    const id = String(data.id || "");
+    if (!id) throw new Error(`上传文件 ${name} 成功，但响应中没有 File ID`);
+    return { id, name: String(data.filename || name) };
+  }
+
+  async addSessionFile(sessionId: string, fileId: string, mountPath: string): Promise<void> {
+    await this.request(`/sessions/${encodeURIComponent(sessionId)}/resources`, {
+      method: "POST",
+      body: JSON.stringify({ type: "file", file_id: fileId, access: "read_only", mount_path: mountPath })
+    });
   }
 
   async sendMessage(sessionId: string, text: string): Promise<void> {
