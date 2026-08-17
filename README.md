@@ -1,8 +1,47 @@
 # Ark Agent Feishu Bot
 
-> 一个方舟 API Key，两次飞书扫码，认领一个能以你的身份使用 `lark-cli` 的办公助手。
+> 一个方舟 API Key，把 Managed Agents 变成飞书个人助手或团队数字员工。
 
-这不是一个要求你手工配置 Agent、Environment、Vault 和飞书应用的 Bot 框架。初始化向导会直接创建一套个人专属资源，把飞书用户凭证安全地交给 Managed Agents Session，并启动一个通过 WebSocket 收消息的本地 Gateway。
+这是一个面向方舟 Managed Agents 的飞书接入插件。初始化向导会创建 Agent、Environment、Vault 和飞书应用，并启动通过 WebSocket 收消息的本地 Gateway；用户不需要手工拼接这些资源。
+
+当前提供两种相互隔离的运行模式：
+
+| 模式 | 适合谁 | 飞书操作身份 | 初始化 | 启动 |
+|---|---|---|---|---|
+| 个人助手 | 个人使用 | 默认使用授权用户身份 | `arkagent init` | `arkagent` |
+| 数字员工 | 团队或企业单实例部署 | 默认使用 Bot 身份，必要时按用户申请授权 | `arkagent employee init` | `arkagent employee` |
+
+个人助手保存在 `~/.arkagent/`，数字员工保存在 `~/.arkagent/employee/`，两者可以在同一台机器上独立初始化和运行。
+
+## 安装与升级
+
+无需全局安装，直接运行最新版：
+
+```bash
+npx --yes arkagent@latest <command>
+```
+
+也可以全局安装；已经安装过时，用同一条命令升级：
+
+```bash
+npm install -g arkagent@latest
+arkagent --help
+```
+
+本文后续使用较短的全局命令写法。如果不想全局安装，把每条命令中的 `arkagent` 换成 `npx --yes arkagent@latest` 即可。
+
+## 最新命令速查
+
+| 命令 | 作用 |
+|---|---|
+| `arkagent init` | 初始化个人助手并自动启动 Gateway |
+| `arkagent` | 启动个人助手 Gateway |
+| `arkagent login` | 复用现有资源，重新进行个人用户 OAuth |
+| `arkagent doctor` | 检查个人助手配置 |
+| `arkagent employee init` | 初始化数字员工并自动启动 Bot Gateway 与 WebUI |
+| `arkagent employee` | 启动数字员工 Bot Gateway 与 WebUI |
+| `arkagent employee doctor` | 检查数字员工配置 |
+| `arkagent employee repair-environment` | 新建并切换到正确安装 `lark-cli` 的 Environment |
 
 ## 你会得到什么
 
@@ -17,7 +56,7 @@
 
 初始化完成后，你可以直接在飞书里让它创建文档、整理云空间内容、总结发送给 Bot 的文件，或执行其他已经授权的 `lark-cli` 办公任务。
 
-## Quickstart
+## 个人助手 Quickstart
 
 ### 1. 准备
 
@@ -62,13 +101,6 @@ npx --yes arkagent@latest login
 
 `login` 会复用当前 App ID、App Secret、方舟 API Key、Vault 和 Credential，只重新执行一次用户 OAuth，并更新本地 OAuth 状态与 Vault 中的 `user_access_token`。它不会创建新的飞书 App、Agent 或 Environment。由于 Credential 只在 Session 创建时注入，登录成功后会自动废弃全部旧 Session 映射；重启 Gateway 后，下一条消息会创建使用新 token 的 Session。
 
-如果准备长期运行，可以全局安装，之后命令更短：
-
-```bash
-npm install -g arkagent
-arkagent init
-```
-
 可以先试：
 
 ```text
@@ -96,6 +128,8 @@ npx --yes arkagent@latest employee init
 ```bash
 npx --yes arkagent@latest employee
 ```
+
+终端会打印两类运行信息：飞书 Bot 名称和 App ID，用于确认当前连接的是哪个 Bot；以及只监听本机的 WebUI 地址。WebUI 地址包含随机访问令牌，请不要转发或写入公开日志。
 
 检查配置：
 
@@ -146,6 +180,16 @@ arkagent employee repair-environment
 ```
 
 该命令创建新 Environment 并更新本地配置；随后重新启动 `arkagent employee`。
+
+### 最小验收流程
+
+完成 `employee init` 且飞书权限审核通过后，建议按以下顺序验证：
+
+1. 私聊 Bot 发送 `hi`，确认能收到最终回复且没有工具过程消息刷屏；
+2. 发送“创建一篇测试飞书文档”，确认 Agent 使用 Bot 身份创建并返回链接；
+3. 发送“先检查我明天下午 3 点是否有空，再创建 30 分钟日程并邀请我”；
+4. 点击授权卡片完成用户日历只读授权，确认原任务无需重发即可自动继续；
+5. 打开终端打印的 WebUI，检查「身份」「行为日志」「访问过的用户」三个 Tab。
 
 ### 数字员工默认权限
 
