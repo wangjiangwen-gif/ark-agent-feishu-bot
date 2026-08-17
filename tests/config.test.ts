@@ -3,10 +3,19 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, loadConfigFile } from "../src/config.ts";
+import { loadConfig, loadConfigFile, loadEmployeeConfig } from "../src/config.ts";
 
 test("loadConfig reports all missing required values", () => {
   assert.throws(() => loadConfig({}), /ARK_API_KEY.*FEISHU_APP_SECRET/);
+});
+
+test("employee config requires bot and WebUI fields but no user OAuth token", () => {
+  const config = loadEmployeeConfig({
+    ARK_API_KEY: "ark-secret", ARK_AGENT_ID: "agent", ARK_ENVIRONMENT_ID: "env", ARK_VAULT_ID: "vault", ARK_CREDENTIAL_ID: "credential",
+    FEISHU_APP_ID: "app", FEISHU_APP_SECRET: "app-secret", ARKAGENT_WEB_TOKEN: "web-secret"
+  });
+  assert.equal(config.webHost, "127.0.0.1");
+  assert.equal(config.webPort, 8787);
 });
 
 test("loadConfig applies safe defaults", () => {

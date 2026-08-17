@@ -36,7 +36,7 @@
     "start": "node --experimental-strip-types src/cli.ts run",
     "doctor": "node --experimental-strip-types src/cli.ts doctor",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "check": "node --experimental-strip-types --check src/cli.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/init.ts && node --experimental-strip-types --check src/login.ts && node --experimental-strip-types --check src/paths.ts && node --experimental-strip-types --check src/scopes.ts && node --experimental-strip-types --check src/oauth.ts && node --experimental-strip-types --check src/gateway.ts && node --experimental-strip-types --check src/ark.ts && node --experimental-strip-types --check src/store.ts && node --experimental-strip-types --check src/feishu.ts"
+    "check": "node --experimental-strip-types --check src/cli.ts && node --experimental-strip-types --check src/config.ts && node --experimental-strip-types --check src/init.ts && node --experimental-strip-types --check src/employee-init.ts && node --experimental-strip-types --check src/identities.ts && node --experimental-strip-types --check src/web.ts && node --experimental-strip-types --check src/login.ts && node --experimental-strip-types --check src/paths.ts && node --experimental-strip-types --check src/scopes.ts && node --experimental-strip-types --check src/oauth.ts && node --experimental-strip-types --check src/gateway.ts && node --experimental-strip-types --check src/ark.ts && node --experimental-strip-types --check src/store.ts && node --experimental-strip-types --check src/feishu.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.56.0",

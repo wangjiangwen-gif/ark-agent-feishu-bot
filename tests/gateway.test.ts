@@ -123,6 +123,24 @@ test("gateway rejects users other than the authorized user", async () => {
   store.close();
 });
 
+test("employee platform access accepts every message delivered by Feishu and observes the user", async () => {
+  const store = new GatewayStore(":memory:");
+  let creates = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => { creates++; return "session"; },
+    run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true
+  });
+  gateway.accept(message({ userOpenId: "platform-approved" }));
+  await delay(20);
+  assert.equal(creates, 1);
+  assert.equal(store.getEmployeeUser("tenant-1", "platform-approved")?.usageCount, 1);
+  assert.equal(store.listAuditLogs()[0].status, "succeeded");
+  store.close();
+});
+
 test("/new resets the session without refreshing an expired credential", async () => {
   const store = new GatewayStore(":memory:");
   const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };

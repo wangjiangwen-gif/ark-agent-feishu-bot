@@ -34,3 +34,24 @@ test("store resets every session without clearing event deduplication", () => {
   assert.equal(store.claimEvent("event-1"), false);
   store.close();
 });
+
+test("employee users are observed with first, latest and usage count", () => {
+  const store = new GatewayStore(":memory:");
+  const first = store.observeEmployeeUser("tenant", "user-1");
+  const second = store.observeEmployeeUser("tenant", "user-1");
+  assert.equal(first.usageCount, 1);
+  assert.equal(second.usageCount, 2);
+  assert.equal(second.firstUsedAt, first.firstUsedAt);
+  assert.equal(store.listEmployeeUsers().length, 1);
+  store.close();
+});
+
+test("audit logs are newest first", () => {
+  const store = new GatewayStore(":memory:");
+  store.addAuditLog({ tenantKey: "tenant", openId: "user-1", chatId: "chat", messageId: "message-1", action: "message", status: "failed" });
+  store.addAuditLog({ tenantKey: "tenant", openId: "user-2", chatId: "chat", messageId: "message-2", action: "message", status: "succeeded", durationMs: 12 });
+  const logs = store.listAuditLogs();
+  assert.equal(logs.length, 2);
+  assert.equal(logs[0].openId, "user-2");
+  store.close();
+});

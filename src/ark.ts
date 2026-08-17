@@ -64,6 +64,13 @@ export class ArkClient {
     return { id: String(data.id || agentId), version: data.version === undefined ? undefined : String(data.version) };
   }
 
+  async updateAgent(agentId: string, version: string, config: AgentConfig): Promise<{ id: string; version?: string }> {
+    const response = await this.request(`/agents/${encodeURIComponent(agentId)}`, { method: "POST", body: JSON.stringify({ ...config, version: Number(version) }) });
+    const payload = await response.json() as Record<string, unknown>;
+    const data = (payload.data || payload) as Record<string, unknown>;
+    return { id: String(data.id || agentId), version: data.version === undefined ? undefined : String(data.version) };
+  }
+
   async listAgents(): Promise<Array<{ id: string; name: string; version?: string }>> {
     const response = await this.request("/agents?limit=100");
     const payload = await response.json() as Record<string, unknown>;
@@ -103,7 +110,7 @@ export class ArkClient {
       body: JSON.stringify({ name, config: {
         type: "cloud", networking: { type: "unrestricted" },
         env: { LARKSUITE_CLI_APP_ID: feishuAppId },
-        setup_script: "set -e\nnpm install -g @larksuite/cli\nlark-cli --version"
+        setup_script: "set -e\nnpm install -g @larksuite/cli@latest\nnpx --yes @larksuite/cli@latest install </dev/null\nlark-cli config strict-mode off\ntimeout 30 lark-cli --version"
       } })
     });
     const payload = await response.json() as Record<string, unknown>;
@@ -140,9 +147,13 @@ export class ArkClient {
   }
 
   async createEnvironmentCredential(vaultId: string, displayName: string, secretValue: string): Promise<string> {
+    return this.createEnvironmentVariableCredential(vaultId, displayName, "LARKSUITE_CLI_USER_ACCESS_TOKEN", secretValue);
+  }
+
+  async createEnvironmentVariableCredential(vaultId: string, displayName: string, secretName: string, secretValue: string): Promise<string> {
     const response = await this.request(`/vaults/${encodeURIComponent(vaultId)}/credentials`, {
       method: "POST", body: JSON.stringify({ display_name: displayName, auth: {
-        type: "environment_variable", secret_name: "LARKSUITE_CLI_USER_ACCESS_TOKEN", secret_value: secretValue,
+        type: "environment_variable", secret_name: secretName, secret_value: secretValue,
         networking: { type: "unrestricted" }
       } })
     });

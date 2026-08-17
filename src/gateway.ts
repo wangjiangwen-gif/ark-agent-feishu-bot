@@ -66,27 +66,43 @@ export class Gateway {
     return true;
   }
 
+  resume(message: IncomingMessage): void {
+    const key = toConversationKey(message);
+    this.queue.enqueue(this.store.conversationKey(key), async () => {
+      try { await this.process(message, key); }
+      catch (error) { await this.reply(message.chatId, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
+    });
+  }
+
   private async process(message: IncomingMessage, key: ConversationKey): Promise<void> {
-    if (message.userOpenId !== this.options.authorizedUserOpenId) {
+    if (!this.options.platformAccess && message.userOpenId !== this.options.authorizedUserOpenId) {
       await this.reply(message.chatId, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
     }
+    if (this.options.platformAccess) this.store.observeEmployeeUser(message.tenantKey, message.userOpenId);
     if (message.text.trim() === "/new") {
       this.store.resetSession(key);
       await this.reply(message.chatId, "已开启新会话，下一条消息会创建新的 Agent Session。");
+      if (this.options.platformAccess) this.store.addAuditLog({
+        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId,
+        messageId: message.messageId, action: "reset_session", status: "succeeded"
+      });
       return;
     }
+    if (this.options.requiresAuthorization?.(message) && this.options.ensureAuthorization && !await this.options.ensureAuthorization(message)) return;
     await this.options.beforeCreateSession?.();
+    const startedAt = Date.now();
     let sessionId = this.store.getSession(key);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
     if (!sessionId) {
       await this.reply(message.chatId, "已收到，正在处理。首次启动可能需要几分钟。");
+      const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
         this.options.environmentId,
-        [this.options.vaultId],
-        { FEISHU_USER_OPEN_ID: message.userOpenId }
+        [this.options.vaultId, ...extraVaultIds],
+        { FEISHU_USER_OPEN_ID: message.userOpenId, ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}) }
       );
       this.store.saveSession(key, sessionId, this.options.agentId);
     } else {
@@ -133,6 +149,18 @@ export class Gateway {
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
       await this.reply(message.chatId, resultToReply(result));
+      this.store.addAuditLog({
+        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId, messageId: message.messageId,
+        sessionId, action: message.attachments.length ? "file_message" : "message", status: "succeeded",
+        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.attachments.length)
+      });
+    } catch (error) {
+      this.store.addAuditLog({
+        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId, messageId: message.messageId,
+        sessionId, action: message.attachments.length ? "file_message" : "message", status: "failed",
+        durationMs: Date.now() - startedAt, summary: error instanceof Error ? error.message.slice(0, 240) : "执行失败"
+      });
+      throw error;
     } finally {
       if (progressTimer) clearTimeout(progressTimer);
     }
@@ -148,12 +176,22 @@ export type GatewayOptions = {
   agentId: string;
   environmentId: string;
   vaultId: string;
-  authorizedUserOpenId: string;
+  authorizedUserOpenId?: string;
   timeoutMs: number;
   progressDelayMs?: number;
   beforeCreateSession?: () => Promise<void>;
+  platformAccess?: boolean;
+  requiresAuthorization?: (message: IncomingMessage) => boolean;
+  ensureAuthorization?: (message: IncomingMessage) => Promise<boolean>;
+  getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
+  dualIdentity?: boolean;
   downloadAttachment?: (attachment: IncomingMessage["attachments"][number], message: IncomingMessage) => Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
+
+function summarizeInput(text: string, attachmentCount: number): string {
+  const clean = text.replace(/\s+/g, " ").trim().slice(0, 160);
+  return [clean, attachmentCount ? `${attachmentCount} 个附件` : ""].filter(Boolean).join(" · ") || "空消息";
+}
 
 function safeFilename(value: string, index: number): string {
   const cleaned = value.normalize("NFKC").replace(/[\\/\0-\x1f\x7f]/g, "_").replace(/^\.+/, "").trim().slice(0, 120);

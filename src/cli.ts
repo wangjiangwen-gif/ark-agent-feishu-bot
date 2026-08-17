@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig, loadConfigFile } from "./config.ts";
 import { persistOAuthState } from "./login.ts";
-import { getArkagentPaths } from "./paths.ts";
+import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
 
 const command = process.argv[2] || "run";
+const employeeCommand = process.argv[3] || "run";
 
 async function main(): Promise<void> {
   try {
@@ -15,14 +16,124 @@ async function main(): Promise<void> {
     else if (command === "doctor") await doctor();
     else if (command === "init") await guidedInit();
     else if (command === "login") await login();
+    else if (command === "employee") {
+      if (employeeCommand === "run") await runEmployee();
+      else if (employeeCommand === "init") await guidedEmployeeInit();
+      else if (employeeCommand === "doctor") await employeeDoctor();
+      else if (employeeCommand === "repair-environment") await repairEmployeeEnvironment();
+      else printHelp();
+    }
     else printHelp();
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
     if (error instanceof Error && error.message.startsWith("缺少环境变量")) {
-      console.error("请运行 arkagent init 完成交互式配置。");
+      console.error(command === "employee" ? "请运行 arkagent employee init 完成交互式配置。" : "请运行 arkagent init 完成交互式配置。");
     }
     process.exitCode = 1;
   }
+}
+
+async function repairEmployeeEnvironment(): Promise<void> {
+  const paths = loadSavedEmployeeEnvironment();
+  const [{ loadEmployeeConfig }, { ArkClient }] = await Promise.all([import("./config.ts"), import("./ark.ts")]);
+  const config = loadEmployeeConfig();
+  const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
+  const requestedId = process.argv[4]?.trim();
+  const environment = requestedId
+    ? (await ark.listEnvironments()).find(item => item.id === requestedId)
+    : await ark.createEnvironment(`ark-employee-repaired-${Date.now()}`, config.feishuAppId);
+  if (!environment) throw new Error(`Environment 不存在：${requestedId}`);
+  const original = readFileSync(paths.configPath, "utf8");
+  const updated = original.replace(/^ARK_ENVIRONMENT_ID=.*$/m, `ARK_ENVIRONMENT_ID=${JSON.stringify(environment.id)}`);
+  if (updated === original) throw new Error("配置文件缺少 ARK_ENVIRONMENT_ID，未执行覆盖");
+  writeFileSync(paths.configPath, updated, { encoding: "utf8", mode: 0o600 });
+  chmodSync(paths.configPath, 0o600);
+  console.log(`已创建并切换到新 Environment：${environment.id}`);
+}
+
+async function runEmployee(): Promise<void> {
+  loadSavedEmployeeEnvironment();
+  const [{ loadEmployeeConfig }, { ArkClient }, { startFeishuGateway, createFeishuResourceDownloader }, { Gateway }, { GatewayStore }, { startEmployeeWeb }, { FeishuOAuth }, { EmployeeAuthorizationManager, needsCalendarAuthorization }, Lark] = await Promise.all([
+    import("./config.ts"), import("./ark.ts"), import("./feishu.ts"), import("./gateway.ts"), import("./store.ts"), import("./web.ts"), import("./oauth.ts"), import("./employee-auth.ts"), import("@larksuiteoapi/node-sdk")
+  ]);
+  const config = loadEmployeeConfig();
+  const store = new GatewayStore(config.databasePath);
+  const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
+  const currentAgent = await ark.getAgent(config.arkAgentId);
+  if (["1", "2", "3"].includes(currentAgent.version || "")) {
+    const { EMPLOYEE_AGENT_CONFIG } = await import("./employee-init.ts");
+    const upgraded = await ark.updateAgent(config.arkAgentId, currentAgent.version, EMPLOYEE_AGENT_CONFIG);
+    console.log(`已升级数字员工 Agent${upgraded.version ? ` 至 v${upgraded.version}` : ""}，支持对话内用户授权。`);
+    store.resetAllSessions();
+  }
+  const client = new Lark.Client({ appId: config.feishuAppId, appSecret: config.feishuAppSecret });
+  let botTokenExpiresAt = 0;
+  let botTokenCredential = (await ark.listCredentials(config.arkVaultId)).find(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN");
+  const ensureBotToken = async (): Promise<void> => {
+    if (botTokenExpiresAt - Date.now() > 5 * 60_000) return;
+    const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app_id: config.feishuAppId, app_secret: config.feishuAppSecret }), signal: AbortSignal.timeout(30_000)
+    });
+    const payload = await response.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
+    if (!response.ok || payload.code || !payload.tenant_access_token) throw new Error(`获取 Bot tenant_access_token 失败：${payload.msg || response.status}`);
+    if (botTokenCredential) await ark.updateEnvironmentCredential(config.arkVaultId, botTokenCredential.id, payload.tenant_access_token);
+    else botTokenCredential = { id: await ark.createEnvironmentVariableCredential(config.arkVaultId, "lark-cli-bot-tenant-access-token", "LARKSUITE_CLI_TENANT_ACCESS_TOKEN", payload.tenant_access_token), displayName: "lark-cli-bot-tenant-access-token", authType: "environment_variable", secretName: "LARKSUITE_CLI_TENANT_ACCESS_TOKEN" };
+    botTokenExpiresAt = Date.now() + Number(payload.expire || 7200) * 1000;
+  };
+  const sendReply = async (chatId: string, text: string): Promise<void> => {
+    const response = await client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) }
+    });
+    assertLarkResponse(response, "发送文本消息");
+  };
+  const sendAuthorizationCard = async (chatId: string, url: string): Promise<void> => {
+    const card = { schema: "2.0", config: { width_mode: "default" }, header: { title: { tag: "plain_text", content: "授权查看你的日程" }, subtitle: { tag: "plain_text", content: "仅用于本次数字员工协作" }, template: "blue", icon: { tag: "standard_icon", token: "calendar_outlined" } }, body: { elements: [{ tag: "markdown", content: "为了帮你避开冲突，数字员工需要读取你的日程和忙闲信息。创建日程仍使用数字员工的 Bot 身份，并会邀请你参加。" }, { tag: "button", text: { tag: "plain_text", content: "授权查看日程" }, type: "primary_filled", width: "fill", behaviors: [{ type: "open_url", default_url: url }] }] } };
+    const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: chatId, msg_type: "interactive", content: JSON.stringify(card) } });
+    assertLarkResponse(response, "发送授权卡片");
+  };
+  let gateway: InstanceType<typeof Gateway>;
+  const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resume(message));
+  gateway = new Gateway(store, ark, sendReply, {
+    agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
+    timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: createFeishuResourceDownloader(client),
+    requiresAuthorization: message => needsCalendarAuthorization(message.text), ensureAuthorization: message => auth.ensure(message),
+    getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true
+  });
+  const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName });
+  console.log("数字员工配置：");
+  console.log(`- 飞书 App ID：${config.feishuAppId}`);
+  console.log(`- 方舟 Agent ID：${config.arkAgentId}`);
+  console.log(`- 管理后台：${web.url}`);
+  console.log("正在连接飞书 WebSocket；获准用户可私聊 Bot 或在群里 @Bot。");
+  const syntheticText = process.env.ARKAGENT_SYNTHETIC_MESSAGE?.trim();
+  if (syntheticText) {
+    const recent = store.listAuditLogs(1)[0];
+    if (!recent) throw new Error("没有可用于模拟输入的历史会话，请先给数字员工发送一条普通消息");
+    console.log(`正在向最近会话注入 Gateway 测试消息：${syntheticText}`);
+    gateway.accept({
+      eventId: `synthetic-${Date.now()}`, messageId: `synthetic-${Date.now()}`,
+      chatId: recent.chatId, chatType: "p2p", threadId: "", userOpenId: recent.openId,
+      tenantKey: recent.tenantKey, text: syntheticText, attachments: [], mentionedBot: false
+    });
+  }
+  try {
+    await startFeishuGateway({ appId: config.feishuAppId, appSecret: config.feishuAppSecret, gateway });
+  } catch (error) {
+    web.server.close();
+    store.close();
+    throw error;
+  }
+}
+
+async function employeeDoctor(): Promise<void> {
+  loadSavedEmployeeEnvironment();
+  const [{ loadEmployeeConfig }, { ArkClient }] = await Promise.all([import("./config.ts"), import("./ark.ts")]);
+  const config = loadEmployeeConfig();
+  const agent = await new ArkClient(config.arkApiKey, config.arkBaseUrl).getAgent(config.arkAgentId);
+  console.log(`数字员工配置有效；已连接 Agent ${agent.id}${agent.version ? ` v${agent.version}` : ""}。`);
+  console.log(`WebUI 将监听 http://${config.webHost}:${config.webPort}/。`);
 }
 
 async function run(): Promise<void> {
@@ -193,8 +304,53 @@ async function guidedInit(): Promise<void> {
   }
 }
 
+async function guidedEmployeeInit(): Promise<void> {
+  if (!stdin.isTTY) throw new Error("交互式 employee init 需要在终端中运行");
+  const paths = getEmployeePaths();
+  const [{ ArkClient }, { runEmployeeInit }, Lark, qrModule] = await Promise.all([
+    import("./ark.ts"), import("./employee-init.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
+  ]);
+  const qr = qrModule.default || qrModule;
+  const result = await runEmployeeInit({
+    askSecret: async label => readMaskedInput(`${label}（输入内容以 • 显示）: `),
+    createArk: (apiKey, baseUrl) => new ArkClient(apiKey, baseUrl),
+    createFeishuApp: async (botScopes, userScopes) => {
+      console.log("即将创建飞书数字员工应用，请使用飞书扫码确认。");
+      const credentials = await Lark.registerApp({
+        source: "arkagent-employee",
+        appPreset: { name: "方舟数字员工", desc: "使用 Bot 身份工作的方舟 Managed Agents 数字员工" },
+        addons: {
+          scopes: { tenant: botScopes, user: userScopes },
+          events: { items: { tenant: ["im.message.receive_v1"] } }
+        },
+        onQRCodeReady(info) {
+          qr.generate(info.url, { small: true });
+          console.log(`如果二维码无法扫描，请打开：${info.url}`);
+          console.log(`链接将在 ${info.expireIn} 秒后失效。`);
+        }
+      });
+      return { appId: credentials.client_id, appSecret: credentials.client_secret };
+    },
+    envPath: paths.configPath,
+    gatewayDatabasePath: paths.databasePath
+  });
+  console.log(`已创建数字员工 Agent：${result.agentId}`);
+  console.log(`${result.environmentCreated ? "已创建" : "已复用"} Environment：${result.environmentId}`);
+  console.log(`配置已安全写入 ${result.envPath}。`);
+  console.log("权限管理复用飞书应用可用范围。");
+  console.log("建议企业管理员前往：飞书管理后台 > 工作台 > 应用管理 > 方舟数字员工 > 应用可用范围，开启“允许不在可用范围内的成员申请使用应用”。");
+  console.log("初始化完成，正在启动数字员工…");
+  await runEmployee();
+}
+
 function loadSavedEnvironment(): ReturnType<typeof getArkagentPaths> {
   const paths = getArkagentPaths();
+  if (existsSync(paths.configPath)) loadConfigFile(paths.configPath);
+  return paths;
+}
+
+function loadSavedEmployeeEnvironment(): ReturnType<typeof getEmployeePaths> {
+  const paths = getEmployeePaths();
   if (existsSync(paths.configPath)) loadConfigFile(paths.configPath);
   return paths;
 }
@@ -235,7 +391,7 @@ async function readMaskedInput(prompt: string): Promise<string> {
 }
 
 function printHelp(): void {
-  console.log(`arkagent [command]\n\n  init    交互式认领办公助手\n  login   复用当前 App 重新执行用户 OAuth\n  doctor  检查配置并验证方舟 Agent\n  run     启动本地 Gateway（默认）`);
+  console.log(`arkagent [command]\n\n个人助手：\n  init             交互式认领办公助手\n  login            复用当前 App 重新执行用户 OAuth\n  doctor           检查配置并验证方舟 Agent\n  run              启动个人助手 Gateway（默认）\n\n数字员工：\n  employee init                创建 Bot 身份数字员工\n  employee                     启动数字员工 Gateway 与 WebUI\n  employee doctor              检查数字员工配置\n  employee repair-environment  重建并切换数字员工运行环境`);
 }
 
 await main();

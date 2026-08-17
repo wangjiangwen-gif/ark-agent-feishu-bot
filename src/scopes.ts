@@ -9,11 +9,29 @@ const DOMAIN_SCOPES = {
   drive: ["drive:drive", "drive:file"]
 };
 
+const BOT_BASE_SCOPES = [
+  "im:message:send_as_bot",
+  "im:message:readonly",
+  "im:message.p2p_msg:readonly",
+  "im:message.group_at_msg:readonly",
+  "calendar:calendar",
+  "calendar:calendar.event:create",
+  "calendar:calendar.event:read"
+];
+
 export const SUPPORTED_LARK_DOMAINS = Object.keys(DOMAIN_SCOPES);
 
 export function resolveLarkUserScopes(input: string): string[] {
+  return [...BASE_SCOPES, ...resolveBusinessScopes(input)];
+}
+
+export function resolveLarkBotScopes(input: string): string[] {
+  return [...new Set([...BOT_BASE_SCOPES, ...resolveBusinessScopes(input)])];
+}
+
+function resolveBusinessScopes(input: string): string[] {
   const domains = [...new Set(input.split(/[\s,]+/).map(value => value.trim()).filter(Boolean))];
   const unknown = domains.filter(domain => !(domain in DOMAIN_SCOPES));
   if (unknown.length) throw new Error(`暂不支持 lark-cli 业务域：${unknown.join(", ")}；当前支持：${SUPPORTED_LARK_DOMAINS.join(", ")}`);
-  return [...new Set([...BASE_SCOPES, ...domains.flatMap(domain => DOMAIN_SCOPES[domain as keyof typeof DOMAIN_SCOPES])])];
+  return [...new Set(domains.flatMap(domain => DOMAIN_SCOPES[domain as keyof typeof DOMAIN_SCOPES]))];
 }
