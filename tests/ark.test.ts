@@ -44,7 +44,7 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
     config: {
       type: "cloud", networking: { type: "unrestricted" },
       env: { LARKSUITE_CLI_APP_ID: "cli-1" },
-      setup_script: "set -e\nnpm install -g @larksuite/cli\nlark-cli --version"
+      setup_script: "set -e\nnpm install -g @larksuite/cli@latest\nnpx --yes @larksuite/cli@latest install </dev/null\nlark-cli config strict-mode off\ntimeout 30 lark-cli --version"
     }
   });
   assert.deepEqual(calls.at(-1)?.body, {

@@ -15,3 +15,13 @@ export function getArkagentPaths(env: NodeJS.ProcessEnv = process.env): Arkagent
     databasePath: join(stateDir, "gateway.db")
   };
 }
+
+export function getEmployeePaths(env: NodeJS.ProcessEnv = process.env): ArkagentPaths {
+  const personal = getArkagentPaths(env);
+  const stateDir = resolve(env.ARKAGENT_EMPLOYEE_HOME || join(personal.stateDir, "employee"));
+  return {
+    stateDir,
+    configPath: join(stateDir, "config.env"),
+    databasePath: join(stateDir, "gateway.db")
+  };
+}
