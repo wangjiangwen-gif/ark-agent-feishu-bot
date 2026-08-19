@@ -41,6 +41,38 @@ test("normalizeFeishuMessage extracts image resources and ignores unsupported me
   assert.equal(normalizeFeishuMessage({ message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "sticker" } }), undefined);
 });
 
+test("normalizeFeishuMessage combines text and images from a rich post", () => {
+  const result = normalizeFeishuMessage({
+    message: {
+      message_id: "om-post", chat_id: "oc-1", chat_type: "p2p", message_type: "post",
+      content: JSON.stringify({
+        title: "现场反馈",
+        content: [
+          [{ tag: "text", text: "请分析这张截图" }, { tag: "a", text: "参考链接", href: "https://example.com" }],
+          [{ tag: "img", image_key: "img-v3-first" }],
+          [{ tag: "text", text: "并给出修复建议" }, { tag: "img", image_key: "img-v3-second" }]
+        ]
+      })
+    }
+  });
+  assert.equal(result?.text, "现场反馈\n请分析这张截图 参考链接\n并给出修复建议");
+  assert.deepEqual(result?.attachments, [
+    { key: "img-v3-first", name: "img-v3-first.jpg", type: "image" },
+    { key: "img-v3-second", name: "img-v3-second.jpg", type: "image" }
+  ]);
+});
+
+test("normalizeFeishuMessage supports localized rich post payloads", () => {
+  const result = normalizeFeishuMessage({
+    message: {
+      message_id: "om-post-localized", chat_id: "oc-1", chat_type: "p2p", message_type: "post",
+      content: JSON.stringify({ zh_cn: { title: "中文标题", content: [[{ tag: "text", text: "正文" }, { tag: "img", image_key: "img-cn" }]] } })
+    }
+  });
+  assert.equal(result?.text, "中文标题\n正文");
+  assert.deepEqual(result?.attachments, [{ key: "img-cn", name: "img-cn.jpg", type: "image" }]);
+});
+
 test("resource downloader enforces the byte limit while streaming", async () => {
   const client = {
     im: { messageResource: { get: async () => ({

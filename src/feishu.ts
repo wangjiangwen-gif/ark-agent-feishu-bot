@@ -19,6 +19,18 @@ type FeishuEvent = {
   };
 };
 
+type PostNode = {
+  tag?: string;
+  text?: string;
+  user_name?: string;
+  image_key?: string;
+};
+
+type PostBody = {
+  title?: string;
+  content?: PostNode[][];
+};
+
 export async function startFeishuGateway(options: {
   appId: string;
   appSecret: string;
@@ -43,12 +55,14 @@ export function normalizeFeishuMessage(event: FeishuEvent): IncomingMessage | un
   let text = "";
   let attachments: IncomingMessage["attachments"] = [];
   try {
-    const content = JSON.parse(message.content || "{}") as { text?: string; file_key?: string; file_name?: string; image_key?: string };
+    const content = JSON.parse(message.content || "{}") as { text?: string; file_key?: string; file_name?: string; image_key?: string } & Record<string, unknown>;
     if (message.message_type === "text") text = String(content.text || "");
     else if (message.message_type === "file" && content.file_key) {
       attachments = [{ key: content.file_key, name: content.file_name || content.file_key, type: "file" }];
     } else if (message.message_type === "image" && content.image_key) {
       attachments = [{ key: content.image_key, name: `${content.image_key}.jpg`, type: "image" }];
+    } else if (message.message_type === "post") {
+      ({ text, attachments } = normalizePost(content));
     } else return undefined;
   } catch {
     return undefined;
@@ -68,6 +82,43 @@ export function normalizeFeishuMessage(event: FeishuEvent): IncomingMessage | un
     attachments,
     mentionedBot: Boolean(message.mentions?.length)
   };
+}
+
+function normalizePost(content: Record<string, unknown>): Pick<IncomingMessage, "text" | "attachments"> {
+  const body = selectPostBody(content);
+  if (!body) return { text: "", attachments: [] };
+  const lines: string[] = [];
+  const attachments: IncomingMessage["attachments"] = [];
+  const imageKeys = new Set<string>();
+  if (typeof body.title === "string" && body.title.trim()) lines.push(body.title.trim());
+  for (const row of Array.isArray(body.content) ? body.content : []) {
+    if (!Array.isArray(row)) continue;
+    const texts: string[] = [];
+    for (const node of row) {
+      if (!node || typeof node !== "object") continue;
+      if (["text", "a", "code_block"].includes(node.tag || "") && typeof node.text === "string" && node.text.trim()) texts.push(node.text.trim());
+      else if (node.tag === "at" && typeof node.user_name === "string" && node.user_name.trim()) texts.push(`@${node.user_name.trim()}`);
+      else if (["img", "image"].includes(node.tag || "") && typeof node.image_key === "string" && node.image_key && !imageKeys.has(node.image_key)) {
+        imageKeys.add(node.image_key);
+        attachments.push({ key: node.image_key, name: `${node.image_key}.jpg`, type: "image" });
+      }
+    }
+    if (texts.length) lines.push(texts.join(" "));
+  }
+  return { text: lines.join("\n"), attachments };
+}
+
+function selectPostBody(content: Record<string, unknown>): PostBody | undefined {
+  if (Array.isArray(content.content)) return content as PostBody;
+  for (const locale of ["zh_cn", "en_us", "ja_jp"]) {
+    const candidate = content[locale];
+    if (isPostBody(candidate)) return candidate;
+  }
+  return Object.values(content).find(isPostBody);
+}
+
+function isPostBody(value: unknown): value is PostBody {
+  return Boolean(value && typeof value === "object" && Array.isArray((value as PostBody).content));
 }
 
 export type FeishuResourceClient = {

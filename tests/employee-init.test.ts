@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPLOYEE_AGENT_NAME, runEmployeeInit } from "../src/employee-init.ts";
 
+test("employee runtime never mutates the configured user Agent", async () => {
+  const source = await readFile(join(process.cwd(), "src/cli.ts"), "utf8");
+  const runtime = source.slice(source.indexOf("async function runEmployee"), source.indexOf("async function employeeDoctor"));
+  assert.doesNotMatch(runtime, /\.updateAgent\s*\(/);
+});
+
 test("employee init creates bot credential without user OAuth", async () => {
   const dir = await mkdtemp(join(tmpdir(), "arkagent-employee-init-"));
   const envPath = join(dir, "config.env");
