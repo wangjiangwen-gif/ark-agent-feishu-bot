@@ -53,20 +53,91 @@ test("gateway acknowledges quickly, deduplicates, and reuses a session", async (
 
 test("gateway creates a session bound to the user Vault", async () => {
   const store = new GatewayStore(":memory:");
+  let sessionAgentId = "";
+  let sessionEnvironmentId = "";
   let sessionVaultIds: string[] | undefined;
   let sessionEnv: Record<string, string> | undefined;
   const gateway = new Gateway(store, {
-    createSession: async (_agentId, _environmentId, vaultIds, env) => {
+    createSession: async (agentId, environmentId, vaultIds, env) => {
+      sessionAgentId = agentId;
+      sessionEnvironmentId = environmentId;
       sessionVaultIds = vaultIds;
       sessionEnv = env;
       return "session-1";
     },
     run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
-  }, async () => undefined, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "ou-current-user", timeoutMs: 5_000 });
+  }, async () => undefined, { agentId: "agent-user-owned", environmentId: "env-user-owned", vaultId: "vlt-1", authorizedUserOpenId: "ou-current-user", timeoutMs: 5_000 });
   gateway.accept(message({ userOpenId: "ou-current-user" }));
   await delay(30);
+  assert.equal(sessionAgentId, "agent-user-owned");
+  assert.equal(sessionEnvironmentId, "env-user-owned");
   assert.deepEqual(sessionVaultIds, ["vlt-1"]);
   assert.deepEqual(sessionEnv, { FEISHU_USER_OPEN_ID: "ou-current-user" });
+  store.close();
+});
+
+test("gateway compacts the old session before resuming in a user-authorized session", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };
+  store.saveSession(key, "session-old", "agent-1");
+  const operations: string[] = [];
+  let resumedInput = "";
+  let sessionVaultIds: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async (_agentId, _environmentId, vaultIds) => {
+      operations.push("create:session-new");
+      sessionVaultIds = vaultIds;
+      return "session-new";
+    },
+    run: async (sessionId, input) => {
+      operations.push(`run:${sessionId}`);
+      if (sessionId === "session-old") {
+        assert.match(input, /不要调用工具/);
+        return { terminal: "idle" as const, messages: ["用户目标：安排项目复盘；已知参会人：张三、李四。"] };
+      }
+      resumedInput = input;
+      return { terminal: "idle" as const, messages: ["已继续处理"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, getUserVaultIds: async () => ["vlt-user"]
+  });
+
+  gateway.resumeWithHandoff(message({ text: "帮我找大家有空的时间" }));
+  await delay(40);
+
+  assert.deepEqual(operations, ["run:session-old", "create:session-new", "run:session-new"]);
+  assert.deepEqual(sessionVaultIds, ["vlt-bot", "vlt-user"]);
+  assert.match(resumedInput, /source_session_id: session-old/);
+  assert.match(resumedInput, /用户目标：安排项目复盘/);
+  assert.match(resumedInput, /旧 Session 的文件系统、挂载文件和临时路径未迁移/);
+  assert.match(resumedInput, /帮我找大家有空的时间/);
+  assert.equal(store.getSession(key), "session-new");
+  store.close();
+});
+
+test("gateway still rotates and resumes when old-session compaction fails", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };
+  store.saveSession(key, "session-old", "agent-1");
+  let resumedInput = "";
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-new",
+    run: async (sessionId, input) => {
+      if (sessionId === "session-old") throw new Error("compact timeout");
+      resumedInput = input;
+      return { terminal: "idle" as const, messages: ["已继续处理"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true
+  });
+
+  gateway.resumeWithHandoff(message({ text: "继续创建日程" }));
+  await delay(40);
+
+  assert.equal(resumedInput, "继续创建日程");
+  assert.equal(store.getSession(key), "session-new");
   store.close();
 });
 
@@ -181,7 +252,7 @@ test("gateway downloads, uploads and mounts a Feishu file before running the Age
   gateway.accept(message({ text: "", attachments: [{ key: "file-key", name: "季度计划.pdf", type: "file" }] }));
   await delay(30);
   assert.deepEqual(operations, ["session", "upload:季度计划.pdf:application/pdf:2", "mount:/mnt/data/季度计划.pdf", "run"]);
-  assert.match(prompt, /\/mnt\/data\/季度计划\.pdf/);
+  assert.match(prompt, /文件已挂载到：\n- \/mnt\/session\/uploads\/mnt\/data\/季度计划\.pdf/);
   store.close();
 });
 

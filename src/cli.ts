@@ -59,13 +59,6 @@ async function runEmployee(): Promise<void> {
   const config = loadEmployeeConfig();
   const store = new GatewayStore(config.databasePath);
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
-  const currentAgent = await ark.getAgent(config.arkAgentId);
-  if (["1", "2", "3"].includes(currentAgent.version || "")) {
-    const { EMPLOYEE_AGENT_CONFIG } = await import("./employee-init.ts");
-    const upgraded = await ark.updateAgent(config.arkAgentId, currentAgent.version, EMPLOYEE_AGENT_CONFIG);
-    console.log(`已升级数字员工 Agent${upgraded.version ? ` 至 v${upgraded.version}` : ""}，支持对话内用户授权。`);
-    store.resetAllSessions();
-  }
   const client = new Lark.Client({ appId: config.feishuAppId, appSecret: config.feishuAppSecret });
   let botTokenExpiresAt = 0;
   let botTokenCredential = (await ark.listCredentials(config.arkVaultId)).find(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN");
@@ -94,7 +87,7 @@ async function runEmployee(): Promise<void> {
     assertLarkResponse(response, "发送授权卡片");
   };
   let gateway: InstanceType<typeof Gateway>;
-  const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resume(message));
+  const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resumeWithHandoff(message));
   gateway = new Gateway(store, ark, sendReply, {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: createFeishuResourceDownloader(client),

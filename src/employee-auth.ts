@@ -56,7 +56,6 @@ export class EmployeeAuthorizationManager {
       if (credential) await this.ark.updateEnvironmentCredential(vault.id, credential.id, tokens.accessToken);
       else credential = { id: await this.ark.createEnvironmentVariableCredential(vault.id, "lark-cli-user-access-token", "LARKSUITE_CLI_USER_ACCESS_TOKEN", tokens.accessToken), displayName: "lark-cli-user-access-token", authType: "environment_variable" };
       this.store.saveEmployeeOAuth({ tenantKey: message.tenantKey, openId, vaultId: vault.id, credentialId: credential.id, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt, scopes: EMPLOYEE_CALENDAR_USER_SCOPES });
-      this.store.resetSession({ tenantKey: message.tenantKey, chatId: message.chatId, threadId: message.threadId, userOpenId: message.userOpenId });
       this.resume(message);
     } catch (error) {
       console.error("用户授权失败：", error instanceof Error ? error.message : error);
