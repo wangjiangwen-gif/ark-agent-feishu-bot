@@ -36,7 +36,7 @@ test("Channel SDK message maps to the channel-neutral contract", () => {
   });
 });
 
-test("Channel adapter replies in the original thread and sends cards", async () => {
+test("Channel adapter sends normal chats directly and preserves existing topics", async () => {
   const calls: Array<{ to: string; input: unknown; options?: unknown }> = [];
   const handlers = new Map<string, (...args: never[]) => unknown>();
   const port = {
@@ -47,15 +47,21 @@ test("Channel adapter replies in the original thread and sends cards", async () 
     downloadResource: async () => Buffer.from([1, 2, 3])
   } as unknown as LarkChannelPort;
   const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
-  const inbound = normalizeLarkChannelMessage(normalized({ threadId: "omt-1" }), "cli-one");
+  const direct = normalizeLarkChannelMessage(normalized(), "cli-one");
+  const group = normalizeLarkChannelMessage(normalized({ messageId: "om-2", chatType: "group" }), "cli-one");
+  const topic = normalizeLarkChannelMessage(normalized({ messageId: "om-3", chatType: "group", threadId: "omt-1" }), "cli-one");
   let received = "";
   await adapter.start(message => { received = message.text; });
   await handlers.get("message")?.(normalized() as never);
-  await adapter.reply(inbound, { type: "text", text: "完成" });
+  await adapter.reply(direct, { type: "text", text: "单聊答复" });
+  await adapter.reply(group, { type: "text", text: "群聊答复" });
+  await adapter.reply(topic, { type: "text", text: "话题答复" });
   await adapter.send("oc-2", { type: "card", card: { schema: "2.0" } });
   assert.equal(received, "请总结");
   assert.deepEqual(calls, [
-    { to: "oc-1", input: { text: "完成" }, options: { replyTo: "om-1", replyInThread: true } },
+    { to: "oc-1", input: { text: "单聊答复" }, options: undefined },
+    { to: "oc-1", input: { text: "群聊答复" }, options: undefined },
+    { to: "oc-1", input: { text: "话题答复" }, options: { replyTo: "om-3", replyInThread: true } },
     { to: "oc-2", input: { card: { schema: "2.0" } }, options: undefined }
   ]);
 });

@@ -55,10 +55,12 @@ export class LarkChannelAdapter implements ChannelAdapter {
   }
 
   async reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void> {
-    await this.channel.send(message.conversationId, toLarkSendInput(outbound), {
-      replyTo: message.messageId,
-      replyInThread: Boolean(message.threadId)
-    });
+    const input = toLarkSendInput(outbound);
+    if (message.conversationType === "group" && message.threadId) {
+      await this.channel.send(message.conversationId, input, { replyTo: message.messageId, replyInThread: true });
+      return;
+    }
+    await this.channel.send(message.conversationId, input);
   }
 
   async send(conversationId: string, outbound: ChannelOutbound): Promise<void> {

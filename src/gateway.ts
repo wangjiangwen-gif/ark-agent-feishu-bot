@@ -35,14 +35,15 @@ export class KeyedQueue {
 
 export class Gateway {
   private queue = new KeyedQueue();
+  private sessionStatsCheckedAt = new Map<string, number>();
   private store: GatewayStore;
-  private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile">>;
+  private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>;
   private reply: Reply;
   private options: GatewayOptions;
 
   constructor(
     store: GatewayStore,
-    ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile">>,
+    ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>,
     reply: Reply,
     options: GatewayOptions
   ) {
@@ -126,10 +127,24 @@ export class Gateway {
     await this.options.beforeCreateSession?.();
     const startedAt = Date.now();
     let sessionId = this.store.getSession(key);
+    const hadSession = Boolean(sessionId);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
+    if (sessionId) {
+      progressTimer = setTimeout(() => {
+        progressReply = this.replyText(message, "已收到，正在处理，请稍候。").catch(error => {
+          console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
+        });
+      }, this.options.progressDelayMs ?? 2_500);
+      if (await this.shouldRotateSession(sessionId)) {
+        handoff ||= await this.createSessionHandoff(key);
+        this.store.resetSession(key);
+        this.sessionStatsCheckedAt.delete(sessionId);
+        sessionId = undefined;
+      }
+    }
     if (!sessionId) {
-      await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
+      if (!hadSession) await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
       const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
@@ -138,12 +153,6 @@ export class Gateway {
         { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
       );
       this.store.saveSession(key, sessionId, this.options.agentId);
-    } else {
-      progressTimer = setTimeout(() => {
-        progressReply = this.replyText(message, "已收到，正在处理，请稍候。").catch(error => {
-          console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
-        });
-      }, this.options.progressDelayMs ?? 2_500);
     }
     let input = message.text;
     try {
@@ -202,6 +211,26 @@ export class Gateway {
     }
   }
 
+  private async shouldRotateSession(sessionId: string): Promise<boolean> {
+    if (this.options.sessionRotation === false || !this.ark.getSessionStats) return false;
+    const now = Date.now();
+    const lastCheckedAt = this.sessionStatsCheckedAt.get(sessionId) || 0;
+    if (now - lastCheckedAt < (this.options.sessionStatsCheckIntervalMs ?? 60_000)) return false;
+    this.sessionStatsCheckedAt.set(sessionId, now);
+    const limits = this.options.sessionRotation || {};
+    try {
+      const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2_000));
+      const maxEvents = limits.maxEvents ?? 120;
+      const maxInputTokens = limits.maxInputTokens ?? 20_000;
+      const rotate = stats.eventCount >= maxEvents || (stats.latestInputTokens ?? 0) >= maxInputTokens;
+      if (rotate) console.info(`Session ${sessionId} 达到上下文阈值，将压缩并轮换`);
+      return rotate;
+    } catch (error) {
+      console.warn("检查 Session 上下文大小失败，将继续复用当前 Session：", error instanceof Error ? error.message : error);
+      return false;
+    }
+  }
+
   private replyText(message: IncomingMessage, text: string): Promise<void> {
     return this.reply(message, { type: "text", text });
   }
@@ -228,6 +257,9 @@ export type GatewayOptions = {
   timeoutMs: number;
   progressDelayMs?: number;
   handoffTimeoutMs?: number;
+  sessionRotation?: false | { maxEvents?: number; maxInputTokens?: number };
+  sessionStatsCheckIntervalMs?: number;
+  sessionStatsTimeoutMs?: number;
   beforeCreateSession?: () => Promise<void>;
   platformAccess?: boolean;
   requiresAuthorization?: (message: IncomingMessage) => boolean;

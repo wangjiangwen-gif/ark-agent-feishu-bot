@@ -5,6 +5,16 @@ export type RunResult = {
   messages: string[];
 };
 
+export type SessionStats = {
+  eventCount: number;
+  latestInputTokens?: number;
+};
+
+type ArkClientOptions = {
+  sseHeadStartMs?: number;
+  eventPollIntervalMs?: number;
+};
+
 export type AgentConfig = {
   name: string;
   description: string;
@@ -30,12 +40,17 @@ export class ArkClient {
   private baseUrl: string;
 
   private fetcher: typeof fetch;
+  private options: Required<ArkClientOptions>;
   private environmentConfigs = new Map<string, EnvironmentConfig>();
 
-  constructor(apiKey: string, baseUrl: string, fetcher: typeof fetch = fetch) {
+  constructor(apiKey: string, baseUrl: string, fetcher: typeof fetch = fetch, options: ArkClientOptions = {}) {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl;
     this.fetcher = fetcher;
+    this.options = {
+      sseHeadStartMs: options.sseHeadStartMs ?? 100,
+      eventPollIntervalMs: options.eventPollIntervalMs ?? 750
+    };
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
@@ -227,30 +242,40 @@ export class ArkClient {
     });
   }
 
+  async getSessionStats(sessionId: string, signal?: AbortSignal): Promise<SessionStats> {
+    const events = await this.listSessionEvents(sessionId, signal);
+    let latestInputTokens: number | undefined;
+    for (const event of events) {
+      const usage = event.model_usage && typeof event.model_usage === "object"
+        ? event.model_usage as Record<string, unknown>
+        : undefined;
+      const inputTokens = usage?.input_tokens;
+      if (typeof inputTokens === "number" && Number.isFinite(inputTokens)) {
+        latestInputTokens = Math.max(latestInputTokens ?? 0, inputTokens);
+      }
+    }
+    return { eventCount: events.length, latestInputTokens };
+  }
+
   async run(sessionId: string, text: string, timeoutMs: number, onProgress?: (progress: string) => Promise<void>): Promise<RunResult> {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
-    const messages: string[] = [];
-    const seen = new Set<string>();
     try {
-      // 先建立事件流再发送消息，避免快速完成的 Agent 在 SSE 订阅建立前
-      // 已经产生 message + idle，导致 Gateway 永久等待下一条事件。
-      const eventStream = await this.openEventStream(sessionId, controller.signal);
+      // 先发起 SSE 请求，但不等待服务端返回响应头。部分环境建立事件流约需
+      // 15 秒；若在这里 await，会让 user.message 也被无谓阻塞。
+      const eventStream = this.openEventStream(sessionId, controller.signal);
+      await Promise.race([
+        eventStream.then(() => undefined, () => undefined),
+        waitFor(this.options.sseHeadStartMs, controller.signal)
+      ]);
       await this.sendMessage(sessionId, text);
-      for await (const event of eventStream) {
-        if (event.id && seen.has(event.id)) continue;
-        if (event.id) seen.add(event.id);
-        if (event.type === "agent.message") {
-          const text = eventText(event);
-          if (text) messages.push(text);
-        }
-        const progress = eventProgress(event);
-        if (progress) await onProgress?.(progress);
-        if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages };
-        if (event.type === "session.status_idle") return { terminal: "idle", messages };
-      }
-      throw new Error("事件流结束，但未观察到 Session 终态");
+      const result = await Promise.any([
+        this.consumeEventStream(eventStream, onProgress),
+        this.pollRunResult(sessionId, startedAt, controller.signal)
+      ]);
+      controller.abort();
+      return result;
     } catch (error) {
       if (!controller.signal.aborted) throw error;
       const recovered = await this.recoverTimedOutRun(sessionId, startedAt);
@@ -265,9 +290,7 @@ export class ArkClient {
     // 超时边界常与最终 idle 只差几秒；短暂回查事件历史，避免已经完成的回复丢失。
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await new Promise(resolve => setTimeout(resolve, 5_000));
-      const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/events?limit=200`);
-      const payload = await response.json() as Record<string, unknown>;
-      const events = Array.isArray(payload.data) ? payload.data as ArkEvent[] : [];
+      const events = await this.listSessionEvents(sessionId);
       const result = resultFromEvents(events, startedAt);
       if (result) return result;
     }
@@ -278,6 +301,44 @@ export class ArkClient {
     yield* await this.openEventStream(sessionId, signal);
   }
 
+  private async consumeEventStream(
+    streamPromise: Promise<AsyncGenerator<ArkEvent>>,
+    onProgress?: (progress: string) => Promise<void>
+  ): Promise<RunResult> {
+    const messages: string[] = [];
+    const seen = new Set<string>();
+    for await (const event of await streamPromise) {
+      if (event.id && seen.has(event.id)) continue;
+      if (event.id) seen.add(event.id);
+      if (event.type === "agent.message") {
+        const text = eventText(event);
+        if (text) messages.push(text);
+      }
+      const progress = eventProgress(event);
+      if (progress) await onProgress?.(progress);
+      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages };
+      if (event.type === "session.status_idle") return { terminal: "idle", messages };
+    }
+    throw new Error("事件流结束，但未观察到 Session 终态");
+  }
+
+  private async pollRunResult(sessionId: string, startedAt: number, signal: AbortSignal): Promise<RunResult> {
+    while (!signal.aborted) {
+      const result = resultFromEvents(await this.listSessionEvents(sessionId, signal), startedAt);
+      if (result) return result;
+      await waitFor(this.options.eventPollIntervalMs, signal);
+    }
+    throw signal.reason || new Error("Session 事件轮询已取消");
+  }
+
+  private async listSessionEvents(sessionId: string, signal?: AbortSignal): Promise<ArkEvent[]> {
+    const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/events?limit=200`, { signal });
+    const payload = await response.json() as Record<string, unknown>;
+    if (Array.isArray(payload.data)) return payload.data as ArkEvent[];
+    const data = payload.data && typeof payload.data === "object" ? payload.data as Record<string, unknown> : undefined;
+    return Array.isArray(data?.items) ? data.items as ArkEvent[] : [];
+  }
+
   private async openEventStream(sessionId: string, signal: AbortSignal): Promise<AsyncGenerator<ArkEvent>> {
     const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}/events/stream`, {
       headers: { Accept: "text/event-stream", Authorization: `Bearer ${this.apiKey}` }, signal
@@ -285,6 +346,21 @@ export class ArkClient {
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
     return parseEventStream(response.body);
   }
+}
+
+function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function* parseEventStream(body: ReadableStream<Uint8Array>): AsyncGenerator<ArkEvent> {

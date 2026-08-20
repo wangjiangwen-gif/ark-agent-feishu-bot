@@ -145,6 +145,67 @@ test("gateway still rotates and resumes when old-session compaction fails", asyn
   store.close();
 });
 
+test("gateway automatically compacts and rotates an oversized session", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = toConversationKey(message());
+  store.saveSession(key, "session-old", "agent-1");
+  const operations: string[] = [];
+  let newInput = "";
+  const gateway = new Gateway(store, {
+    getSessionStats: async sessionId => {
+      operations.push(`stats:${sessionId}`);
+      return { eventCount: 196, latestInputTokens: 27_611 };
+    },
+    createSession: async () => {
+      operations.push("create:session-new");
+      return "session-new";
+    },
+    run: async (sessionId, input) => {
+      operations.push(`run:${sessionId}`);
+      if (sessionId === "session-old") return { terminal: "idle" as const, messages: ["用户目标：继续完成办公任务。"] };
+      newInput = input;
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000
+  });
+
+  gateway.accept(message({ text: "继续" }));
+  await delay(40);
+
+  assert.deepEqual(operations, ["stats:session-old", "run:session-old", "create:session-new", "run:session-new"]);
+  assert.match(newInput, /用户目标：继续完成办公任务/);
+  assert.match(newInput, /<current_user_request>\n继续/);
+  assert.equal(store.getSession(key), "session-new");
+  store.close();
+});
+
+test("gateway reuses a session below the rotation threshold", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = toConversationKey(message());
+  store.saveSession(key, "session-current", "agent-1");
+  let creates = 0;
+  let runSession = "";
+  const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 20, latestInputTokens: 4_000 }),
+    createSession: async () => { creates++; return "session-new"; },
+    run: async sessionId => {
+      runSession = sessionId;
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000
+  });
+
+  gateway.accept(message());
+  await delay(30);
+
+  assert.equal(creates, 0);
+  assert.equal(runSession, "session-current");
+  assert.equal(store.getSession(key), "session-current");
+  store.close();
+});
+
 test("reused slow sessions receive one delayed processing reply", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
