@@ -167,7 +167,7 @@ test("result requires both a successful terminal and a business message", () => 
   }), "文档已创建：https://example.com/docx/1");
 });
 
-test("gateway acknowledges quickly, deduplicates, and reuses a session", async () => {
+test("gateway avoids processing text for fast requests, deduplicates, and reuses a session", async () => {
   const store = new GatewayStore(":memory:");
   let creates = 0;
   let runs = 0;
@@ -184,7 +184,7 @@ test("gateway acknowledges quickly, deduplicates, and reuses a session", async (
   await delay(30);
   assert.equal(creates, 1);
   assert.equal(runs, 2);
-  assert.deepEqual(replies, ["已收到，正在处理。首次启动可能需要几分钟。", "回复", "回复"]);
+  assert.deepEqual(replies, ["回复", "回复"]);
   store.close();
 });
 
@@ -339,7 +339,7 @@ test("gateway reuses a session below the rotation threshold", async () => {
   store.close();
 });
 
-test("reused slow sessions receive one delayed processing reply", async () => {
+test("slow sessions receive one delayed processing reply without a startup message", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
   let runs = 0;
@@ -356,7 +356,7 @@ test("reused slow sessions receive one delayed processing reply", async () => {
   gateway.accept(message({ eventId: "event-2", messageId: "message-2" }));
   await delay(40);
   assert.deepEqual(replies, [
-    "已收到，正在处理。首次启动可能需要几分钟。", "回复",
+    "回复",
     "已收到，正在处理，请稍候。", "回复"
   ]);
   store.close();

@@ -368,7 +368,7 @@ test("Channel adapter drives the complete receive, Agent and reply path", async 
   await adapter.start(message => gateway.accept(message));
   messageHandler?.(normalized());
   await delay(30);
-  assert.deepEqual(sends.map(item => item.input), [{ text: "已收到，正在处理。首次启动可能需要几分钟。" }, { text: "最终答复" }]);
+  assert.deepEqual(sends.map(item => item.input), [{ text: "最终答复" }]);
   assert.equal(store.listAuditLogs()[0].installationId, "cli-one");
   await adapter.stop();
   store.close();

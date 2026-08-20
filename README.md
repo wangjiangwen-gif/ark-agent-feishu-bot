@@ -272,7 +272,7 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 - 群聊只处理明确 `@Bot` 的文本消息。
 - 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session，`/new` 显式重置；数字员工仅在群聊中为每条 @ 消息创建独立 Session，多用户请求并行执行。
 - 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
-- 新建 Session 会立即回复一次“正在处理”；复用 Session 只有超过 2.5 秒仍未完成时才发送一次提示。
+- Gateway 优先使用 `Get` 表情反馈处理中状态；仅当表情添加失败且请求超过 2.5 秒仍未完成时，才发送一次“正在处理，请稍候。”兜底提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
 - Markdown/TXT 原文直接内联到本次 Session 消息；其他单聊文件上传到方舟 Files，再只读挂载到 `/mnt/data/`。文件本体不写入 Gateway 数据库。

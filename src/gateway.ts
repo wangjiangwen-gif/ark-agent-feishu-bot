@@ -164,10 +164,9 @@ export class Gateway {
     const startedAt = Date.now();
     const reusableSession = !this.usesIsolatedSession(message);
     let sessionId = reusableSession ? this.store.getSession(key) : undefined;
-    const hadSession = Boolean(sessionId);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
-    if (sessionId && !hasReaction) {
+    if (!hasReaction) {
       progressTimer = setTimeout(() => {
         progressReply = this.replyText(message, "已收到，正在处理，请稍候。").catch(error => {
           console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
@@ -183,7 +182,6 @@ export class Gateway {
       }
     }
     if (!sessionId) {
-      if (!hadSession && !hasReaction) await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
       const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
