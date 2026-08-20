@@ -24,6 +24,7 @@ export const OFFICE_AGENT_CONFIG: AgentConfig = {
 3. 只有任务及其业务域已经明确，且确实需要读取或修改飞书数据时，才允许调用 lark-cli。
 4. 禁止运行 lark-cli skills list、lark-cli --version 或其他能力枚举、安装检测、版本探测命令。仅在业务域明确后读取与任务直接匹配的 Skill。
 5. 工具调用超时或失败后，不得改用相似的探测命令继续尝试，也不得重复原命令；应根据已有错误向用户说明或提出必要的澄清问题。
+6. 单一查询或写入任务优先控制在两次 lark-cli 调用以内（一次读取 Skill、一次业务命令）；不得重复读取同一信息。
 
 执行飞书任务时：
 1. 业务域明确后，运行 lark-cli skills read <skill-name>，完整读取与任务匹配的内置 Skill，并遵循其中工作流。

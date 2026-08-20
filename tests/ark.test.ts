@@ -43,10 +43,17 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
     name: "env",
     config: {
       type: "cloud", networking: { type: "unrestricted" },
-      env: { LARKSUITE_CLI_APP_ID: "cli-1" },
-      setup_script: "set -e\nnpm install -g @larksuite/cli@latest\nnpx --yes @larksuite/cli@latest install </dev/null\nlark-cli config strict-mode off\ntimeout 30 lark-cli --version"
+      env: {
+        LARKSUITE_CLI_APP_ID: "cli-1",
+        LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+        LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
+        LARKSUITE_CLI_STRICT_MODE: "off"
+      },
+      setup_script: (calls[0].body?.config as Record<string, unknown>).setup_script
     }
   });
+  assert.match(String((calls[0].body?.config as Record<string, unknown>).setup_script), /sha256sum -c -/);
+  assert.doesNotMatch(String((calls[0].body?.config as Record<string, unknown>).setup_script), /\bnpm(?:\s|$)|\bnpx(?:\s|$)/);
   assert.deepEqual(calls.at(-1)?.body, {
     agent: "agent-1",
     environment: {

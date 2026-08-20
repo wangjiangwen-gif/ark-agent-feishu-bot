@@ -10,6 +10,8 @@ test("employee prompt clarifies ambiguous requests before using tools", () => {
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /不得通过执行命令猜测用户意图/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /禁止运行 lark-cli skills list/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /工具调用超时或失败后，不得改用相似的探测命令继续尝试/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /输入已包含近期会话快照时，不得再次读取相同范围/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /单一查询或写入任务优先控制在两次 lark-cli 调用以内/);
 });
 
 test("employee runtime never mutates the configured user Agent", async () => {

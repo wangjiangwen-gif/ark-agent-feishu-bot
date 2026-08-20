@@ -132,7 +132,9 @@ test("per-message group Session receives bounded history and current channel ide
     FEISHU_THREAD_ID: "omt-one",
     FEISHU_TRIGGER_MESSAGE_ID: "message-1",
     FEISHU_TRIGGER_CREATE_TIME: "1700000000000",
-    LARKSUITE_CLI_STRICT_MODE: "off"
+    LARKSUITE_CLI_STRICT_MODE: "off",
+    LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+    LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
   });
   store.close();
 });
@@ -209,7 +211,11 @@ test("gateway creates a session bound to the user Vault", async () => {
   assert.equal(sessionAgentId, "agent-user-owned");
   assert.equal(sessionEnvironmentId, "env-user-owned");
   assert.deepEqual(sessionVaultIds, ["vlt-1"]);
-  assert.deepEqual(sessionEnv, { FEISHU_USER_OPEN_ID: "ou-current-user" });
+  assert.deepEqual(sessionEnv, {
+    FEISHU_USER_OPEN_ID: "ou-current-user",
+    LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+    LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
+  });
   store.close();
 });
 

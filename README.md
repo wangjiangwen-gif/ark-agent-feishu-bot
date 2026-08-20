@@ -185,6 +185,8 @@ arkagent employee repair-environment
 
 该命令创建新 Environment 并更新本地配置；随后重新启动 `arkagent employee`。
 
+新 Environment 不再在启动阶段执行 `npm install` / `npx install`。它会从 lark-cli 安装器使用的国内镜像直接下载固定版本原生二进制，并用官方发布清单中的 SHA-256 校验后安装；同时关闭更新与 Skill 通知器。这样既避免 GitHub 首连失败后的长时间回退，也避免重复下载。lark-cli 升级需随 arkagent 版本更新并同步校验值，不会在 Session 启动时自动漂移到未知版本。
+
 ### 最小验收流程
 
 完成 `employee init` 且飞书权限审核通过后，建议按以下顺序验证：
@@ -211,7 +213,7 @@ arkagent employee repair-environment
 
 本项目的真实联调暴露出以下 MA 平台体验问题：
 
-- **Environment 更新不等于镜像重建**：修改 `setup_script` 后，新 Session 仍可能复用旧镜像；平台缺少明确的 rebuild、版本号和构建日志。
+- **Environment 更新不等于镜像重建**：修改 `setup_script` 后，新 Session 仍可能复用旧镜像；平台缺少明确的 rebuild、版本号和构建日志。本项目因此以新建 Environment 的方式切换 lark-cli 版本。
 - **初始化脚本可观测性不足**：安装失败、网络阻塞和缓存复用难以区分，用户只能从 Agent 后续执行失败反推环境状态。
 - **bash 启动不稳定且错误层次模糊**：多次出现“60 秒内未拿到 execution_id”，无法判断是调度排队、容器启动、命令执行还是网络问题。
 - **Vault 占位符不适合所有凭证交换**：App Secret 以占位符注入后，依赖它在请求体中换取 Bot token 的 CLI 流程不可用；最终只能由 Gateway 在本地换取短期 tenant token 再写入 Vault。

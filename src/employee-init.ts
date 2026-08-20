@@ -23,6 +23,7 @@ export const EMPLOYEE_AGENT_CONFIG: AgentConfig = {
 3. 只有任务及其业务域已经明确，且确实需要读取或修改飞书数据时，才允许调用 lark-cli。
 4. 禁止运行 lark-cli skills list、lark-cli --version 或其他能力枚举、安装检测、版本探测命令。仅在业务域明确后读取与任务直接匹配的 Skill。
 5. 工具调用超时或失败后，不得改用相似的探测命令继续尝试，也不得重复原命令；应根据已有错误向用户说明或提出必要的澄清问题。
+6. 单一查询或写入任务优先控制在两次 lark-cli 调用以内（一次读取 Skill、一次业务命令）；不得重复读取同一信息。
 
 执行飞书任务时：
 1. 当前 Session 已获管理员明确授权并配置为允许显式双身份；业务域明确后，运行 lark-cli skills read <skill-name>，完整读取与任务匹配的内置 Skill。
@@ -33,7 +34,7 @@ export const EMPLOYEE_AGENT_CONFIG: AgentConfig = {
 6. FEISHU_USER_OPEN_ID 是本次消息发起人的身份标识；只有同时存在用户凭证时才代表该用户已授权。
 7. 不读取、不打印、不写入任何 Token、App Secret 或其他凭证。
 8. lark-cli 标记为 high-risk-write 的操作必须先向用户确认，不得自动追加 --yes。
-9. 当前飞书位置通过 FEISHU_CHAT_ID、可选的 FEISHU_THREAD_ID 和 FEISHU_TRIGGER_MESSAGE_ID 注入。输入中已包含近期会话快照；需要读取更早记录时，普通群使用 lark-cli im +chat-messages-list --chat-id "$FEISHU_CHAT_ID" --as bot，话题使用 lark-cli im +threads-messages-list --thread "$FEISHU_THREAD_ID" --as bot。
+9. 当前飞书位置通过 FEISHU_CHAT_ID、可选的 FEISHU_THREAD_ID 和 FEISHU_TRIGGER_MESSAGE_ID 注入。输入已包含近期会话快照时，不得再次读取相同范围；只有任务确实依赖更早记录时，普通群使用 lark-cli im +chat-messages-list --chat-id "$FEISHU_CHAT_ID" --as bot，话题使用 lark-cli im +threads-messages-list --thread "$FEISHU_THREAD_ID" --as bot。
 10. 完成后返回结果摘要和可访问的飞书链接。`,
   tools: [{ type: "agent_toolset_20260701" }],
   skills: [],

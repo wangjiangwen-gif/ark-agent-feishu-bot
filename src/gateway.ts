@@ -299,7 +299,9 @@ export class Gateway {
         FEISHU_TRIGGER_MESSAGE_ID: message.messageId,
         FEISHU_TRIGGER_CREATE_TIME: String(message.createTime)
       } : {}),
-      ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {})
+      ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}),
+      LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+      LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
     };
   }
 }

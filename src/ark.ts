@@ -35,6 +35,20 @@ export type EnvironmentConfig = {
   [key: string]: unknown;
 };
 
+const LARK_CLI_VERSION = "1.0.88";
+const LARK_CLI_SETUP_SCRIPT = `set -e
+case "$(uname -m)" in
+  x86_64) ARCH=amd64; SHA=497de20939acdd2aae4c898fea7a0ca71d5a459ed543202e762a8bcb3228effe ;;
+  aarch64|arm64) ARCH=arm64; SHA=96a3cac444947456ce9971c912946323f20d14416434da7e274bd9d77d7ac28b ;;
+  *) echo "unsupported architecture" >&2; exit 1 ;;
+esac
+ARCHIVE=/tmp/lark-cli.tar.gz
+curl --fail --location --silent --show-error --connect-timeout 10 --max-time 120 "https://registry.npmmirror.com/-/binary/lark-cli/v${LARK_CLI_VERSION}/lark-cli-${LARK_CLI_VERSION}-linux-$ARCH.tar.gz" -o "$ARCHIVE"
+echo "$SHA  $ARCHIVE" | sha256sum -c -
+tar -xzf "$ARCHIVE" -C /usr/local/bin lark-cli
+chmod 0755 /usr/local/bin/lark-cli
+rm -f "$ARCHIVE"`;
+
 export class ArkClient {
   private apiKey: string;
   private baseUrl: string;
@@ -124,8 +138,13 @@ export class ArkClient {
       method: "POST",
       body: JSON.stringify({ name, config: {
         type: "cloud", networking: { type: "unrestricted" },
-        env: { LARKSUITE_CLI_APP_ID: feishuAppId },
-        setup_script: "set -e\nnpm install -g @larksuite/cli@latest\nnpx --yes @larksuite/cli@latest install </dev/null\nlark-cli config strict-mode off\ntimeout 30 lark-cli --version"
+        env: {
+          LARKSUITE_CLI_APP_ID: feishuAppId,
+          LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+          LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
+          LARKSUITE_CLI_STRICT_MODE: "off"
+        },
+        setup_script: LARK_CLI_SETUP_SCRIPT
       } })
     });
     const payload = await response.json() as Record<string, unknown>;
