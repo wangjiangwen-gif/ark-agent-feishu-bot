@@ -36,24 +36,32 @@ export async function startFeishuGateway(options: {
   appSecret: string;
   gateway: Gateway;
 }): Promise<void> {
+  return startLegacyFeishuChannel({ ...options, onMessage: message => options.gateway.accept(message) });
+}
+
+export async function startLegacyFeishuChannel(options: {
+  appId: string;
+  appSecret: string;
+  onMessage: (message: IncomingMessage) => void;
+}): Promise<void> {
   const Lark = await import("@larksuiteoapi/node-sdk");
   const baseConfig = { appId: options.appId, appSecret: options.appSecret };
   const wsClient = new Lark.WSClient({ ...baseConfig, loggerLevel: Lark.LoggerLevel.info });
   const dispatcher = new Lark.EventDispatcher({}).register({
     "im.message.receive_v1": async (data: unknown) => {
-      const message = normalizeFeishuMessage(data as FeishuEvent);
-      if (message) options.gateway.accept(message);
+      const message = normalizeFeishuMessage(data as FeishuEvent, options.appId);
+      if (message) options.onMessage(message);
     }
   });
   // SDK 的事件处理函数只做去重与入队，不等待 Agent 执行，满足飞书 3 秒处理约束。
   await wsClient.start({ eventDispatcher: dispatcher });
 }
 
-export function normalizeFeishuMessage(event: FeishuEvent): IncomingMessage | undefined {
+export function normalizeFeishuMessage(event: FeishuEvent, installationId = "legacy"): IncomingMessage | undefined {
   const message = event.message;
   if (!message?.message_id || !message.chat_id) return undefined;
   let text = "";
-  let attachments: IncomingMessage["attachments"] = [];
+  let attachments: LegacyAttachment[] = [];
   try {
     const content = JSON.parse(message.content || "{}") as { text?: string; file_key?: string; file_name?: string; image_key?: string } & Record<string, unknown>;
     if (message.message_type === "text") text = String(content.text || "");
@@ -71,24 +79,28 @@ export function normalizeFeishuMessage(event: FeishuEvent): IncomingMessage | un
     if (mention.key) text = text.replaceAll(mention.key, "");
   }
   return {
+    channelType: "lark",
+    installationId,
     eventId: event.event_id || message.message_id,
     messageId: message.message_id,
-    chatId: message.chat_id,
-    chatType: message.chat_type === "p2p" ? "p2p" : "group",
+    conversationId: message.chat_id,
+    conversationType: message.chat_type === "p2p" ? "direct" : "group",
     threadId: message.thread_id || message.root_id || message.parent_id || "",
-    userOpenId: event.sender?.sender_id?.open_id || "",
-    tenantKey: event.tenant_key || "default",
+    senderId: event.sender?.sender_id?.open_id || "",
+    tenantId: event.tenant_key || "default",
     text: text.trim(),
-    attachments,
+    resources: attachments.map(item => ({ id: item.key, name: item.name, type: item.type })),
     mentionedBot: Boolean(message.mentions?.length)
   };
 }
 
-function normalizePost(content: Record<string, unknown>): Pick<IncomingMessage, "text" | "attachments"> {
+type LegacyAttachment = { key: string; name: string; type: "file" | "image" };
+
+function normalizePost(content: Record<string, unknown>): { text: string; attachments: LegacyAttachment[] } {
   const body = selectPostBody(content);
   if (!body) return { text: "", attachments: [] };
   const lines: string[] = [];
-  const attachments: IncomingMessage["attachments"] = [];
+  const attachments: LegacyAttachment[] = [];
   const imageKeys = new Set<string>();
   if (typeof body.title === "string" && body.title.trim()) lines.push(body.title.trim());
   for (const row of Array.isArray(body.content) ? body.content : []) {
@@ -129,10 +141,10 @@ export type FeishuResourceClient = {
 };
 
 export function createFeishuResourceDownloader(client: FeishuResourceClient, maxBytes = MAX_FEISHU_FILE_BYTES) {
-  return async (attachment: IncomingMessage["attachments"][number], message: IncomingMessage): Promise<{ bytes: Uint8Array; mimeType: string }> => {
+  return async (attachment: IncomingMessage["resources"][number], message: IncomingMessage): Promise<{ bytes: Uint8Array; mimeType: string }> => {
     const response = await client.im.messageResource.get({
       params: { type: attachment.type },
-      path: { message_id: message.messageId, file_key: attachment.key }
+      path: { message_id: message.messageId, file_key: attachment.id }
     });
     const declaredSize = Number(headerValue(response.headers, "content-length") || 0);
     if (declaredSize > maxBytes) throw new Error(`文件 ${attachment.name} 超过 ${formatBytes(maxBytes)} 限制`);

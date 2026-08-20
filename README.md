@@ -4,6 +4,8 @@
 
 这是一个面向方舟 Managed Agents 的飞书接入插件。初始化向导会创建 Agent、Environment、Vault 和飞书应用，并启动通过 WebSocket 收消息的本地 Gateway；用户不需要手工拼接这些资源。
 
+Gateway 默认使用飞书官方 `@larksuite/channel` 接收和归一化消息，并通过内部 Channel Adapter 接入 Managed Agents。Session、用户身份注入、OAuth、Vault 和审计仍由 arkagent 核心管理；会话与事件按 Channel 和应用实例隔离，为后续接入其他消息平台保留边界。若新版 Channel SDK 在特定网络环境下异常，可临时使用 `ARKAGENT_FEISHU_TRANSPORT=legacy arkagent`（数字员工命令同理）回退旧传输层。
+
 当前提供两种相互隔离的运行模式：
 
 | 模式 | 适合谁 | 飞书操作身份 | 初始化 | 启动 |
@@ -162,7 +164,7 @@ npx --yes arkagent@latest employee doctor
 
 Bot 的 App Secret 保存在本地安全配置，用于 WebSocket 鉴权和刷新短期 `tenant_access_token`。Gateway 把短期 Bot token 写入方舟 Vault，以 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 注入 Session；MA Session 不需要读取 App Secret。App ID 由 Environment 提供。当前消息发送者的 `open_id` 会作为 `FEISHU_USER_OPEN_ID` 覆写到 Session；只有该 Session 同时挂载了对应用户 Vault 时，才表示这个用户已经授权。
 
-数字员工会显式申请 `im:message.p2p_msg:readonly` 与 `im:message.group_at_msg:readonly`，分别用于接收用户私聊和群聊中明确 @Bot 的消息。应用可用范围、原生申请和审批由飞书控制面统一管理，arkagent 不复制这套能力。
+数字员工会显式申请 `im:message.p2p_msg:readonly` 与 `im:message.group_at_msg:readonly`，分别用于接收用户私聊和群聊中明确 @Bot 的消息；同时申请消息 Reaction、消息更新及 CardKit 权限。Gateway 收到请求后先在用户消息上添加 `Get` 表情，使用同一条流式消息逐步更新 Agent 回复，任务成功或失败后都会移除该表情。应用可用范围、原生申请和审批由飞书控制面统一管理，arkagent 不复制这套能力。
 
 WebUI 首页是数字员工列表；点击员工后进入详情，通过「身份」「行为日志」「访问过的用户」查看该员工。身份页展示当前 Agent 已拥有的飞书 Bot 身份、认证方式、能力和授权范围；只展示方舟 Vault Credential 的脱敏引用，不会返回 App Secret 或 token。身份模型预留了 provider 和 identity type，后续可继续接入飞书用户身份及其他服务身份。「访问过的用户」只表示已经实际使用过 Bot 的用户，完整使用权限仍由飞书应用可用范围管理。
 
@@ -195,7 +197,7 @@ arkagent employee repair-environment
 
 | 身份 | init 时声明的权限 | 是否还需后续动作 |
 |---|---|---|
-| Bot 消息 | `im:message:send_as_bot`、`im:message:readonly`、私聊与群聊 @Bot 事件 | 受飞书应用可用范围控制 |
+| Bot 消息 | `im:message:send_as_bot`、`im:message:readonly`、`im:message.reactions:write_only`、`im:message:update`、`cardkit:card:write`、`cardkit:card:read`、私聊与群聊 @Bot 事件 | 受飞书应用可用范围控制；新增权限可能需要管理员审核并重新发布应用 |
 | Bot 日历 | `calendar:calendar`、`calendar:calendar.event:create`、`calendar:calendar.event:read` | 可能需要企业管理员审核 |
 | Bot 文档/云空间 | `docs,drive` 对应权限 | 可能因企业策略需要审核 |
 | 用户基础 | `offline_access`、`auth:user.id:read` | 每位用户首次使用时 OAuth |
@@ -240,7 +242,7 @@ arkagent employee repair-environment
 
 | 业务域 | OAuth scopes | 用途 |
 |---|---|---|
-| Bot 消息 | `im:message:send_as_bot`、`im:message:readonly` | 回复消息、下载用户发送的文件 |
+| Bot 消息 | `im:message:send_as_bot`、`im:message:readonly`、`im:message.reactions:write_only`、`im:message:update`、`cardkit:card:write`、`cardkit:card:read` | 回复消息、流式更新和处理中表情 |
 | 基础 | `offline_access`、`auth:user.id:read` | 刷新 token、确认授权用户 |
 | docs | `docx:document`、`docx:document:create`、`docx:document:readonly`、`docx:document:write_only` | 创建、回读与更新飞书文档 |
 | drive | `drive:drive`、`drive:file` | 访问云空间文件 |
@@ -305,8 +307,10 @@ npm pack --dry-run
 | `src/web.ts` | 本地数字员工概览、已连接身份、实际使用者和审计 WebUI |
 | `src/login.ts` | 复用现有资源重新授权，并更新本地 OAuth 状态和 Vault Credential |
 | `src/oauth.ts` | 飞书 Device OAuth 与 token 刷新 |
-| `src/feishu.ts` | 飞书 WebSocket 事件接入与消息归一化 |
-| `src/gateway.ts` | 去重、Session 复用、进度与最终回复 |
+| `src/channel.ts` | 与平台无关的 Channel 消息、资源、出站能力和适配器契约 |
+| `src/lark-channel.ts` | 飞书 Channel SDK 适配器 |
+| `src/feishu.ts` | 可回退的旧版飞书 WebSocket 接入 |
+| `src/gateway.ts` | 跨 Channel 去重、Session 复用、身份注入与最终回复 |
 | `src/ark.ts` | Managed Agents API 与 SSE 客户端 |
 | `src/store.ts` | SQLite 会话、实际使用者和审计记录 |
 

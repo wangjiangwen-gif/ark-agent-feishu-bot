@@ -27,7 +27,7 @@ test("normalizeFeishuMessage extracts file resources", () => {
     }
   });
   assert.equal(result?.text, "");
-  assert.deepEqual(result?.attachments, [{ key: "file-v3", name: "季度计划.pdf", type: "file" }]);
+  assert.deepEqual(result?.resources, [{ id: "file-v3", name: "季度计划.pdf", type: "file" }]);
 });
 
 test("normalizeFeishuMessage extracts image resources and ignores unsupported messages", () => {
@@ -37,7 +37,7 @@ test("normalizeFeishuMessage extracts image resources and ignores unsupported me
       content: JSON.stringify({ image_key: "img-v3" })
     }
   });
-  assert.deepEqual(image?.attachments, [{ key: "img-v3", name: "img-v3.jpg", type: "image" }]);
+  assert.deepEqual(image?.resources, [{ id: "img-v3", name: "img-v3.jpg", type: "image" }]);
   assert.equal(normalizeFeishuMessage({ message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "sticker" } }), undefined);
 });
 
@@ -56,9 +56,9 @@ test("normalizeFeishuMessage combines text and images from a rich post", () => {
     }
   });
   assert.equal(result?.text, "现场反馈\n请分析这张截图 参考链接\n并给出修复建议");
-  assert.deepEqual(result?.attachments, [
-    { key: "img-v3-first", name: "img-v3-first.jpg", type: "image" },
-    { key: "img-v3-second", name: "img-v3-second.jpg", type: "image" }
+  assert.deepEqual(result?.resources, [
+    { id: "img-v3-first", name: "img-v3-first.jpg", type: "image" },
+    { id: "img-v3-second", name: "img-v3-second.jpg", type: "image" }
   ]);
 });
 
@@ -70,7 +70,7 @@ test("normalizeFeishuMessage supports localized rich post payloads", () => {
     }
   });
   assert.equal(result?.text, "中文标题\n正文");
-  assert.deepEqual(result?.attachments, [{ key: "img-cn", name: "img-cn.jpg", type: "image" }]);
+  assert.deepEqual(result?.resources, [{ id: "img-cn", name: "img-cn.jpg", type: "image" }]);
 });
 
 test("resource downloader enforces the byte limit while streaming", async () => {
@@ -80,9 +80,9 @@ test("resource downloader enforces the byte limit while streaming", async () => 
       async *getReadableStream() { yield new Uint8Array([1, 2]); yield new Uint8Array([3, 4]); }
     }) } }
   };
-  const attachment = { key: "file-v3", name: "report.pdf", type: "file" as const };
+  const attachment = { id: "file-v3", name: "report.pdf", type: "file" as const };
   const message = normalizeFeishuMessage({
-    message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "file", content: JSON.stringify({ file_key: attachment.key, file_name: attachment.name }) }
+    message: { message_id: "om-1", chat_id: "oc-1", chat_type: "p2p", message_type: "file", content: JSON.stringify({ file_key: attachment.id, file_name: attachment.name }) }
   })!;
   const result = await createFeishuResourceDownloader(client, 4)(attachment, message);
   assert.deepEqual([...result.bytes], [1, 2, 3, 4]);

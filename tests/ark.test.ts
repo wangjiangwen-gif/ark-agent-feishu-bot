@@ -112,8 +112,73 @@ test("run establishes SSE before sending the user message", async () => {
     return new Response("{}", { status: 200 });
   });
   const result = await client.run("session-1", "你好", 5_000);
-  assert.deepEqual(calls, ["/sessions/session-1/events/stream", "/sessions/session-1/events"]);
+  assert.deepEqual(calls.slice(0, 2), ["/sessions/session-1/events/stream", "/sessions/session-1/events"]);
   assert.deepEqual(result, { terminal: "idle", messages: ["完成"] });
+});
+
+test("run posts immediately when SSE response headers are delayed and completes from event history", async () => {
+  const calls: string[] = [];
+  let messageSent = false;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async (url, init) => {
+    const path = String(url).replace("https://ark.example/api/v3", "");
+    calls.push(`${init?.method || "GET"} ${path}`);
+    if (path.endsWith("/events/stream")) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return new Response("", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
+    if (path.endsWith("/events") && init?.method === "POST") {
+      messageSent = true;
+      return new Response("{}", { status: 200 });
+    }
+    const data = messageSent ? [
+      { type: "agent.message", processed_at: new Date().toISOString(), content: [{ type: "text", text: "轮询完成" }] },
+      { type: "session.status_idle", processed_at: new Date().toISOString() }
+    ] : [];
+    return new Response(JSON.stringify({ data }), { status: 200 });
+  }, { sseHeadStartMs: 5, eventPollIntervalMs: 5 });
+
+  const startedAt = Date.now();
+  const result = await client.run("session-1", "你好", 5_000);
+
+  assert.ok(Date.now() - startedAt < 100);
+  assert.equal(calls[0], "GET /sessions/session-1/events/stream");
+  assert.equal(calls[1], "POST /sessions/session-1/events");
+  assert.deepEqual(result, { terminal: "idle", messages: ["轮询完成"] });
+});
+
+test("run accumulates agent.message deltas into full-text snapshots", async () => {
+  const snapshots: string[] = [];
+  const client = new ArkClient("key", "https://ark.example/api/v3", async (url) => {
+    const path = String(url).replace("https://ark.example/api/v3", "");
+    if (path.includes("/events/stream")) return new Response([
+      'data: {"type":"event_start","event":{"type":"agent.message","id":"evt-1"}}',
+      "",
+      'data: {"type":"event_delta","event_id":"evt-1","delta":{"type":"content_delta","index":0,"content":{"type":"text","text":"你"}}}',
+      "",
+      'data: {"type":"event_delta","event_id":"evt-1","delta":{"type":"content_delta","index":0,"content":{"type":"text","text":"好"}}}',
+      "",
+      'data: {"type":"agent.message","id":"evt-1","content":[{"type":"text","text":"你好！"}]}',
+      "",
+      'data: {"type":"session.status_idle"}',
+      ""
+    ].join("\n"), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    return new Response("{}", { status: 200 });
+  });
+
+  const result = await client.run("session-1", "你好", 5_000, undefined, async snapshot => { snapshots.push(snapshot); });
+
+  assert.deepEqual(snapshots, ["你", "你好", "你好！"]);
+  assert.deepEqual(result, { terminal: "idle", messages: ["你好！"] });
+});
+
+test("getSessionStats reports event count and latest model input tokens", async () => {
+  const client = new ArkClient("key", "https://ark.example/api/v3", async () => new Response(JSON.stringify({ data: { items: [
+    { type: "span.model_request_end", model_usage: { input_tokens: 1200 } },
+    { type: "agent.message" },
+    { type: "span.model_request_end", model_usage: { input_tokens: 27611 } }
+  ] } }), { status: 200 }));
+
+  assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611 });
 });
 
 test("Ark uploads a file and mounts it read-only in a Session", async () => {

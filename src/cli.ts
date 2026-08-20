@@ -6,6 +6,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig, loadConfigFile } from "./config.ts";
 import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
+import type { ChannelAdapter, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -53,13 +54,13 @@ async function repairEmployeeEnvironment(): Promise<void> {
 
 async function runEmployee(): Promise<void> {
   loadSavedEmployeeEnvironment();
-  const [{ loadEmployeeConfig }, { ArkClient }, { startFeishuGateway, createFeishuResourceDownloader }, { Gateway }, { GatewayStore }, { startEmployeeWeb }, { FeishuOAuth }, { EmployeeAuthorizationManager, needsCalendarAuthorization }, Lark] = await Promise.all([
-    import("./config.ts"), import("./ark.ts"), import("./feishu.ts"), import("./gateway.ts"), import("./store.ts"), import("./web.ts"), import("./oauth.ts"), import("./employee-auth.ts"), import("@larksuiteoapi/node-sdk")
+  const [{ loadEmployeeConfig }, { ArkClient }, { Gateway }, { GatewayStore }, { startEmployeeWeb }, { FeishuOAuth }, { EmployeeAuthorizationManager, needsCalendarAuthorization }] = await Promise.all([
+    import("./config.ts"), import("./ark.ts"), import("./gateway.ts"), import("./store.ts"), import("./web.ts"), import("./oauth.ts"), import("./employee-auth.ts")
   ]);
   const config = loadEmployeeConfig();
   const store = new GatewayStore(config.databasePath);
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
-  const client = new Lark.Client({ appId: config.feishuAppId, appSecret: config.feishuAppSecret });
+  const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret);
   let botTokenExpiresAt = 0;
   let botTokenCredential = (await ark.listCredentials(config.arkVaultId)).find(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN");
   const ensureBotToken = async (): Promise<void> => {
@@ -74,23 +75,16 @@ async function runEmployee(): Promise<void> {
     else botTokenCredential = { id: await ark.createEnvironmentVariableCredential(config.arkVaultId, "lark-cli-bot-tenant-access-token", "LARKSUITE_CLI_TENANT_ACCESS_TOKEN", payload.tenant_access_token), displayName: "lark-cli-bot-tenant-access-token", authType: "environment_variable", secretName: "LARKSUITE_CLI_TENANT_ACCESS_TOKEN" };
     botTokenExpiresAt = Date.now() + Number(payload.expire || 7200) * 1000;
   };
-  const sendReply = async (chatId: string, text: string): Promise<void> => {
-    const response = await client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) }
-    });
-    assertLarkResponse(response, "发送文本消息");
-  };
-  const sendAuthorizationCard = async (chatId: string, url: string): Promise<void> => {
+  const sendAuthorizationCard = async (message: ChannelMessage, url: string): Promise<void> => {
     const card = { schema: "2.0", config: { width_mode: "default" }, header: { title: { tag: "plain_text", content: "授权查看你的日程" }, subtitle: { tag: "plain_text", content: "仅用于本次数字员工协作" }, template: "blue", icon: { tag: "standard_icon", token: "calendar_outlined" } }, body: { elements: [{ tag: "markdown", content: "为了帮你避开冲突，数字员工需要读取你的日程和忙闲信息。创建日程仍使用数字员工的 Bot 身份，并会邀请你参加。" }, { tag: "button", text: { tag: "plain_text", content: "授权查看日程" }, type: "primary_filled", width: "fill", behaviors: [{ type: "open_url", default_url: url }] }] } };
-    const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: chatId, msg_type: "interactive", content: JSON.stringify(card) } });
-    assertLarkResponse(response, "发送授权卡片");
+    await channel.reply(message, { type: "card", card });
   };
   let gateway: InstanceType<typeof Gateway>;
   const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resumeWithHandoff(message));
-  gateway = new Gateway(store, ark, sendReply, {
+  gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
-    timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: createFeishuResourceDownloader(client),
+    timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
+    streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     requiresAuthorization: message => needsCalendarAuthorization(message.text), ensureAuthorization: message => auth.ensure(message),
     getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true
   });
@@ -106,13 +100,14 @@ async function runEmployee(): Promise<void> {
     if (!recent) throw new Error("没有可用于模拟输入的历史会话，请先给数字员工发送一条普通消息");
     console.log(`正在向最近会话注入 Gateway 测试消息：${syntheticText}`);
     gateway.accept({
+      channelType: "lark", installationId: config.feishuAppId,
       eventId: `synthetic-${Date.now()}`, messageId: `synthetic-${Date.now()}`,
-      chatId: recent.chatId, chatType: "p2p", threadId: "", userOpenId: recent.openId,
-      tenantKey: recent.tenantKey, text: syntheticText, attachments: [], mentionedBot: false
+      conversationId: recent.chatId, conversationType: "direct", threadId: "", senderId: recent.openId,
+      tenantId: recent.tenantKey, text: syntheticText, resources: [], mentionedBot: false
     });
   }
   try {
-    await startFeishuGateway({ appId: config.feishuAppId, appSecret: config.feishuAppSecret, gateway });
+    await channel.start(message => gateway.accept(message));
   } catch (error) {
     web.server.close();
     store.close();
@@ -132,8 +127,8 @@ async function employeeDoctor(): Promise<void> {
 async function run(): Promise<void> {
   const paths = loadSavedEnvironment();
   const config = loadConfig();
-  const [{ ArkClient }, { startFeishuGateway, createFeishuResourceDownloader }, { Gateway }, { GatewayStore }, { FeishuOAuth }] = await Promise.all([
-    import("./ark.ts"), import("./feishu.ts"), import("./gateway.ts"), import("./store.ts"), import("./oauth.ts")
+  const [{ ArkClient }, { Gateway }, { GatewayStore }, { FeishuOAuth }] = await Promise.all([
+    import("./ark.ts"), import("./gateway.ts"), import("./store.ts"), import("./oauth.ts")
   ]);
   const store = new GatewayStore(config.databasePath);
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
@@ -149,21 +144,16 @@ async function run(): Promise<void> {
     })().finally(() => { refreshing = undefined; });
     await refreshing;
   };
-  const Lark = await import("@larksuiteoapi/node-sdk");
-  const client = new Lark.Client({ appId: config.feishuAppId, appSecret: config.feishuAppSecret });
-  const sendReply = async (chatId: string, text: string): Promise<void> => {
-    const response = await client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) }
-    });
-    assertLarkResponse(response, "发送文本消息");
-  };
-  const gateway = new Gateway(store, ark, sendReply, {
+  const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret);
+  const gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId,
     environmentId: config.arkEnvironmentId,
     vaultId: config.arkVaultId,
-    authorizedUserOpenId: config.feishuUserOpenId,
-    downloadAttachment: createFeishuResourceDownloader(client),
+    authorizedUserId: config.feishuUserOpenId,
+    downloadAttachment: (resource, message) => channel.download(resource, message),
+    streamReply: channel.streamReply,
+    addReaction: channel.addReaction,
+    removeReaction: channel.removeReaction,
     beforeCreateSession: ensureCredentialFresh,
     timeoutMs: config.sessionTimeoutMs
   });
@@ -173,7 +163,53 @@ async function run(): Promise<void> {
   console.log(`- 方舟 Environment ID：${config.arkEnvironmentId}`);
   console.log(`- 授权用户 open_id：${maskIdentity(config.feishuUserOpenId)}`);
   console.log("正在连接飞书 WebSocket；请在该 App 对应的 Bot 会话中发送消息。");
-  await startFeishuGateway({ appId: config.feishuAppId, appSecret: config.feishuAppSecret, gateway });
+  await channel.start(message => gateway.accept(message));
+}
+
+type FeishuRuntime = {
+  transport: "channel" | "legacy";
+  start(handler: (message: ChannelMessage) => void): Promise<void>;
+  stop(): Promise<void>;
+  reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void>;
+  streamReply?: (message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
+  addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
+  removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
+  download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
+};
+
+async function createFeishuRuntime(appId: string, appSecret: string): Promise<FeishuRuntime> {
+  const transport = process.env.ARKAGENT_FEISHU_TRANSPORT === "legacy" ? "legacy" : "channel";
+  if (transport === "channel") {
+    const { LarkChannelAdapter } = await import("./lark-channel.ts");
+    const adapter: ChannelAdapter = new LarkChannelAdapter({ appId, appSecret });
+    console.log("飞书接入层：Channel SDK（设置 ARKAGENT_FEISHU_TRANSPORT=legacy 可临时回退）");
+    return {
+      transport,
+      start: handler => adapter.start(handler),
+      stop: () => adapter.stop(),
+      reply: (message, outbound) => adapter.reply(message, outbound),
+      streamReply: (message, producer) => adapter.streamReply(message, producer),
+      addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
+      removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
+      download: (resource, message) => adapter.download(resource, message)
+    };
+  }
+  const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, Lark] = await Promise.all([import("./feishu.ts"), import("@larksuiteoapi/node-sdk")]);
+  const client = new Lark.Client({ appId, appSecret });
+  const download = createFeishuResourceDownloader(client);
+  console.warn("飞书接入层：旧版 node-sdk；建议仅在 Channel SDK 异常时临时使用。");
+  return {
+    transport,
+    start: handler => startLegacyFeishuChannel({ appId, appSecret, onMessage: handler }),
+    stop: async () => undefined,
+    reply: async (message, outbound) => {
+      const msgType = outbound.type === "card" ? "interactive" : "text";
+      const content = outbound.type === "card" ? JSON.stringify(outbound.card) : JSON.stringify({ text: outbound.type === "markdown" ? outbound.markdown : outbound.text });
+      const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: message.conversationId, msg_type: msgType, content } });
+      assertLarkResponse(response, outbound.type === "card" ? "发送授权卡片" : "发送文本消息");
+    },
+    download
+  };
 }
 
 function maskIdentity(value: string): string {
@@ -249,8 +285,8 @@ async function guidedInit(): Promise<void> {
   };
   try {
     const paths = getArkagentPaths();
-    const [{ ArkClient }, { runGuidedInit }, { FeishuOAuth }, Lark, qrModule] = await Promise.all([
-      import("./ark.ts"), import("./init.ts"), import("./oauth.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
+    const [{ ArkClient }, { runGuidedInit }, { FeishuOAuth }, { resolveLarkBotScopes }, Lark, qrModule] = await Promise.all([
+      import("./ark.ts"), import("./init.ts"), import("./oauth.ts"), import("./scopes.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
     ]);
     const qr = qrModule.default || qrModule;
     const result = await runGuidedInit({
@@ -263,7 +299,7 @@ async function guidedInit(): Promise<void> {
           source: "ark-agent-feishu-bot",
           appPreset: { name: "方舟 Agent Bot", desc: "由方舟 Managed Agents 驱动的飞书机器人" },
           addons: {
-            scopes: { tenant: ["im:message:send_as_bot", "im:message:readonly"], user: userScopes },
+            scopes: { tenant: resolveLarkBotScopes(""), user: userScopes },
             events: { items: { tenant: ["im.message.receive_v1"] } }
           },
           onQRCodeReady(info) {

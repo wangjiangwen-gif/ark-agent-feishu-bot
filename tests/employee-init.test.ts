@@ -33,6 +33,8 @@ test("employee init creates bot credential without user OAuth", async () => {
     assert.ok(scopes.includes("im:message:send_as_bot"));
     assert.ok(scopes.includes("im:message.p2p_msg:readonly"));
     assert.ok(scopes.includes("im:message.group_at_msg:readonly"));
+    assert.ok(scopes.includes("im:message.reactions:write_only"));
+    assert.ok(scopes.includes("cardkit:card:write"));
     assert.equal(scopes.includes("offline_access"), false);
     const config = await readFile(envPath, "utf8");
     assert.match(config, /ARKAGENT_MODE="employee"/);

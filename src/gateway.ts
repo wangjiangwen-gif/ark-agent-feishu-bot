@@ -1,4 +1,5 @@
 import type { ArkClient, RunResult } from "./ark.ts";
+import type { ChannelMessage, ChannelOutbound } from "./channel.ts";
 import type { ConversationKey, GatewayStore } from "./store.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
@@ -16,20 +17,9 @@ const HANDOFF_PROMPT = `请为即将接替本 Session 的新 Session 生成一�
 
 type SessionHandoff = { sourceSessionId: string; summary: string };
 
-export type IncomingMessage = {
-  eventId: string;
-  messageId: string;
-  chatId: string;
-  chatType: "p2p" | "group";
-  threadId: string;
-  userOpenId: string;
-  tenantKey: string;
-  text: string;
-  attachments: Array<{ key: string; name: string; type: "file" | "image" }>;
-  mentionedBot: boolean;
-};
+export type IncomingMessage = ChannelMessage;
 
-export type Reply = (chatId: string, text: string) => Promise<void>;
+export type Reply = (message: IncomingMessage, outbound: ChannelOutbound) => Promise<void>;
 
 export class KeyedQueue {
   private tails = new Map<string, Promise<void>>();
@@ -45,14 +35,15 @@ export class KeyedQueue {
 
 export class Gateway {
   private queue = new KeyedQueue();
+  private sessionStatsCheckedAt = new Map<string, number>();
   private store: GatewayStore;
-  private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile">>;
+  private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>;
   private reply: Reply;
   private options: GatewayOptions;
 
   constructor(
     store: GatewayStore,
-    ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile">>,
+    ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>,
     reply: Reply,
     options: GatewayOptions
   ) {
@@ -64,16 +55,16 @@ export class Gateway {
 
   accept(message: IncomingMessage): boolean {
     if (!shouldHandleMessage(message)) return false;
-    if (!this.store.claimEvent(message.eventId)) return false;
+    if (!this.store.claimEvent(message.channelType, message.installationId, message.eventId)) return false;
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
       try {
-        await this.process(message, key);
-        this.store.completeEvent(message.eventId, "completed");
+        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
+        this.store.completeEvent(message.channelType, message.installationId, message.eventId, "completed");
       } catch (error) {
-        this.store.completeEvent(message.eventId, "failed");
+        this.store.completeEvent(message.channelType, message.installationId, message.eventId, "failed");
         const reason = error instanceof Error ? error.message : String(error);
-        await this.reply(message.chatId, `执行失败：${reason.slice(0, 240)}`);
+        await this.replyText(message, `执行失败：${reason.slice(0, 240)}`);
       }
     });
     return true;
@@ -82,8 +73,8 @@ export class Gateway {
   resume(message: IncomingMessage): void {
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
-      try { await this.process(message, key); }
-      catch (error) { await this.reply(message.chatId, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
+      try { await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction)); }
+      catch (error) { await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
     });
   }
 
@@ -91,13 +82,31 @@ export class Gateway {
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
       try {
-        const handoff = await this.createSessionHandoff(key);
-        this.store.resetSession(key);
-        await this.process(message, key, handoff);
+        await this.withReaction(message, async hasReaction => {
+          const handoff = await this.createSessionHandoff(key);
+          this.store.resetSession(key);
+          await this.process(message, key, handoff, hasReaction);
+        });
       } catch (error) {
-        await this.reply(message.chatId, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`);
+        await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`);
       }
     });
+  }
+
+  private async withReaction(message: IncomingMessage, task: (hasReaction: boolean) => Promise<void>): Promise<void> {
+    let reactionId: string | undefined;
+    if (this.options.addReaction && this.options.removeReaction) {
+      try { reactionId = await this.options.addReaction(message, "Get"); }
+      catch (error) { console.warn("添加处理中表情失败，将使用文本提示：", error instanceof Error ? error.message : error); }
+    }
+    try {
+      await task(Boolean(reactionId));
+    } finally {
+      if (reactionId && this.options.removeReaction) {
+        try { await this.options.removeReaction(message, reactionId); }
+        catch (error) { console.warn("移除处理中表情失败：", error instanceof Error ? error.message : error); }
+      }
+    }
   }
 
   private async createSessionHandoff(key: ConversationKey): Promise<SessionHandoff | undefined> {
@@ -116,17 +125,18 @@ export class Gateway {
     }
   }
 
-  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff): Promise<void> {
-    if (!this.options.platformAccess && message.userOpenId !== this.options.authorizedUserOpenId) {
-      await this.reply(message.chatId, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
+  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff, hasReaction = false): Promise<void> {
+    if (!this.options.platformAccess && message.senderId !== this.options.authorizedUserId) {
+      await this.replyText(message, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
     }
-    if (this.options.platformAccess) this.store.observeEmployeeUser(message.tenantKey, message.userOpenId);
+    if (this.options.platformAccess) this.store.observeEmployeeUser(message.tenantId, message.senderId);
     if (message.text.trim() === "/new") {
       this.store.resetSession(key);
-      await this.reply(message.chatId, "已开启新会话，下一条消息会创建新的 Agent Session。");
+      await this.replyText(message, "已开启新会话，下一条消息会创建新的 Agent Session。");
       if (this.options.platformAccess) this.store.addAuditLog({
-        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId,
+        channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
         messageId: message.messageId, action: "reset_session", status: "succeeded"
       });
       return;
@@ -135,32 +145,42 @@ export class Gateway {
     await this.options.beforeCreateSession?.();
     const startedAt = Date.now();
     let sessionId = this.store.getSession(key);
+    const hadSession = Boolean(sessionId);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
+    if (sessionId && !hasReaction) {
+      progressTimer = setTimeout(() => {
+        progressReply = this.replyText(message, "已收到，正在处理，请稍候。").catch(error => {
+          console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
+        });
+      }, this.options.progressDelayMs ?? 2_500);
+    }
+    if (sessionId) {
+      if (await this.shouldRotateSession(sessionId)) {
+        handoff ||= await this.createSessionHandoff(key);
+        this.store.resetSession(key);
+        this.sessionStatsCheckedAt.delete(sessionId);
+        sessionId = undefined;
+      }
+    }
     if (!sessionId) {
-      await this.reply(message.chatId, "已收到，正在处理。首次启动可能需要几分钟。");
+      if (!hadSession && !hasReaction) await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
       const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
         this.options.environmentId,
         [this.options.vaultId, ...extraVaultIds],
-        { FEISHU_USER_OPEN_ID: message.userOpenId, ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}) }
+        { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
       );
       this.store.saveSession(key, sessionId, this.options.agentId);
-    } else {
-      progressTimer = setTimeout(() => {
-        progressReply = this.reply(message.chatId, "已收到，正在处理，请稍候。").catch(error => {
-          console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
-        });
-      }, this.options.progressDelayMs ?? 2_500);
     }
     let input = message.text;
     try {
-      if (message.attachments.length) {
+      if (message.resources.length) {
         if (!this.options.downloadAttachment || !this.ark.uploadFile || !this.ark.addSessionFile) throw new Error("当前 Gateway 未配置文件处理能力");
         const mounted: string[] = [];
         const inlineTexts: Array<{ name: string; text: string }> = [];
-        for (const [index, attachment] of message.attachments.entries()) {
+        for (const [index, attachment] of message.resources.entries()) {
           const downloaded = await this.options.downloadAttachment(attachment, message);
           const name = safeFilename(attachment.name, index);
           if (isInlineTextFile(name)) {
@@ -188,19 +208,30 @@ export class Gateway {
       if (handoff) input = buildHandoffInput(handoff, input);
       // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result
       // 转成“执行进度：xxx”消息刷屏。
-      const result = await this.ark.run(sessionId, input, this.options.timeoutMs);
+      let result: RunResult | undefined;
+      if (this.options.streamReply) {
+        await this.options.streamReply(message, async update => {
+          result = await this.ark.run(sessionId, input, this.options.timeoutMs, undefined, update);
+          await update(resultToReply(result));
+        });
+      } else {
+        result = await this.ark.run(sessionId, input, this.options.timeoutMs);
+      }
+      if (!result) throw new Error("流式回复结束，但 Agent Session 没有返回结果");
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
-      await this.reply(message.chatId, resultToReply(result));
+      if (!this.options.streamReply) await this.replyText(message, resultToReply(result));
       this.store.addAuditLog({
-        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId, messageId: message.messageId,
-        sessionId, action: message.attachments.length ? "file_message" : "message", status: "succeeded",
-        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.attachments.length)
+        channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
+        sessionId, action: message.resources.length ? "file_message" : "message", status: "succeeded",
+        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.resources.length)
       });
     } catch (error) {
       this.store.addAuditLog({
-        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId, messageId: message.messageId,
-        sessionId, action: message.attachments.length ? "file_message" : "message", status: "failed",
+        channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
+        sessionId, action: message.resources.length ? "file_message" : "message", status: "failed",
         durationMs: Date.now() - startedAt, summary: error instanceof Error ? error.message.slice(0, 240) : "执行失败"
       });
       throw error;
@@ -208,28 +239,67 @@ export class Gateway {
       if (progressTimer) clearTimeout(progressTimer);
     }
   }
+
+  private async shouldRotateSession(sessionId: string): Promise<boolean> {
+    if (this.options.sessionRotation === false || !this.ark.getSessionStats) return false;
+    const now = Date.now();
+    const lastCheckedAt = this.sessionStatsCheckedAt.get(sessionId) || 0;
+    if (now - lastCheckedAt < (this.options.sessionStatsCheckIntervalMs ?? 60_000)) return false;
+    this.sessionStatsCheckedAt.set(sessionId, now);
+    const limits = this.options.sessionRotation || {};
+    try {
+      const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2_000));
+      const maxEvents = limits.maxEvents ?? 120;
+      const maxInputTokens = limits.maxInputTokens ?? 20_000;
+      const rotate = stats.eventCount >= maxEvents || (stats.latestInputTokens ?? 0) >= maxInputTokens;
+      if (rotate) console.info(`Session ${sessionId} 达到上下文阈值，将压缩并轮换`);
+      return rotate;
+    } catch (error) {
+      console.warn("检查 Session 上下文大小失败，将继续复用当前 Session：", error instanceof Error ? error.message : error);
+      return false;
+    }
+  }
+
+  private replyText(message: IncomingMessage, text: string): Promise<void> {
+    return this.reply(message, { type: "text", text });
+  }
+
+  private defaultSessionEnvironment(message: IncomingMessage): Record<string, string> {
+    if (message.channelType !== "lark") return {};
+    return {
+      FEISHU_USER_OPEN_ID: message.senderId,
+      ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {})
+    };
+  }
 }
 
 export function shouldHandleMessage(message: IncomingMessage): boolean {
-  if (!message.text.trim() && !message.attachments.length) return false;
-  return message.chatType === "p2p" || message.mentionedBot;
+  if (!message.text.trim() && !message.resources.length) return false;
+  return message.conversationType === "direct" || message.mentionedBot;
 }
 
 export type GatewayOptions = {
   agentId: string;
   environmentId: string;
   vaultId: string;
-  authorizedUserOpenId?: string;
+  authorizedUserId?: string;
   timeoutMs: number;
   progressDelayMs?: number;
   handoffTimeoutMs?: number;
+  sessionRotation?: false | { maxEvents?: number; maxInputTokens?: number };
+  sessionStatsCheckIntervalMs?: number;
+  sessionStatsTimeoutMs?: number;
+  streamReply?: (message: IncomingMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
+  addReaction?: (message: IncomingMessage, emojiType: string) => Promise<string>;
+  removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
   beforeCreateSession?: () => Promise<void>;
   platformAccess?: boolean;
   requiresAuthorization?: (message: IncomingMessage) => boolean;
   ensureAuthorization?: (message: IncomingMessage) => Promise<boolean>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   dualIdentity?: boolean;
-  downloadAttachment?: (attachment: IncomingMessage["attachments"][number], message: IncomingMessage) => Promise<{ bytes: Uint8Array; mimeType: string }>;
+  sessionEnvironment?: (message: IncomingMessage) => Record<string, string>;
+  downloadAttachment?: (attachment: IncomingMessage["resources"][number], message: IncomingMessage) => Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
 
 function buildHandoffInput(handoff: SessionHandoff, currentInput: string): string {
@@ -266,10 +336,12 @@ function sessionVisibleFilePath(mountPath: string): string {
 
 export function toConversationKey(message: IncomingMessage): ConversationKey {
   return {
-    tenantKey: message.tenantKey,
-    chatId: message.chatId,
+    channelType: message.channelType,
+    installationId: message.installationId,
+    tenantId: message.tenantId,
+    conversationId: message.conversationId,
     threadId: message.threadId,
-    userOpenId: message.userOpenId
+    senderId: message.senderId
   };
 }
 
