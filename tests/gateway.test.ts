@@ -139,6 +139,32 @@ test("per-message group Session receives bounded history and current channel ide
   store.close();
 });
 
+test("group history loading overlaps Session creation", async () => {
+  const store = new GatewayStore(":memory:");
+  const operations: string[] = [];
+  let releaseHistory: (() => void) | undefined;
+  const historyPending = new Promise<void>(resolve => { releaseHistory = resolve; });
+  const gateway = new Gateway(store, {
+    createSession: async () => { operations.push("session"); return "session-one"; },
+    run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true,
+    loadRecentHistory: async () => {
+      operations.push("history");
+      await historyPending;
+      return [];
+    }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true }));
+  await delay(20);
+  assert.deepEqual(operations, ["history", "session"]);
+  releaseHistory?.();
+  await delay(30);
+  store.close();
+});
+
 test("group requests still run when recent history cannot be loaded", async () => {
   const store = new GatewayStore(":memory:");
   let prompt = "";

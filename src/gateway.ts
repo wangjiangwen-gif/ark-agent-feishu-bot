@@ -160,6 +160,18 @@ export class Gateway {
       return;
     }
     if (this.options.requiresAuthorization?.(message) && this.options.ensureAuthorization && !await this.options.ensureAuthorization(message)) return;
+    let recentHistoryPromise: Promise<ChannelHistoryMessage[]> | undefined;
+    if (this.options.loadRecentHistory && message.conversationType === "group") {
+      try {
+        recentHistoryPromise = this.options.loadRecentHistory(message).catch(error => {
+          console.warn("读取近期群聊上下文失败，将仅处理当前消息：", error instanceof Error ? error.message : error);
+          return [];
+        });
+      } catch (error) {
+        console.warn("读取近期群聊上下文失败，将仅处理当前消息：", error instanceof Error ? error.message : error);
+        recentHistoryPromise = Promise.resolve([]);
+      }
+    }
     await this.options.beforeCreateSession?.();
     const startedAt = Date.now();
     const reusableSession = !this.usesIsolatedSession(message);
@@ -222,13 +234,9 @@ export class Gateway {
         ].join("\n")).join("\n\n"));
         input = sections.join("\n\n");
       }
-      if (this.options.loadRecentHistory && message.conversationType === "group") {
-        try {
-          const history = await this.options.loadRecentHistory(message);
-          if (history.length) input = buildConversationContextInput(message, history, input);
-        } catch (error) {
-          console.warn("读取近期群聊上下文失败，将仅处理当前消息：", error instanceof Error ? error.message : error);
-        }
+      if (recentHistoryPromise) {
+        const history = await recentHistoryPromise;
+        if (history.length) input = buildConversationContextInput(message, history, input);
       }
       if (handoff) input = buildHandoffInput(handoff, input);
       // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result

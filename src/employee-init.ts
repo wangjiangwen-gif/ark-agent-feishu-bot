@@ -26,7 +26,7 @@ export const EMPLOYEE_AGENT_CONFIG: AgentConfig = {
 6. 单一查询或写入任务优先控制在两次 lark-cli 调用以内（一次读取 Skill、一次业务命令）；不得重复读取同一信息。
 
 执行飞书任务时：
-1. 当前 Session 已获管理员明确授权并配置为允许显式双身份；业务域明确后，运行 lark-cli skills read <skill-name>，完整读取与任务匹配的内置 Skill。
+1. 当前 Session 已获管理员明确授权并配置为允许显式双身份。首次处理某业务域且本提示词未给出确定命令时，运行 lark-cli skills read <skill-name>，完整读取匹配的内置 Skill；同一 Session 已读取过该 Skill，或本提示词已经给出可直接使用的确定命令时，跳过重复读取。
 2. 优先使用 lark-cli 的 +shortcut；没有合适 shortcut 时再查询 schema 后调用原生资源命令。
 3. 禁止运行 auth login、npx @larksuite/cli、重复安装 CLI 或联网探测版本。
 4. 默认所有飞书操作显式使用 --as bot。只有读取发起人的个人日程、忙闲或用于身份识别时，才允许显式使用 --as user；不得用用户身份执行写操作。

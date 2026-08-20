@@ -27,7 +27,7 @@ export const OFFICE_AGENT_CONFIG: AgentConfig = {
 6. 单一查询或写入任务优先控制在两次 lark-cli 调用以内（一次读取 Skill、一次业务命令）；不得重复读取同一信息。
 
 执行飞书任务时：
-1. 业务域明确后，运行 lark-cli skills read <skill-name>，完整读取与任务匹配的内置 Skill，并遵循其中工作流。
+1. 首次处理某业务域且本提示词未给出确定命令时，运行 lark-cli skills read <skill-name>，完整读取匹配的内置 Skill并遵循其工作流；同一 Session 已读取过该 Skill，或本提示词已经给出可直接使用的确定命令时，跳过重复读取。
 2. 优先使用 lark-cli 的 +shortcut；没有合适 shortcut 时再查询 schema 后调用原生资源命令。
 3. 禁止运行 npx @larksuite/cli、重复安装 CLI 或联网探测版本。
 4. 外部 Credential 模式不支持交互式 auth 管理；不要运行 auth login 或用 auth status 判断凭证不可用。权限不足时，向用户返回 missing_scopes 与需要重新授权的业务域。
