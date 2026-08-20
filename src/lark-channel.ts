@@ -12,6 +12,18 @@ export type LarkChannelPort = Pick<LarkChannel,
   "addReaction" | "connect" | "disconnect" | "downloadResource" | "on" | "removeReaction" | "send" | "stream"
 > & { rawClient?: FeishuResourceClient };
 
+type StreamingOptions = {
+  intervalMs?: number;
+  minChunkChars?: number;
+  maxSteps?: number;
+};
+
+const DEFAULT_STREAMING_OPTIONS: Required<StreamingOptions> = {
+  intervalMs: 120,
+  minChunkChars: 48,
+  maxSteps: 6
+};
+
 export class LarkChannelAdapter implements ChannelAdapter {
   readonly channelType = "lark" as const;
   readonly installationId: string;
@@ -20,11 +32,17 @@ export class LarkChannelAdapter implements ChannelAdapter {
   });
   private readonly channel: LarkChannelPort;
   private readonly maxFileBytes: number;
+  private readonly streaming: Required<StreamingOptions>;
   private readonly streamingDownloader?: ReturnType<typeof createFeishuResourceDownloader>;
 
-  constructor(options: { appId: string; appSecret: string; maxFileBytes?: number; channel?: LarkChannelPort }) {
+  constructor(options: { appId: string; appSecret: string; maxFileBytes?: number; channel?: LarkChannelPort; streaming?: StreamingOptions }) {
     this.installationId = options.appId;
     this.maxFileBytes = options.maxFileBytes ?? MAX_FEISHU_FILE_BYTES;
+    this.streaming = {
+      intervalMs: positiveInteger(options.streaming?.intervalMs, DEFAULT_STREAMING_OPTIONS.intervalMs),
+      minChunkChars: positiveInteger(options.streaming?.minChunkChars, DEFAULT_STREAMING_OPTIONS.minChunkChars),
+      maxSteps: positiveInteger(options.streaming?.maxSteps, DEFAULT_STREAMING_OPTIONS.maxSteps)
+    };
     this.channel = options.channel ?? createLarkChannel({
       appId: options.appId,
       appSecret: options.appSecret,
@@ -70,7 +88,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
     producer: (update: (snapshot: string) => Promise<void>) => Promise<void>
   ): Promise<void> {
     await this.channel.stream(message.conversationId, {
-      markdown: async controller => producer(snapshot => controller.setContent(snapshot))
+      markdown: async controller => progressivelyWriteMarkdown(controller.setContent.bind(controller), producer, this.streaming)
     }, replyOptions(message));
   }
 
@@ -88,6 +106,62 @@ export class LarkChannelAdapter implements ChannelAdapter {
     if (bytes.byteLength > this.maxFileBytes) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(this.maxFileBytes)} 限制`);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
+}
+
+async function progressivelyWriteMarkdown(
+  setContent: (value: string) => Promise<void>,
+  producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
+  options: Required<StreamingOptions>
+): Promise<void> {
+  let target = "";
+  let rendered = "";
+  let producerFinished = false;
+
+  let writerError: unknown;
+  const writer = (async () => {
+    while (!producerFinished || rendered !== target) {
+      if (rendered === target) {
+        await wait(options.intervalMs);
+        continue;
+      }
+      const next = nextProgressiveSnapshot(rendered, target, options);
+      await setContent(next);
+      rendered = next;
+      if (rendered !== target) await wait(options.intervalMs);
+    }
+  })().catch(error => { writerError = error; });
+
+  let producerError: unknown;
+  try {
+    await producer(async snapshot => {
+      if (snapshot && snapshot !== target) target = snapshot;
+    });
+  } catch (error) {
+    producerError = error;
+  } finally {
+    producerFinished = true;
+  }
+
+  await writer;
+  if (writerError) throw writerError;
+  if (producerError) throw producerError;
+}
+
+function nextProgressiveSnapshot(current: string, target: string, options: Required<StreamingOptions>): string {
+  const targetChars = Array.from(target);
+  // 一个 run 可能先产生过程性的 agent.message，再产生最终答案。后一条不是前一条
+  // 的前缀时，从最终答案的首批字符重新渐进展示，不能整段瞬间替换。
+  const currentLength = target.startsWith(current) ? Array.from(current).length : 0;
+  const chunkSize = Math.max(options.minChunkChars, Math.ceil(targetChars.length / options.maxSteps));
+  return targetChars.slice(0, Math.min(targetChars.length, currentLength + chunkSize)).join("");
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : fallback;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function replyOptions(message: ChannelMessage): { replyTo: string; replyInThread: true } | undefined {

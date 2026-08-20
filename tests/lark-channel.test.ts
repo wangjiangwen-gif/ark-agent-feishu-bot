@@ -98,9 +98,98 @@ test("Channel adapter streams snapshots and manages the Get reaction", async () 
   await adapter.removeReaction(inbound, reactionId);
 
   assert.deepEqual(streamCalls, [{
-    to: "oc-1", options: { replyTo: "om-1", replyInThread: true }, snapshots: ["你", "你好"]
+    to: "oc-1", options: { replyTo: "om-1", replyInThread: true }, snapshots: ["你好"]
   }]);
   assert.deepEqual(reactions, ["add:om-1:Get", "remove:om-1:reaction-1"]);
+});
+
+test("Channel adapter preserves producer failures after flushing the latest snapshot", async () => {
+  const snapshots: string[] = [];
+  const port = {
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => () => undefined,
+    send: async () => ({ messageId: "reply-1" }),
+    stream: async (_to: string, input: { markdown: (controller: { setContent(value: string): Promise<void> }) => Promise<void> }) => {
+      await input.markdown({ setContent: async value => { snapshots.push(value); } });
+      return { messageId: "stream-1" };
+    },
+    downloadResource: async () => Buffer.alloc(0)
+  } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({
+    appId: "cli-one", appSecret: "secret", channel: port,
+    streaming: { intervalMs: 1, minChunkChars: 4, maxSteps: 4 }
+  });
+  const inbound = normalizeLarkChannelMessage(normalized(), "cli-one");
+
+  await assert.rejects(adapter.streamReply(inbound, async update => {
+    await update("已生成部分内容");
+    throw new Error("upstream failed");
+  }), /upstream failed/);
+  assert.equal(snapshots.at(-1), "已生成部分内容");
+});
+
+test("Channel adapter progressively reveals a complete upstream snapshot", async () => {
+  const snapshots: string[] = [];
+  const port = {
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => () => undefined,
+    send: async () => ({ messageId: "reply-1" }),
+    stream: async (_to: string, input: { markdown: (controller: { setContent(value: string): Promise<void> }) => Promise<void> }) => {
+      await input.markdown({ setContent: async value => { snapshots.push(value); } });
+      return { messageId: "stream-1" };
+    },
+    downloadResource: async () => Buffer.alloc(0)
+  } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({
+    appId: "cli-one", appSecret: "secret", channel: port,
+    streaming: { intervalMs: 1, minChunkChars: 4, maxSteps: 4 }
+  });
+  const inbound = normalizeLarkChannelMessage(normalized(), "cli-one");
+
+  await adapter.streamReply(inbound, async update => {
+    await update("一二三四五六七八九十甲乙丙丁戊己");
+  });
+
+  assert.ok(snapshots.length >= 3, `expected progressive updates, got ${snapshots.length}`);
+  assert.equal(snapshots.at(-1), "一二三四五六七八九十甲乙丙丁戊己");
+  for (let index = 1; index < snapshots.length; index++) {
+    assert.ok(snapshots[index].startsWith(snapshots[index - 1]));
+    assert.ok(snapshots[index].length > snapshots[index - 1].length);
+  }
+});
+
+test("Channel adapter progressively replaces a previous non-prefix Agent message", async () => {
+  const snapshots: string[] = [];
+  const port = {
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => () => undefined,
+    send: async () => ({ messageId: "reply-1" }),
+    stream: async (_to: string, input: { markdown: (controller: { setContent(value: string): Promise<void> }) => Promise<void> }) => {
+      await input.markdown({ setContent: async value => { snapshots.push(value); } });
+      return { messageId: "stream-1" };
+    },
+    downloadResource: async () => Buffer.alloc(0)
+  } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({
+    appId: "cli-one", appSecret: "secret", channel: port,
+    streaming: { intervalMs: 1, minChunkChars: 4, maxSteps: 4 }
+  });
+  const inbound = normalizeLarkChannelMessage(normalized(), "cli-one");
+  const final = "最终回答甲乙丙丁戊己庚辛壬癸";
+
+  await adapter.streamReply(inbound, async update => {
+    await update("正在检查一二三四五六七八九十");
+    await delay(10);
+    await update(final);
+  });
+
+  const replacement = snapshots.find(value => final.startsWith(value));
+  assert.ok(replacement, "expected a snapshot from the replacement message");
+  assert.ok(replacement.length < final.length, "replacement must not jump directly to the complete final message");
+  assert.equal(snapshots.at(-1), final);
 });
 
 test("Channel adapter enforces the attachment limit", async () => {
