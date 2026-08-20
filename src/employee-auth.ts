@@ -18,9 +18,13 @@ export class EmployeeAuthorizationManager {
   private oauth: FeishuOAuth;
   private sendCard: (message: IncomingMessage, url: string) => Promise<void>;
   private resume: (message: IncomingMessage) => void;
+  private resumeWithHandoff: (message: IncomingMessage) => void;
   constructor(store: GatewayStore, ark: EmployeeAuthArk, oauth: FeishuOAuth,
-    sendCard: (message: IncomingMessage, url: string) => Promise<void>, resume: (message: IncomingMessage) => void) {
-    this.store = store; this.ark = ark; this.oauth = oauth; this.sendCard = sendCard; this.resume = resume;
+    sendCard: (message: IncomingMessage, url: string) => Promise<void>,
+    resume: (message: IncomingMessage) => void,
+    resumeWithHandoff: (message: IncomingMessage) => void) {
+    this.store = store; this.ark = ark; this.oauth = oauth; this.sendCard = sendCard;
+    this.resume = resume; this.resumeWithHandoff = resumeWithHandoff;
   }
 
   async vaultIds(message: IncomingMessage): Promise<string[]> {
@@ -71,7 +75,18 @@ export class EmployeeAuthorizationManager {
       if (credential) await this.ark.updateEnvironmentCredential(vault.id, credential.id, tokens.accessToken);
       else credential = { id: await this.ark.createEnvironmentVariableCredential(vault.id, "lark-cli-user-access-token", "LARKSUITE_CLI_USER_ACCESS_TOKEN", tokens.accessToken), displayName: "lark-cli-user-access-token", authType: "environment_variable" };
       this.store.saveEmployeeOAuth({ tenantKey: message.tenantId, openId, vaultId: vault.id, credentialId: credential.id, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt, scopes: EMPLOYEE_CALENDAR_USER_SCOPES });
-      for (const queued of pending.messages) this.resume(queued);
+      const handedOffDirectConversations = new Set<string>();
+      for (const queued of pending.messages) {
+        const directConversation = queued.conversationType === "direct"
+          ? [queued.channelType, queued.installationId, queued.tenantId, queued.conversationId, queued.threadId, queued.senderId].join(":")
+          : undefined;
+        if (directConversation && !handedOffDirectConversations.has(directConversation)) {
+          handedOffDirectConversations.add(directConversation);
+          this.resumeWithHandoff(queued);
+        } else {
+          this.resume(queued);
+        }
+      }
     } catch (error) {
       console.error(`用户授权失败（${key}）：`, error instanceof Error ? error.message : error);
     }

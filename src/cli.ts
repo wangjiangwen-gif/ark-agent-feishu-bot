@@ -84,7 +84,14 @@ async function runEmployee(): Promise<void> {
     await channel.reply(message, { type: "card", card });
   };
   let gateway: InstanceType<typeof Gateway>;
-  const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resume(message));
+  const auth = new EmployeeAuthorizationManager(
+    store,
+    ark,
+    new FeishuOAuth(config.feishuAppId, config.feishuAppSecret),
+    sendAuthorizationCard,
+    message => gateway.resume(message),
+    message => gateway.resumeWithHandoff(message)
+  );
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
