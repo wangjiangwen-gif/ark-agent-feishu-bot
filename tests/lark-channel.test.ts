@@ -198,6 +198,46 @@ test("Channel adapter progressively replaces a previous non-prefix Agent message
   assert.equal(snapshots.at(-1), final);
 });
 
+test("Channel adapter waits for native CardKit typing before closing the stream", async () => {
+  const operations: Array<{ type: string; value?: unknown }> = [];
+  const port = {
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => () => undefined,
+    createCard: async (card: object) => { operations.push({ type: "create", value: card }); return { cardId: "card-1" }; },
+    send: async (_to: string, input: unknown) => { operations.push({ type: "send", value: input }); return { messageId: "reply-1" }; },
+    stream: async () => { throw new Error("legacy stream path used"); },
+    downloadResource: async () => Buffer.alloc(0),
+    rawClient: {
+      im: { messageResource: { get: async () => { throw new Error("unused"); } } },
+      cardkit: { v1: {
+        cardElement: { content: async (payload: unknown) => { operations.push({ type: "content", value: payload }); } },
+        card: { settings: async (payload: unknown) => { operations.push({ type: "settings", value: payload }); } }
+      } }
+    }
+  } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({
+    appId: "cli-one", appSecret: "secret", channel: port,
+    streaming: {
+      intervalMs: 1, minChunkChars: 4, maxSteps: 4,
+      printFrequencyMs: 1, printStep: 10, settlePaddingMs: 0
+    }
+  });
+  const inbound = normalizeLarkChannelMessage(normalized(), "cli-one");
+  const final = "原生打字机需要在关闭流之前消费完最终内容";
+
+  await adapter.streamReply(inbound, async update => update(final));
+
+  assert.equal(operations[0].type, "create");
+  assert.deepEqual(operations[1], { type: "send", value: { cardId: "card-1" } });
+  const updates = operations.filter(operation => operation.type === "content");
+  assert.ok(updates.length >= 3, `expected incremental CardKit updates, got ${updates.length}`);
+  assert.equal(operations.at(-1)?.type, "settings");
+  const card = operations[0].value as { config: { streaming_config: { print_frequency_ms: { default: number }; print_step: { default: number } } } };
+  assert.equal(card.config.streaming_config.print_frequency_ms.default, 1);
+  assert.equal(card.config.streaming_config.print_step.default, 10);
+});
+
 test("Channel adapter enforces the attachment limit", async () => {
   const port = {
     connect: async () => undefined,

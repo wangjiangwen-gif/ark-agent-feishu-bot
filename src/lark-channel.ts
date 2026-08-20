@@ -9,19 +9,32 @@ type RawLarkMessage = {
 };
 
 export type LarkChannelPort = Pick<LarkChannel,
-  "addReaction" | "connect" | "disconnect" | "downloadResource" | "on" | "removeReaction" | "send" | "stream"
-> & { rawClient?: FeishuResourceClient };
+  "addReaction" | "connect" | "createCard" | "disconnect" | "downloadResource" | "on" | "removeReaction" | "send" | "stream"
+> & { rawClient?: FeishuCardStreamClient };
+
+type FeishuCardStreamClient = FeishuResourceClient & {
+  cardkit?: { v1?: {
+    cardElement?: { content(payload: unknown): Promise<unknown> };
+    card?: { settings(payload: unknown): Promise<unknown> };
+  } };
+};
 
 type StreamingOptions = {
   intervalMs?: number;
   minChunkChars?: number;
   maxSteps?: number;
+  printFrequencyMs?: number;
+  printStep?: number;
+  settlePaddingMs?: number;
 };
 
 const DEFAULT_STREAMING_OPTIONS: Required<StreamingOptions> = {
   intervalMs: 80,
   minChunkChars: 12,
-  maxSteps: 10
+  maxSteps: 10,
+  printFrequencyMs: 40,
+  printStep: 4,
+  settlePaddingMs: 120
 };
 
 export class LarkChannelAdapter implements ChannelAdapter {
@@ -41,7 +54,10 @@ export class LarkChannelAdapter implements ChannelAdapter {
     this.streaming = {
       intervalMs: positiveInteger(options.streaming?.intervalMs, DEFAULT_STREAMING_OPTIONS.intervalMs),
       minChunkChars: positiveInteger(options.streaming?.minChunkChars, DEFAULT_STREAMING_OPTIONS.minChunkChars),
-      maxSteps: positiveInteger(options.streaming?.maxSteps, DEFAULT_STREAMING_OPTIONS.maxSteps)
+      maxSteps: positiveInteger(options.streaming?.maxSteps, DEFAULT_STREAMING_OPTIONS.maxSteps),
+      printFrequencyMs: positiveInteger(options.streaming?.printFrequencyMs, DEFAULT_STREAMING_OPTIONS.printFrequencyMs),
+      printStep: positiveInteger(options.streaming?.printStep, DEFAULT_STREAMING_OPTIONS.printStep),
+      settlePaddingMs: nonNegativeInteger(options.streaming?.settlePaddingMs, DEFAULT_STREAMING_OPTIONS.settlePaddingMs)
     };
     this.channel = options.channel ?? createLarkChannel({
       appId: options.appId,
@@ -87,12 +103,68 @@ export class LarkChannelAdapter implements ChannelAdapter {
     message: ChannelMessage,
     producer: (update: (snapshot: string) => Promise<void>) => Promise<void>
   ): Promise<void> {
+    const cardkit = this.channel.rawClient?.cardkit?.v1;
+    if (cardkit?.cardElement?.content && cardkit.card?.settings && typeof this.channel.createCard === "function") {
+      await this.streamNativeCardKit(message, producer, cardkit as Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>);
+      return;
+    }
     await this.channel.stream(message.conversationId, {
       markdown: async controller => progressivelyWriteMarkdown({
         append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
         setContent: controller.setContent.bind(controller)
       }, producer, this.streaming)
     }, replyOptions(message));
+  }
+
+  private async streamNativeCardKit(
+    message: ChannelMessage,
+    producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
+    cardkit: Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>
+  ): Promise<void> {
+    const elementId = "arkagent_stream_md";
+    const { cardId } = await this.channel.createCard(buildNativeStreamingCard(elementId, this.streaming));
+    await this.channel.send(message.conversationId, { cardId }, replyOptions(message));
+    let sequence = 0;
+    let content = "";
+    let lastChunkChars = 0;
+    const push = async (): Promise<void> => {
+      await cardkit.cardElement.content({
+        path: { card_id: cardId, element_id: elementId },
+        data: { content: content || "...", sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
+      });
+    };
+
+    try {
+      await progressivelyWriteMarkdown({
+        append: async chunk => {
+          content += chunk;
+          lastChunkChars = Array.from(chunk).length;
+          await push();
+        },
+        setContent: async value => {
+          content = value;
+          lastChunkChars = Array.from(value).length;
+          await push();
+        }
+      }, producer, this.streaming);
+    } finally {
+      if (lastChunkChars) {
+        const settleMs = Math.ceil(lastChunkChars / this.streaming.printStep) * this.streaming.printFrequencyMs
+          + this.streaming.settlePaddingMs;
+        await wait(settleMs);
+      }
+      await cardkit.card.settings({
+        path: { card_id: cardId },
+        data: {
+          settings: JSON.stringify({ config: {
+            streaming_mode: false,
+            summary: { content: summarizeCard(content) }
+          } }),
+          sequence: ++sequence,
+          uuid: `s_${cardId}_${sequence}`
+        }
+      });
+    }
   }
 
   addReaction(message: ChannelMessage, emojiType: string): Promise<string> {
@@ -109,6 +181,26 @@ export class LarkChannelAdapter implements ChannelAdapter {
     if (bytes.byteLength > this.maxFileBytes) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(this.maxFileBytes)} 限制`);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
+}
+
+function buildNativeStreamingCard(elementId: string, options: Required<StreamingOptions>): object {
+  return {
+    schema: "2.0",
+    config: {
+      streaming_mode: true,
+      summary: { content: "生成中…" },
+      streaming_config: {
+        print_frequency_ms: { default: options.printFrequencyMs },
+        print_step: { default: options.printStep },
+        print_strategy: "fast"
+      }
+    },
+    body: { elements: [{ tag: "markdown", element_id: elementId, content: "..." }] }
+  };
+}
+
+function summarizeCard(content: string): string {
+  return content.replace(/\s+/g, " ").trim().slice(0, 50) || "已完成";
 }
 
 async function progressivelyWriteMarkdown(
@@ -163,6 +255,10 @@ function nextProgressiveSnapshot(current: string, target: string, options: Requi
 
 function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isInteger(value) && Number(value) > 0 ? Number(value) : fallback;
+}
+
+function nonNegativeInteger(value: number | undefined, fallback: number): number {
+  return Number.isInteger(value) && Number(value) >= 0 ? Number(value) : fallback;
 }
 
 function wait(ms: number): Promise<void> {
