@@ -44,5 +44,8 @@ export interface ChannelAdapter {
   stop(): Promise<void>;
   reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void>;
   send(conversationId: string, outbound: ChannelOutbound): Promise<void>;
+  streamReply?(message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>): Promise<void>;
+  addReaction?(message: ChannelMessage, emojiType: string): Promise<string>;
+  removeReaction?(message: ChannelMessage, reactionId: string): Promise<void>;
   download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
 }

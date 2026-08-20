@@ -249,6 +249,58 @@ test("gateway filters Agent tool progress and sends only the final reply", async
   store.close();
 });
 
+test("gateway streams the final response and clears the Get reaction", async () => {
+  const store = new GatewayStore(":memory:");
+  store.saveSession(toConversationKey(message()), "session-1", "agent-1");
+  const replies: string[] = [];
+  const snapshots: string[] = [];
+  const reactions: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-1",
+    run: async (_sessionId, _text, _timeout, _onProgress, onDelta) => {
+      await onDelta?.("流式");
+      await onDelta?.("流式回复");
+      return { terminal: "idle" as const, messages: ["流式回复完成"] };
+    }
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
+    addReaction: async (_message, emoji) => { reactions.push(`add:${emoji}`); return "reaction-1"; },
+    removeReaction: async (_message, id) => { reactions.push(`remove:${id}`); },
+    streamReply: async (_message, producer) => { await producer(async snapshot => { snapshots.push(snapshot); }); }
+  });
+
+  gateway.accept(message());
+  await delay(30);
+
+  assert.deepEqual(replies, []);
+  assert.deepEqual(snapshots, ["流式", "流式回复", "流式回复完成"]);
+  assert.deepEqual(reactions, ["add:Get", "remove:reaction-1"]);
+  store.close();
+});
+
+test("gateway clears the Get reaction when streaming fails", async () => {
+  const store = new GatewayStore(":memory:");
+  store.saveSession(toConversationKey(message()), "session-1", "agent-1");
+  const replies: string[] = [];
+  const reactions: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-1",
+    run: async () => { throw new Error("stream failed"); }
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
+    addReaction: async () => { reactions.push("add"); return "reaction-1"; },
+    removeReaction: async () => { reactions.push("remove"); },
+    streamReply: async (_message, producer) => { await producer(async () => undefined); }
+  });
+
+  gateway.accept(message());
+  await delay(30);
+
+  assert.deepEqual(reactions, ["add", "remove"]);
+  assert.match(replies[0], /stream failed/);
+  store.close();
+});
+
 test("gateway rejects users other than the authorized user", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];

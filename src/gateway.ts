@@ -59,7 +59,7 @@ export class Gateway {
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
       try {
-        await this.process(message, key);
+        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
         this.store.completeEvent(message.channelType, message.installationId, message.eventId, "completed");
       } catch (error) {
         this.store.completeEvent(message.channelType, message.installationId, message.eventId, "failed");
@@ -73,7 +73,7 @@ export class Gateway {
   resume(message: IncomingMessage): void {
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
-      try { await this.process(message, key); }
+      try { await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction)); }
       catch (error) { await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
     });
   }
@@ -82,13 +82,31 @@ export class Gateway {
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
       try {
-        const handoff = await this.createSessionHandoff(key);
-        this.store.resetSession(key);
-        await this.process(message, key, handoff);
+        await this.withReaction(message, async hasReaction => {
+          const handoff = await this.createSessionHandoff(key);
+          this.store.resetSession(key);
+          await this.process(message, key, handoff, hasReaction);
+        });
       } catch (error) {
         await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`);
       }
     });
+  }
+
+  private async withReaction(message: IncomingMessage, task: (hasReaction: boolean) => Promise<void>): Promise<void> {
+    let reactionId: string | undefined;
+    if (this.options.addReaction && this.options.removeReaction) {
+      try { reactionId = await this.options.addReaction(message, "Get"); }
+      catch (error) { console.warn("添加处理中表情失败，将使用文本提示：", error instanceof Error ? error.message : error); }
+    }
+    try {
+      await task(Boolean(reactionId));
+    } finally {
+      if (reactionId && this.options.removeReaction) {
+        try { await this.options.removeReaction(message, reactionId); }
+        catch (error) { console.warn("移除处理中表情失败：", error instanceof Error ? error.message : error); }
+      }
+    }
   }
 
   private async createSessionHandoff(key: ConversationKey): Promise<SessionHandoff | undefined> {
@@ -107,7 +125,7 @@ export class Gateway {
     }
   }
 
-  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff): Promise<void> {
+  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff, hasReaction = false): Promise<void> {
     if (!this.options.platformAccess && message.senderId !== this.options.authorizedUserId) {
       await this.replyText(message, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
@@ -130,12 +148,14 @@ export class Gateway {
     const hadSession = Boolean(sessionId);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
-    if (sessionId) {
+    if (sessionId && !hasReaction) {
       progressTimer = setTimeout(() => {
         progressReply = this.replyText(message, "已收到，正在处理，请稍候。").catch(error => {
           console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
         });
       }, this.options.progressDelayMs ?? 2_500);
+    }
+    if (sessionId) {
       if (await this.shouldRotateSession(sessionId)) {
         handoff ||= await this.createSessionHandoff(key);
         this.store.resetSession(key);
@@ -144,7 +164,7 @@ export class Gateway {
       }
     }
     if (!sessionId) {
-      if (!hadSession) await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
+      if (!hadSession && !hasReaction) await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
       const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
@@ -188,10 +208,19 @@ export class Gateway {
       if (handoff) input = buildHandoffInput(handoff, input);
       // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result
       // 转成“执行进度：xxx”消息刷屏。
-      const result = await this.ark.run(sessionId, input, this.options.timeoutMs);
+      let result: RunResult | undefined;
+      if (this.options.streamReply) {
+        await this.options.streamReply(message, async update => {
+          result = await this.ark.run(sessionId, input, this.options.timeoutMs, undefined, update);
+          await update(resultToReply(result));
+        });
+      } else {
+        result = await this.ark.run(sessionId, input, this.options.timeoutMs);
+      }
+      if (!result) throw new Error("流式回复结束，但 Agent Session 没有返回结果");
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
-      await this.replyText(message, resultToReply(result));
+      if (!this.options.streamReply) await this.replyText(message, resultToReply(result));
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
@@ -260,6 +289,9 @@ export type GatewayOptions = {
   sessionRotation?: false | { maxEvents?: number; maxInputTokens?: number };
   sessionStatsCheckIntervalMs?: number;
   sessionStatsTimeoutMs?: number;
+  streamReply?: (message: IncomingMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
+  addReaction?: (message: IncomingMessage, emojiType: string) => Promise<string>;
+  removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
   beforeCreateSession?: () => Promise<void>;
   platformAccess?: boolean;
   requiresAuthorization?: (message: IncomingMessage) => boolean;

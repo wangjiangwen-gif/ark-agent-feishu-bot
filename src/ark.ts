@@ -257,21 +257,27 @@ export class ArkClient {
     return { eventCount: events.length, latestInputTokens };
   }
 
-  async run(sessionId: string, text: string, timeoutMs: number, onProgress?: (progress: string) => Promise<void>): Promise<RunResult> {
+  async run(
+    sessionId: string,
+    text: string,
+    timeoutMs: number,
+    onProgress?: (progress: string) => Promise<void>,
+    onDelta?: (snapshot: string) => Promise<void>
+  ): Promise<RunResult> {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
     try {
       // 先发起 SSE 请求，但不等待服务端返回响应头。部分环境建立事件流约需
       // 15 秒；若在这里 await，会让 user.message 也被无谓阻塞。
-      const eventStream = this.openEventStream(sessionId, controller.signal);
+      const eventStream = this.openEventStream(sessionId, controller.signal, Boolean(onDelta));
       await Promise.race([
         eventStream.then(() => undefined, () => undefined),
         waitFor(this.options.sseHeadStartMs, controller.signal)
       ]);
       await this.sendMessage(sessionId, text);
       const result = await Promise.any([
-        this.consumeEventStream(eventStream, onProgress),
+        this.consumeEventStream(eventStream, onProgress, onDelta),
         this.pollRunResult(sessionId, startedAt, controller.signal)
       ]);
       controller.abort();
@@ -303,16 +309,44 @@ export class ArkClient {
 
   private async consumeEventStream(
     streamPromise: Promise<AsyncGenerator<ArkEvent>>,
-    onProgress?: (progress: string) => Promise<void>
+    onProgress?: (progress: string) => Promise<void>,
+    onDelta?: (snapshot: string) => Promise<void>
   ): Promise<RunResult> {
     const messages: string[] = [];
     const seen = new Set<string>();
+    const previews = new Map<string, Map<number, string>>();
+    let lastSnapshot = "";
     for await (const event of await streamPromise) {
       if (event.id && seen.has(event.id)) continue;
       if (event.id) seen.add(event.id);
+      if (event.type === "event_start") {
+        const preview = event.event && typeof event.event === "object" ? event.event as Record<string, unknown> : undefined;
+        if (preview?.type === "agent.message" && typeof preview.id === "string") previews.set(preview.id, new Map());
+      }
+      if (event.type === "event_delta" && typeof event.event_id === "string") {
+        const blocks = previews.get(event.event_id);
+        const delta = event.delta && typeof event.delta === "object" ? event.delta as Record<string, unknown> : undefined;
+        const content = delta?.content && typeof delta.content === "object" ? delta.content as Record<string, unknown> : undefined;
+        const index = typeof delta?.index === "number" ? delta.index : 0;
+        if (blocks && delta?.type === "content_delta" && content?.type === "text" && typeof content.text === "string") {
+          blocks.set(index, `${blocks.get(index) || ""}${content.text}`);
+          const snapshot = [...blocks.entries()].sort(([left], [right]) => left - right).map(([, value]) => value).join("\n");
+          if (snapshot && snapshot !== lastSnapshot) {
+            lastSnapshot = snapshot;
+            await onDelta?.(snapshot);
+          }
+        }
+      }
       if (event.type === "agent.message") {
         const text = eventText(event);
-        if (text) messages.push(text);
+        if (text) {
+          messages.push(text);
+          if (text !== lastSnapshot) {
+            lastSnapshot = text;
+            await onDelta?.(text);
+          }
+        }
+        if (event.id) previews.delete(event.id);
       }
       const progress = eventProgress(event);
       if (progress) await onProgress?.(progress);
@@ -339,8 +373,9 @@ export class ArkClient {
     return Array.isArray(data?.items) ? data.items as ArkEvent[] : [];
   }
 
-  private async openEventStream(sessionId: string, signal: AbortSignal): Promise<AsyncGenerator<ArkEvent>> {
-    const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}/events/stream`, {
+  private async openEventStream(sessionId: string, signal: AbortSignal, includeMessageDeltas = false): Promise<AsyncGenerator<ArkEvent>> {
+    const deltaQuery = includeMessageDeltas ? "?event_deltas%5B%5D=agent.message" : "";
+    const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}/events/stream${deltaQuery}`, {
       headers: { Accept: "text/event-stream", Authorization: `Bearer ${this.apiKey}` }, signal
     });
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);

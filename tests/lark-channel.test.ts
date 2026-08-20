@@ -66,6 +66,43 @@ test("Channel adapter sends normal chats directly and preserves existing topics"
   ]);
 });
 
+test("Channel adapter streams snapshots and manages the Get reaction", async () => {
+  const streamCalls: Array<{ to: string; options?: unknown; snapshots: string[] }> = [];
+  const reactions: string[] = [];
+  const port = {
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => () => undefined,
+    send: async () => ({ messageId: "reply-1" }),
+    stream: async (to: string, input: { markdown: (controller: { setContent(value: string): Promise<void> }) => Promise<void> }, options?: unknown) => {
+      const snapshots: string[] = [];
+      await input.markdown({ setContent: async value => { snapshots.push(value); } });
+      streamCalls.push({ to, options, snapshots });
+      return { messageId: "stream-1" };
+    },
+    addReaction: async (messageId: string, emojiType: string) => {
+      reactions.push(`add:${messageId}:${emojiType}`);
+      return "reaction-1";
+    },
+    removeReaction: async (messageId: string, reactionId: string) => { reactions.push(`remove:${messageId}:${reactionId}`); },
+    downloadResource: async () => Buffer.alloc(0)
+  } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized({ chatType: "group", threadId: "omt-1" }), "cli-one");
+
+  const reactionId = await adapter.addReaction(inbound, "Get");
+  await adapter.streamReply(inbound, async update => {
+    await update("你");
+    await update("你好");
+  });
+  await adapter.removeReaction(inbound, reactionId);
+
+  assert.deepEqual(streamCalls, [{
+    to: "oc-1", options: { replyTo: "om-1", replyInThread: true }, snapshots: ["你", "你好"]
+  }]);
+  assert.deepEqual(reactions, ["add:om-1:Get", "remove:om-1:reaction-1"]);
+});
+
 test("Channel adapter enforces the attachment limit", async () => {
   const port = {
     connect: async () => undefined,

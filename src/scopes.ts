@@ -14,6 +14,10 @@ const BOT_BASE_SCOPES = [
   "im:message:readonly",
   "im:message.p2p_msg:readonly",
   "im:message.group_at_msg:readonly",
+  "im:message.reactions:write_only",
+  "im:message:update",
+  "cardkit:card:write",
+  "cardkit:card:read",
   "calendar:calendar",
   "calendar:calendar.event:create",
   "calendar:calendar.event:read"

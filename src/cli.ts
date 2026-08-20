@@ -84,6 +84,7 @@ async function runEmployee(): Promise<void> {
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
+    streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     requiresAuthorization: message => needsCalendarAuthorization(message.text), ensureAuthorization: message => auth.ensure(message),
     getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true
   });
@@ -150,6 +151,9 @@ async function run(): Promise<void> {
     vaultId: config.arkVaultId,
     authorizedUserId: config.feishuUserOpenId,
     downloadAttachment: (resource, message) => channel.download(resource, message),
+    streamReply: channel.streamReply,
+    addReaction: channel.addReaction,
+    removeReaction: channel.removeReaction,
     beforeCreateSession: ensureCredentialFresh,
     timeoutMs: config.sessionTimeoutMs
   });
@@ -167,6 +171,9 @@ type FeishuRuntime = {
   start(handler: (message: ChannelMessage) => void): Promise<void>;
   stop(): Promise<void>;
   reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void>;
+  streamReply?: (message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
+  addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
+  removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
   download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
 
@@ -176,7 +183,16 @@ async function createFeishuRuntime(appId: string, appSecret: string): Promise<Fe
     const { LarkChannelAdapter } = await import("./lark-channel.ts");
     const adapter: ChannelAdapter = new LarkChannelAdapter({ appId, appSecret });
     console.log("飞书接入层：Channel SDK（设置 ARKAGENT_FEISHU_TRANSPORT=legacy 可临时回退）");
-    return { transport, start: handler => adapter.start(handler), stop: () => adapter.stop(), reply: (message, outbound) => adapter.reply(message, outbound), download: (resource, message) => adapter.download(resource, message) };
+    return {
+      transport,
+      start: handler => adapter.start(handler),
+      stop: () => adapter.stop(),
+      reply: (message, outbound) => adapter.reply(message, outbound),
+      streamReply: (message, producer) => adapter.streamReply(message, producer),
+      addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
+      removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
+      download: (resource, message) => adapter.download(resource, message)
+    };
   }
   const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, Lark] = await Promise.all([import("./feishu.ts"), import("@larksuiteoapi/node-sdk")]);
   const client = new Lark.Client({ appId, appSecret });
@@ -269,8 +285,8 @@ async function guidedInit(): Promise<void> {
   };
   try {
     const paths = getArkagentPaths();
-    const [{ ArkClient }, { runGuidedInit }, { FeishuOAuth }, Lark, qrModule] = await Promise.all([
-      import("./ark.ts"), import("./init.ts"), import("./oauth.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
+    const [{ ArkClient }, { runGuidedInit }, { FeishuOAuth }, { resolveLarkBotScopes }, Lark, qrModule] = await Promise.all([
+      import("./ark.ts"), import("./init.ts"), import("./oauth.ts"), import("./scopes.ts"), import("@larksuiteoapi/node-sdk"), import("qrcode-terminal")
     ]);
     const qr = qrModule.default || qrModule;
     const result = await runGuidedInit({
@@ -283,7 +299,7 @@ async function guidedInit(): Promise<void> {
           source: "ark-agent-feishu-bot",
           appPreset: { name: "方舟 Agent Bot", desc: "由方舟 Managed Agents 驱动的飞书机器人" },
           addons: {
-            scopes: { tenant: ["im:message:send_as_bot", "im:message:readonly"], user: userScopes },
+            scopes: { tenant: resolveLarkBotScopes(""), user: userScopes },
             events: { items: { tenant: ["im.message.receive_v1"] } }
           },
           onQRCodeReady(info) {

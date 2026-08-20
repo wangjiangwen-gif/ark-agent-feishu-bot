@@ -8,7 +8,9 @@ type RawLarkMessage = {
   sender?: { tenant_key?: string };
 };
 
-export type LarkChannelPort = Pick<LarkChannel, "connect" | "disconnect" | "downloadResource" | "on" | "send"> & { rawClient?: FeishuResourceClient };
+export type LarkChannelPort = Pick<LarkChannel,
+  "addReaction" | "connect" | "disconnect" | "downloadResource" | "on" | "removeReaction" | "send" | "stream"
+> & { rawClient?: FeishuResourceClient };
 
 export class LarkChannelAdapter implements ChannelAdapter {
   readonly channelType = "lark" as const;
@@ -56,15 +58,28 @@ export class LarkChannelAdapter implements ChannelAdapter {
 
   async reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void> {
     const input = toLarkSendInput(outbound);
-    if (message.conversationType === "group" && message.threadId) {
-      await this.channel.send(message.conversationId, input, { replyTo: message.messageId, replyInThread: true });
-      return;
-    }
-    await this.channel.send(message.conversationId, input);
+    await this.channel.send(message.conversationId, input, replyOptions(message));
   }
 
   async send(conversationId: string, outbound: ChannelOutbound): Promise<void> {
     await this.channel.send(conversationId, toLarkSendInput(outbound));
+  }
+
+  async streamReply(
+    message: ChannelMessage,
+    producer: (update: (snapshot: string) => Promise<void>) => Promise<void>
+  ): Promise<void> {
+    await this.channel.stream(message.conversationId, {
+      markdown: async controller => producer(snapshot => controller.setContent(snapshot))
+    }, replyOptions(message));
+  }
+
+  addReaction(message: ChannelMessage, emojiType: string): Promise<string> {
+    return this.channel.addReaction(message.messageId, emojiType);
+  }
+
+  removeReaction(message: ChannelMessage, reactionId: string): Promise<void> {
+    return this.channel.removeReaction(message.messageId, reactionId);
   }
 
   async download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }> {
@@ -73,6 +88,12 @@ export class LarkChannelAdapter implements ChannelAdapter {
     if (bytes.byteLength > this.maxFileBytes) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(this.maxFileBytes)} 限制`);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
+}
+
+function replyOptions(message: ChannelMessage): { replyTo: string; replyInThread: true } | undefined {
+  return message.conversationType === "group" && message.threadId
+    ? { replyTo: message.messageId, replyInThread: true }
+    : undefined;
 }
 
 export function normalizeLarkChannelMessage(message: NormalizedMessage, installationId: string): ChannelMessage {
