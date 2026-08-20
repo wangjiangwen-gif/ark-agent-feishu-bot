@@ -131,13 +131,18 @@ test("Channel adapter preserves producer failures after flushing the latest snap
 
 test("Channel adapter progressively reveals a complete upstream snapshot", async () => {
   const snapshots: string[] = [];
+  const operations: string[] = [];
+  let content = "";
   const port = {
     connect: async () => undefined,
     disconnect: async () => undefined,
     on: () => () => undefined,
     send: async () => ({ messageId: "reply-1" }),
-    stream: async (_to: string, input: { markdown: (controller: { setContent(value: string): Promise<void> }) => Promise<void> }) => {
-      await input.markdown({ setContent: async value => { snapshots.push(value); } });
+    stream: async (_to: string, input: { markdown: (controller: { append(value: string): Promise<void>; setContent(value: string): Promise<void> }) => Promise<void> }) => {
+      await input.markdown({
+        append: async value => { operations.push(`append:${value}`); content += value; snapshots.push(content); },
+        setContent: async value => { operations.push(`set:${value}`); content = value; snapshots.push(content); }
+      });
       return { messageId: "stream-1" };
     },
     downloadResource: async () => Buffer.alloc(0)
@@ -154,6 +159,7 @@ test("Channel adapter progressively reveals a complete upstream snapshot", async
 
   assert.ok(snapshots.length >= 3, `expected progressive updates, got ${snapshots.length}`);
   assert.equal(snapshots.at(-1), "一二三四五六七八九十甲乙丙丁戊己");
+  assert.ok(operations.every(operation => operation.startsWith("append:")), `expected append-only growth, got ${operations.join(",")}`);
   for (let index = 1; index < snapshots.length; index++) {
     assert.ok(snapshots[index].startsWith(snapshots[index - 1]));
     assert.ok(snapshots[index].length > snapshots[index - 1].length);

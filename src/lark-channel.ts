@@ -19,9 +19,9 @@ type StreamingOptions = {
 };
 
 const DEFAULT_STREAMING_OPTIONS: Required<StreamingOptions> = {
-  intervalMs: 120,
-  minChunkChars: 48,
-  maxSteps: 6
+  intervalMs: 80,
+  minChunkChars: 12,
+  maxSteps: 10
 };
 
 export class LarkChannelAdapter implements ChannelAdapter {
@@ -88,7 +88,10 @@ export class LarkChannelAdapter implements ChannelAdapter {
     producer: (update: (snapshot: string) => Promise<void>) => Promise<void>
   ): Promise<void> {
     await this.channel.stream(message.conversationId, {
-      markdown: async controller => progressivelyWriteMarkdown(controller.setContent.bind(controller), producer, this.streaming)
+      markdown: async controller => progressivelyWriteMarkdown({
+        append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
+        setContent: controller.setContent.bind(controller)
+      }, producer, this.streaming)
     }, replyOptions(message));
   }
 
@@ -109,7 +112,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
 }
 
 async function progressivelyWriteMarkdown(
-  setContent: (value: string) => Promise<void>,
+  writer: { append?: (value: string) => Promise<void>; setContent: (value: string) => Promise<void> },
   producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
   options: Required<StreamingOptions>
 ): Promise<void> {
@@ -118,14 +121,16 @@ async function progressivelyWriteMarkdown(
   let producerFinished = false;
 
   let writerError: unknown;
-  const writer = (async () => {
+  const writerTask = (async () => {
     while (!producerFinished || rendered !== target) {
       if (rendered === target) {
         await wait(options.intervalMs);
         continue;
       }
+      const extendsCurrent = target.startsWith(rendered);
       const next = nextProgressiveSnapshot(rendered, target, options);
-      await setContent(next);
+      if (extendsCurrent && writer.append) await writer.append(next.slice(rendered.length));
+      else await writer.setContent(next);
       rendered = next;
       if (rendered !== target) await wait(options.intervalMs);
     }
@@ -142,7 +147,7 @@ async function progressivelyWriteMarkdown(
     producerFinished = true;
   }
 
-  await writer;
+  await writerTask;
   if (writerError) throw writerError;
   if (producerError) throw producerError;
 }
