@@ -4,6 +4,8 @@
 
 这是一个面向方舟 Managed Agents 的飞书接入插件。初始化向导会创建 Agent、Environment、Vault 和飞书应用，并启动通过 WebSocket 收消息的本地 Gateway；用户不需要手工拼接这些资源。
 
+Gateway 默认使用飞书官方 `@larksuite/channel` 接收和归一化消息，并通过内部 Channel Adapter 接入 Managed Agents。Session、用户身份注入、OAuth、Vault 和审计仍由 arkagent 核心管理；会话与事件按 Channel 和应用实例隔离，为后续接入其他消息平台保留边界。若新版 Channel SDK 在特定网络环境下异常，可临时使用 `ARKAGENT_FEISHU_TRANSPORT=legacy arkagent`（数字员工命令同理）回退旧传输层。
+
 当前提供两种相互隔离的运行模式：
 
 | 模式 | 适合谁 | 飞书操作身份 | 初始化 | 启动 |
@@ -305,8 +307,10 @@ npm pack --dry-run
 | `src/web.ts` | 本地数字员工概览、已连接身份、实际使用者和审计 WebUI |
 | `src/login.ts` | 复用现有资源重新授权，并更新本地 OAuth 状态和 Vault Credential |
 | `src/oauth.ts` | 飞书 Device OAuth 与 token 刷新 |
-| `src/feishu.ts` | 飞书 WebSocket 事件接入与消息归一化 |
-| `src/gateway.ts` | 去重、Session 复用、进度与最终回复 |
+| `src/channel.ts` | 与平台无关的 Channel 消息、资源、出站能力和适配器契约 |
+| `src/lark-channel.ts` | 飞书 Channel SDK 适配器 |
+| `src/feishu.ts` | 可回退的旧版飞书 WebSocket 接入 |
+| `src/gateway.ts` | 跨 Channel 去重、Session 复用、身份注入与最终回复 |
 | `src/ark.ts` | Managed Agents API 与 SSE 客户端 |
 | `src/store.ts` | SQLite 会话、实际使用者和审计记录 |
 

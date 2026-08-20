@@ -1,4 +1,5 @@
 import type { ArkClient, RunResult } from "./ark.ts";
+import type { ChannelMessage, ChannelOutbound } from "./channel.ts";
 import type { ConversationKey, GatewayStore } from "./store.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
@@ -16,20 +17,9 @@ const HANDOFF_PROMPT = `请为即将接替本 Session 的新 Session 生成一�
 
 type SessionHandoff = { sourceSessionId: string; summary: string };
 
-export type IncomingMessage = {
-  eventId: string;
-  messageId: string;
-  chatId: string;
-  chatType: "p2p" | "group";
-  threadId: string;
-  userOpenId: string;
-  tenantKey: string;
-  text: string;
-  attachments: Array<{ key: string; name: string; type: "file" | "image" }>;
-  mentionedBot: boolean;
-};
+export type IncomingMessage = ChannelMessage;
 
-export type Reply = (chatId: string, text: string) => Promise<void>;
+export type Reply = (message: IncomingMessage, outbound: ChannelOutbound) => Promise<void>;
 
 export class KeyedQueue {
   private tails = new Map<string, Promise<void>>();
@@ -64,16 +54,16 @@ export class Gateway {
 
   accept(message: IncomingMessage): boolean {
     if (!shouldHandleMessage(message)) return false;
-    if (!this.store.claimEvent(message.eventId)) return false;
+    if (!this.store.claimEvent(message.channelType, message.installationId, message.eventId)) return false;
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
       try {
         await this.process(message, key);
-        this.store.completeEvent(message.eventId, "completed");
+        this.store.completeEvent(message.channelType, message.installationId, message.eventId, "completed");
       } catch (error) {
-        this.store.completeEvent(message.eventId, "failed");
+        this.store.completeEvent(message.channelType, message.installationId, message.eventId, "failed");
         const reason = error instanceof Error ? error.message : String(error);
-        await this.reply(message.chatId, `执行失败：${reason.slice(0, 240)}`);
+        await this.replyText(message, `执行失败：${reason.slice(0, 240)}`);
       }
     });
     return true;
@@ -83,7 +73,7 @@ export class Gateway {
     const key = toConversationKey(message);
     this.queue.enqueue(this.store.conversationKey(key), async () => {
       try { await this.process(message, key); }
-      catch (error) { await this.reply(message.chatId, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
+      catch (error) { await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
     });
   }
 
@@ -95,7 +85,7 @@ export class Gateway {
         this.store.resetSession(key);
         await this.process(message, key, handoff);
       } catch (error) {
-        await this.reply(message.chatId, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`);
+        await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`);
       }
     });
   }
@@ -117,16 +107,17 @@ export class Gateway {
   }
 
   private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff): Promise<void> {
-    if (!this.options.platformAccess && message.userOpenId !== this.options.authorizedUserOpenId) {
-      await this.reply(message.chatId, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
+    if (!this.options.platformAccess && message.senderId !== this.options.authorizedUserId) {
+      await this.replyText(message, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
     }
-    if (this.options.platformAccess) this.store.observeEmployeeUser(message.tenantKey, message.userOpenId);
+    if (this.options.platformAccess) this.store.observeEmployeeUser(message.tenantId, message.senderId);
     if (message.text.trim() === "/new") {
       this.store.resetSession(key);
-      await this.reply(message.chatId, "已开启新会话，下一条消息会创建新的 Agent Session。");
+      await this.replyText(message, "已开启新会话，下一条消息会创建新的 Agent Session。");
       if (this.options.platformAccess) this.store.addAuditLog({
-        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId,
+        channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
         messageId: message.messageId, action: "reset_session", status: "succeeded"
       });
       return;
@@ -138,29 +129,29 @@ export class Gateway {
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
     if (!sessionId) {
-      await this.reply(message.chatId, "已收到，正在处理。首次启动可能需要几分钟。");
+      await this.replyText(message, "已收到，正在处理。首次启动可能需要几分钟。");
       const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
         this.options.environmentId,
         [this.options.vaultId, ...extraVaultIds],
-        { FEISHU_USER_OPEN_ID: message.userOpenId, ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}) }
+        { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
       );
       this.store.saveSession(key, sessionId, this.options.agentId);
     } else {
       progressTimer = setTimeout(() => {
-        progressReply = this.reply(message.chatId, "已收到，正在处理，请稍候。").catch(error => {
+        progressReply = this.replyText(message, "已收到，正在处理，请稍候。").catch(error => {
           console.warn("发送处理中提示失败：", error instanceof Error ? error.message : error);
         });
       }, this.options.progressDelayMs ?? 2_500);
     }
     let input = message.text;
     try {
-      if (message.attachments.length) {
+      if (message.resources.length) {
         if (!this.options.downloadAttachment || !this.ark.uploadFile || !this.ark.addSessionFile) throw new Error("当前 Gateway 未配置文件处理能力");
         const mounted: string[] = [];
         const inlineTexts: Array<{ name: string; text: string }> = [];
-        for (const [index, attachment] of message.attachments.entries()) {
+        for (const [index, attachment] of message.resources.entries()) {
           const downloaded = await this.options.downloadAttachment(attachment, message);
           const name = safeFilename(attachment.name, index);
           if (isInlineTextFile(name)) {
@@ -191,16 +182,18 @@ export class Gateway {
       const result = await this.ark.run(sessionId, input, this.options.timeoutMs);
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
-      await this.reply(message.chatId, resultToReply(result));
+      await this.replyText(message, resultToReply(result));
       this.store.addAuditLog({
-        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId, messageId: message.messageId,
-        sessionId, action: message.attachments.length ? "file_message" : "message", status: "succeeded",
-        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.attachments.length)
+        channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
+        sessionId, action: message.resources.length ? "file_message" : "message", status: "succeeded",
+        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.resources.length)
       });
     } catch (error) {
       this.store.addAuditLog({
-        tenantKey: message.tenantKey, openId: message.userOpenId, chatId: message.chatId, messageId: message.messageId,
-        sessionId, action: message.attachments.length ? "file_message" : "message", status: "failed",
+        channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
+        sessionId, action: message.resources.length ? "file_message" : "message", status: "failed",
         durationMs: Date.now() - startedAt, summary: error instanceof Error ? error.message.slice(0, 240) : "执行失败"
       });
       throw error;
@@ -208,18 +201,30 @@ export class Gateway {
       if (progressTimer) clearTimeout(progressTimer);
     }
   }
+
+  private replyText(message: IncomingMessage, text: string): Promise<void> {
+    return this.reply(message, { type: "text", text });
+  }
+
+  private defaultSessionEnvironment(message: IncomingMessage): Record<string, string> {
+    if (message.channelType !== "lark") return {};
+    return {
+      FEISHU_USER_OPEN_ID: message.senderId,
+      ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {})
+    };
+  }
 }
 
 export function shouldHandleMessage(message: IncomingMessage): boolean {
-  if (!message.text.trim() && !message.attachments.length) return false;
-  return message.chatType === "p2p" || message.mentionedBot;
+  if (!message.text.trim() && !message.resources.length) return false;
+  return message.conversationType === "direct" || message.mentionedBot;
 }
 
 export type GatewayOptions = {
   agentId: string;
   environmentId: string;
   vaultId: string;
-  authorizedUserOpenId?: string;
+  authorizedUserId?: string;
   timeoutMs: number;
   progressDelayMs?: number;
   handoffTimeoutMs?: number;
@@ -229,7 +234,8 @@ export type GatewayOptions = {
   ensureAuthorization?: (message: IncomingMessage) => Promise<boolean>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   dualIdentity?: boolean;
-  downloadAttachment?: (attachment: IncomingMessage["attachments"][number], message: IncomingMessage) => Promise<{ bytes: Uint8Array; mimeType: string }>;
+  sessionEnvironment?: (message: IncomingMessage) => Record<string, string>;
+  downloadAttachment?: (attachment: IncomingMessage["resources"][number], message: IncomingMessage) => Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
 
 function buildHandoffInput(handoff: SessionHandoff, currentInput: string): string {
@@ -266,10 +272,12 @@ function sessionVisibleFilePath(mountPath: string): string {
 
 export function toConversationKey(message: IncomingMessage): ConversationKey {
   return {
-    tenantKey: message.tenantKey,
-    chatId: message.chatId,
+    channelType: message.channelType,
+    installationId: message.installationId,
+    tenantId: message.tenantId,
+    conversationId: message.conversationId,
     threadId: message.threadId,
-    userOpenId: message.userOpenId
+    senderId: message.senderId
   };
 }
 

@@ -5,17 +5,21 @@ import { Gateway, resultToReply, shouldHandleMessage, toConversationKey, type In
 import { GatewayStore } from "../src/store.ts";
 
 function message(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
-  return { eventId: "event-1", messageId: "message-1", chatId: "chat-1", chatType: "p2p", threadId: "", userOpenId: "user-1", tenantKey: "tenant-1", text: "你好", attachments: [], mentionedBot: false, ...overrides };
+  return { channelType: "lark", installationId: "cli-test", eventId: "event-1", messageId: "message-1", conversationId: "chat-1", conversationType: "direct", threadId: "", senderId: "user-1", tenantId: "tenant-1", text: "你好", resources: [], mentionedBot: false, ...overrides };
 }
 
+const collectText = (target: string[]) => async (_message: IncomingMessage, outbound: { type: "text"; text: string } | { type: "markdown"; markdown: string } | { type: "card"; card: Record<string, unknown> }): Promise<void> => {
+  if (outbound.type === "text") target.push(outbound.text);
+};
+
 test("group messages require an explicit bot mention", () => {
-  assert.equal(shouldHandleMessage(message({ chatType: "group", mentionedBot: false })), false);
-  assert.equal(shouldHandleMessage(message({ chatType: "group", mentionedBot: true })), true);
+  assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: false })), false);
+  assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: true })), true);
 });
 
 test("group conversations are isolated by the sender open_id", () => {
-  const first = message({ chatType: "group", mentionedBot: true, userOpenId: "ou-user-1" });
-  const second = message({ chatType: "group", mentionedBot: true, userOpenId: "ou-user-2" });
+  const first = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-1" });
+  const second = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-2" });
   const store = new GatewayStore(":memory:");
   assert.notEqual(store.conversationKey(toConversationKey(first)), store.conversationKey(toConversationKey(second)));
   store.close();
@@ -40,7 +44,7 @@ test("gateway acknowledges quickly, deduplicates, and reuses a session", async (
     createSession: async () => `session-${++creates}`,
     run: async () => { runs++; return { terminal: "idle" as const, messages: ["回复"] }; }
   };
-  const gateway = new Gateway(store, ark, async (_chatId, text) => { replies.push(text); }, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000 });
+  const gateway = new Gateway(store, ark, collectText(replies), { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000 });
   assert.equal(gateway.accept(message()), true);
   assert.equal(gateway.accept(message()), false);
   gateway.accept(message({ eventId: "event-2", messageId: "message-2", text: "再问" }));
@@ -66,8 +70,8 @@ test("gateway creates a session bound to the user Vault", async () => {
       return "session-1";
     },
     run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
-  }, async () => undefined, { agentId: "agent-user-owned", environmentId: "env-user-owned", vaultId: "vlt-1", authorizedUserOpenId: "ou-current-user", timeoutMs: 5_000 });
-  gateway.accept(message({ userOpenId: "ou-current-user" }));
+  }, async () => undefined, { agentId: "agent-user-owned", environmentId: "env-user-owned", vaultId: "vlt-1", authorizedUserId: "ou-current-user", timeoutMs: 5_000 });
+  gateway.accept(message({ senderId: "ou-current-user" }));
   await delay(30);
   assert.equal(sessionAgentId, "agent-user-owned");
   assert.equal(sessionEnvironmentId, "env-user-owned");
@@ -78,7 +82,7 @@ test("gateway creates a session bound to the user Vault", async () => {
 
 test("gateway compacts the old session before resuming in a user-authorized session", async () => {
   const store = new GatewayStore(":memory:");
-  const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };
+  const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
   const operations: string[] = [];
   let resumedInput = "";
@@ -118,7 +122,7 @@ test("gateway compacts the old session before resuming in a user-authorized sess
 
 test("gateway still rotates and resumes when old-session compaction fails", async () => {
   const store = new GatewayStore(":memory:");
-  const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };
+  const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
   let resumedInput = "";
   const gateway = new Gateway(store, {
@@ -152,7 +156,7 @@ test("reused slow sessions receive one delayed processing reply", async () => {
       if (runs === 2) await delay(20);
       return { terminal: "idle" as const, messages: ["回复"] };
     }
-  }, async (_chatId, text) => { replies.push(text); }, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000, progressDelayMs: 5 });
+  }, collectText(replies), { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000, progressDelayMs: 5 });
   gateway.accept(message());
   await delay(20);
   gateway.accept(message({ eventId: "event-2", messageId: "message-2" }));
@@ -166,7 +170,7 @@ test("reused slow sessions receive one delayed processing reply", async () => {
 
 test("gateway filters Agent tool progress and sends only the final reply", async () => {
   const store = new GatewayStore(":memory:");
-  store.saveSession({ tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" }, "session-1", "agent-1");
+  store.saveSession(toConversationKey(message()), "session-1", "agent-1");
   const replies: string[] = [];
   let receivedProgressCallback = false;
   const gateway = new Gateway(store, {
@@ -176,7 +180,7 @@ test("gateway filters Agent tool progress and sends only the final reply", async
       await onProgress?.("正在执行：检查 lark-cli");
       return { terminal: "idle" as const, messages: ["可用"] };
     }
-  }, async (_chatId, text) => { replies.push(text); }, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000, progressDelayMs: 50 });
+  }, collectText(replies), { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000, progressDelayMs: 50 });
   gateway.accept(message());
   await delay(20);
   assert.equal(receivedProgressCallback, false);
@@ -187,8 +191,8 @@ test("gateway filters Agent tool progress and sends only the final reply", async
 test("gateway rejects users other than the authorized user", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
-  const gateway = new Gateway(store, { createSession: async () => "never", run: async () => ({ terminal: "idle", messages: [] }) }, async (_chatId, text) => { replies.push(text); }, { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000 });
-  gateway.accept(message({ userOpenId: "user-2" }));
+  const gateway = new Gateway(store, { createSession: async () => "never", run: async () => ({ terminal: "idle", messages: [] }) }, collectText(replies), { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000 });
+  gateway.accept(message({ senderId: "user-2" }));
   await delay(20);
   assert.match(replies[0], /未授权/);
   store.close();
@@ -204,7 +208,7 @@ test("employee platform access accepts every message delivered by Feishu and obs
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
     platformAccess: true
   });
-  gateway.accept(message({ userOpenId: "platform-approved" }));
+  gateway.accept(message({ senderId: "platform-approved" }));
   await delay(20);
   assert.equal(creates, 1);
   assert.equal(store.getEmployeeUser("tenant-1", "platform-approved")?.usageCount, 1);
@@ -214,15 +218,15 @@ test("employee platform access accepts every message delivered by Feishu and obs
 
 test("/new resets the session without refreshing an expired credential", async () => {
   const store = new GatewayStore(":memory:");
-  const key = { tenantKey: "tenant-1", chatId: "chat-1", threadId: "", userOpenId: "user-1" };
+  const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
   const replies: string[] = [];
   let refreshAttempts = 0;
   const gateway = new Gateway(store, {
     createSession: async () => "never",
     run: async () => ({ terminal: "idle" as const, messages: [] })
-  }, async (_chatId, text) => { replies.push(text); }, {
-    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000,
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
     beforeCreateSession: async () => { refreshAttempts++; throw new Error("expired"); }
   });
   gateway.accept(message({ text: "/new" }));
@@ -246,10 +250,10 @@ test("gateway downloads, uploads and mounts a Feishu file before running the Age
     addSessionFile: async (_sessionId, _fileId, mountPath) => { operations.push(`mount:${mountPath}`); },
     run: async (_sessionId, text) => { prompt = text; operations.push("run"); return { terminal: "idle" as const, messages: ["文件摘要"] }; }
   }, async () => undefined, {
-    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000,
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
     downloadAttachment: async attachment => ({ bytes: new Uint8Array([1, 2]), mimeType: attachment.type === "image" ? "image/jpeg" : "application/pdf" })
   });
-  gateway.accept(message({ text: "", attachments: [{ key: "file-key", name: "季度计划.pdf", type: "file" }] }));
+  gateway.accept(message({ text: "", resources: [{ id: "file-key", name: "季度计划.pdf", type: "file" }] }));
   await delay(30);
   assert.deepEqual(operations, ["session", "upload:季度计划.pdf:application/pdf:2", "mount:/mnt/data/季度计划.pdf", "run"]);
   assert.match(prompt, /文件已挂载到：\n- \/mnt\/session\/uploads\/mnt\/data\/季度计划\.pdf/);
@@ -268,10 +272,10 @@ test("gateway sends Markdown source inline without uploading it to Ark Files", a
     addSessionFile: async () => { mounts++; },
     run: async (_sessionId, text) => { prompt = text; return { terminal: "idle" as const, messages: ["摘要"] }; }
   }, async () => undefined, {
-    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserOpenId: "user-1", timeoutMs: 5_000,
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
     downloadAttachment: async () => ({ bytes: new TextEncoder().encode(source), mimeType: "text/plain" })
   });
-  gateway.accept(message({ text: "", attachments: [{ key: "file-key", name: "计划.md", type: "file" }] }));
+  gateway.accept(message({ text: "", resources: [{ id: "file-key", name: "计划.md", type: "file" }] }));
   await delay(30);
   assert.equal(uploads, 0);
   assert.equal(mounts, 0);
