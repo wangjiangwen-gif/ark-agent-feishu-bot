@@ -72,6 +72,36 @@ test("per-message mode starts same-chat group requests concurrently in isolated 
   store.close();
 });
 
+test("per-message mode still queues direct messages and reuses one Session", async () => {
+  const store = new GatewayStore(":memory:");
+  let creates = 0;
+  const started: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async () => `session-${++creates}`,
+    run: async (_sessionId, input) => {
+      started.push(input);
+      if (input === "私聊 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      return { terminal: "idle" as const, messages: [`${input} 完成`] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true
+  });
+
+  gateway.accept(message({ eventId: "event-a", messageId: "message-a", text: "私聊 A" }));
+  gateway.accept(message({ eventId: "event-b", messageId: "message-b", text: "私聊 B" }));
+  await delay(20);
+
+  assert.deepEqual(started, ["私聊 A"]);
+  releaseFirst?.();
+  await delay(30);
+  assert.deepEqual(started, ["私聊 A", "私聊 B"]);
+  assert.equal(creates, 1);
+  assert.equal(store.getSession(toConversationKey(message())), "session-1");
+  store.close();
+});
+
 test("per-message group Session receives bounded history and current channel identifiers", async () => {
   const store = new GatewayStore(":memory:");
   let prompt = "";

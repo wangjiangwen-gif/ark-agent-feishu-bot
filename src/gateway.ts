@@ -58,7 +58,7 @@ export class Gateway {
     // 飞书可能为同一条消息重复投递不同 event_id；message_id 才是业务幂等键。
     if (!this.store.claimEvent(message.channelType, message.installationId, message.messageId)) return false;
     const key = toConversationKey(message);
-    this.schedule(key, async () => {
+    this.schedule(message, key, async () => {
       try {
         await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
         this.store.completeEvent(message.channelType, message.installationId, message.messageId, "completed");
@@ -73,7 +73,7 @@ export class Gateway {
 
   resume(message: IncomingMessage): void {
     const key = toConversationKey(message);
-    this.schedule(key, async () => {
+    this.schedule(message, key, async () => {
       try { await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction)); }
       catch (error) { await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
     });
@@ -81,11 +81,12 @@ export class Gateway {
 
   resumeWithHandoff(message: IncomingMessage): void {
     const key = toConversationKey(message);
-    this.schedule(key, async () => {
+    this.schedule(message, key, async () => {
       try {
         await this.withReaction(message, async hasReaction => {
-          const handoff = this.options.perMessageSessions ? undefined : await this.createSessionHandoff(key);
-          if (!this.options.perMessageSessions) this.store.resetSession(key);
+          const isolatedSession = this.usesIsolatedSession(message);
+          const handoff = isolatedSession ? undefined : await this.createSessionHandoff(key);
+          if (!isolatedSession) this.store.resetSession(key);
           await this.process(message, key, handoff, hasReaction);
         });
       } catch (error) {
@@ -94,12 +95,16 @@ export class Gateway {
     });
   }
 
-  private schedule(key: ConversationKey, task: () => Promise<void>): void {
-    if (this.options.perMessageSessions) {
+  private schedule(message: IncomingMessage, key: ConversationKey, task: () => Promise<void>): void {
+    if (this.usesIsolatedSession(message)) {
       void Promise.resolve().then(task);
       return;
     }
     this.queue.enqueue(this.store.conversationKey(key), task);
+  }
+
+  private usesIsolatedSession(message: IncomingMessage): boolean {
+    return Boolean(this.options.perMessageSessions && message.conversationType === "group");
   }
 
   private async withReaction(message: IncomingMessage, task: (hasReaction: boolean) => Promise<void>): Promise<void> {
@@ -141,7 +146,7 @@ export class Gateway {
     }
     if (this.options.platformAccess) this.store.observeEmployeeUser(message.tenantId, message.senderId);
     if (message.text.trim() === "/new") {
-      if (this.options.perMessageSessions) {
+      if (this.usesIsolatedSession(message)) {
         await this.replyText(message, "当前模式每条消息都会创建独立 Agent Session，无需手动开启新会话。");
         return;
       }
@@ -157,7 +162,7 @@ export class Gateway {
     if (this.options.requiresAuthorization?.(message) && this.options.ensureAuthorization && !await this.options.ensureAuthorization(message)) return;
     await this.options.beforeCreateSession?.();
     const startedAt = Date.now();
-    const reusableSession = !this.options.perMessageSessions;
+    const reusableSession = !this.usesIsolatedSession(message);
     let sessionId = reusableSession ? this.store.getSession(key) : undefined;
     const hadSession = Boolean(sessionId);
     let progressTimer: ReturnType<typeof setTimeout> | undefined;

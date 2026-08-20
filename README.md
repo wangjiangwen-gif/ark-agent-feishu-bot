@@ -153,7 +153,7 @@ npx --yes arkagent@latest employee doctor
 2. 用户点击卡片，以自己的飞书账号授权日历读取与忙闲权限；
 3. Gateway 校验授权账号的 `open_id` 必须等于消息发送者；
 4. 用户短期 access token 写入该用户独立的方舟 Vault，refresh token 留在本地；
-5. Gateway 用 Bot Vault + 当前用户 Vault 创建该消息专属的新 Session，并自动续跑原请求；
+5. 群聊中 Gateway 用 Bot Vault + 当前用户 Vault 创建该消息专属的新 Session，单聊则继续使用当前会话 Session，并自动续跑原请求；
 6. Agent 用 `--as user` 查询冲突，再用 `--as bot` 创建日程并将 `FEISHU_USER_OPEN_ID` 加为参会人。
 
 用户不需要重新发送原消息，也不需要重新执行 `employee init`。不同用户分别授权、分别使用 Vault，不共享用户凭证。
@@ -166,7 +166,7 @@ Bot 的 App Secret 保存在本地安全配置，用于 WebSocket 鉴权和刷�
 
 数字员工会显式申请 `im:message.p2p_msg:readonly` 与 `im:message.group_at_msg:readonly`，分别用于接收用户私聊和群聊中明确 @Bot 的消息；还会申请 `im:message.group_msg`，供 Gateway 和 Session 内的 Bot 读取群聊或话题近期历史。该权限属于敏感群消息权限，可能需要管理员审核并重新发布应用。Gateway 收到请求后先在用户消息上添加 `Get` 表情，使用同一条流式消息逐步更新 Agent 回复，任务成功或失败后都会移除该表情。应用可用范围、原生申请和审批由飞书控制面统一管理，arkagent 不复制这套能力。
 
-数字员工在群聊中采用“一条 @ 消息、一个独立 Managed Agents Session”。多位用户同时 @Bot 时任务直接并行，不按群或话题排队；每个 Session 固定注入本次发送者的 `open_id` 和对应 Vault，因此不会共享用户身份。创建 Session 后的第一条输入会带上截至触发时刻的近期上下文：普通群按 `chat_id` 读取，Thread 按真实 `thread_id` 读取；当前消息和之后产生的消息会被排除。上下文默认限制为最近 20 条、最多 8,000 字符，并标记为不可信背景资料。需要更早记录时，Agent 可使用 Bot 身份调用 `lark-cli im +chat-messages-list` 或 `lark-cli im +threads-messages-list`。
+数字员工在群聊中采用“一条 @ 消息、一个独立 Managed Agents Session”。多位用户同时 @Bot 时任务直接并行，不按群或话题排队；每个 Session 固定注入本次发送者的 `open_id` 和对应 Vault，因此不会共享用户身份。创建 Session 后的第一条输入会带上截至触发时刻的近期上下文：普通群按 `chat_id` 读取，Thread 按真实 `thread_id` 读取；当前消息和之后产生的消息会被排除。上下文默认限制为最近 20 条、最多 8,000 字符，并标记为不可信背景资料。需要更早记录时，Agent 可使用 Bot 身份调用 `lark-cli im +chat-messages-list` 或 `lark-cli im +threads-messages-list`。单聊仍按飞书会话复用同一个 Session，消息按顺序处理，并支持 `/new` 显式重置。
 
 WebUI 首页是数字员工列表；点击员工后进入详情，通过「身份」「行为日志」「访问过的用户」查看该员工。身份页展示当前 Agent 已拥有的飞书 Bot 身份、认证方式、能力和授权范围；只展示方舟 Vault Credential 的脱敏引用，不会返回 App Secret 或 token。身份模型预留了 provider 和 identity type，后续可继续接入飞书用户身份及其他服务身份。「访问过的用户」只表示已经实际使用过 Bot 的用户，完整使用权限仍由飞书应用可用范围管理。
 
@@ -270,7 +270,7 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 
 - 单聊中的文本、文件和图片消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
-- 个人助手在一个飞书会话中复用 Managed Agents Session，`/new` 显式重置；数字员工的每条触发消息都会创建独立 Session，多用户请求并行执行。
+- 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session，`/new` 显式重置；数字员工仅在群聊中为每条 @ 消息创建独立 Session，多用户请求并行执行。
 - 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
 - 新建 Session 会立即回复一次“正在处理”；复用 Session 只有超过 2.5 秒仍未完成时才发送一次提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
