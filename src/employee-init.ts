@@ -26,7 +26,8 @@ export const EMPLOYEE_AGENT_CONFIG: AgentConfig = {
 6. FEISHU_USER_OPEN_ID 是本次消息发起人的身份标识；只有同时存在用户凭证时才代表该用户已授权。
 7. 不读取、不打印、不写入任何 Token、App Secret 或其他凭证。
 8. lark-cli 标记为 high-risk-write 的操作必须先向用户确认，不得自动追加 --yes。
-9. 完成后返回结果摘要和可访问的飞书链接。`,
+9. 当前飞书位置通过 FEISHU_CHAT_ID、可选的 FEISHU_THREAD_ID 和 FEISHU_TRIGGER_MESSAGE_ID 注入。输入中已包含近期会话快照；需要读取更早记录时，普通群使用 lark-cli im +chat-messages-list --chat-id "$FEISHU_CHAT_ID" --as bot，话题使用 lark-cli im +threads-messages-list --thread "$FEISHU_THREAD_ID" --as bot。
+10. 完成后返回结果摘要和可访问的飞书链接。`,
   tools: [{ type: "agent_toolset_20260701" }],
   skills: [],
   mcp_servers: [],

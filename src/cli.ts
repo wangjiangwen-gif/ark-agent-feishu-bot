@@ -6,7 +6,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig, loadConfigFile } from "./config.ts";
 import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
-import type { ChannelAdapter, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -62,31 +62,36 @@ async function runEmployee(): Promise<void> {
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
   const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret);
   let botTokenExpiresAt = 0;
+  let botTokenRefreshing: Promise<void> | undefined;
   let botTokenCredential = (await ark.listCredentials(config.arkVaultId)).find(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN");
   const ensureBotToken = async (): Promise<void> => {
     if (botTokenExpiresAt - Date.now() > 5 * 60_000) return;
-    const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ app_id: config.feishuAppId, app_secret: config.feishuAppSecret }), signal: AbortSignal.timeout(30_000)
-    });
-    const payload = await response.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
-    if (!response.ok || payload.code || !payload.tenant_access_token) throw new Error(`获取 Bot tenant_access_token 失败：${payload.msg || response.status}`);
-    if (botTokenCredential) await ark.updateEnvironmentCredential(config.arkVaultId, botTokenCredential.id, payload.tenant_access_token);
-    else botTokenCredential = { id: await ark.createEnvironmentVariableCredential(config.arkVaultId, "lark-cli-bot-tenant-access-token", "LARKSUITE_CLI_TENANT_ACCESS_TOKEN", payload.tenant_access_token), displayName: "lark-cli-bot-tenant-access-token", authType: "environment_variable", secretName: "LARKSUITE_CLI_TENANT_ACCESS_TOKEN" };
-    botTokenExpiresAt = Date.now() + Number(payload.expire || 7200) * 1000;
+    if (!botTokenRefreshing) botTokenRefreshing = (async () => {
+      const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ app_id: config.feishuAppId, app_secret: config.feishuAppSecret }), signal: AbortSignal.timeout(30_000)
+      });
+      const payload = await response.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
+      if (!response.ok || payload.code || !payload.tenant_access_token) throw new Error(`获取 Bot tenant_access_token 失败：${payload.msg || response.status}`);
+      if (botTokenCredential) await ark.updateEnvironmentCredential(config.arkVaultId, botTokenCredential.id, payload.tenant_access_token);
+      else botTokenCredential = { id: await ark.createEnvironmentVariableCredential(config.arkVaultId, "lark-cli-bot-tenant-access-token", "LARKSUITE_CLI_TENANT_ACCESS_TOKEN", payload.tenant_access_token), displayName: "lark-cli-bot-tenant-access-token", authType: "environment_variable", secretName: "LARKSUITE_CLI_TENANT_ACCESS_TOKEN" };
+      botTokenExpiresAt = Date.now() + Number(payload.expire || 7200) * 1000;
+    })().finally(() => { botTokenRefreshing = undefined; });
+    await botTokenRefreshing;
   };
   const sendAuthorizationCard = async (message: ChannelMessage, url: string): Promise<void> => {
     const card = { schema: "2.0", config: { width_mode: "default" }, header: { title: { tag: "plain_text", content: "授权查看你的日程" }, subtitle: { tag: "plain_text", content: "仅用于本次数字员工协作" }, template: "blue", icon: { tag: "standard_icon", token: "calendar_outlined" } }, body: { elements: [{ tag: "markdown", content: "为了帮你避开冲突，数字员工需要读取你的日程和忙闲信息。创建日程仍使用数字员工的 Bot 身份，并会邀请你参加。" }, { tag: "button", text: { tag: "plain_text", content: "授权查看日程" }, type: "primary_filled", width: "fill", behaviors: [{ type: "open_url", default_url: url }] }] } };
     await channel.reply(message, { type: "card", card });
   };
   let gateway: InstanceType<typeof Gateway>;
-  const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resumeWithHandoff(message));
+  const auth = new EmployeeAuthorizationManager(store, ark, new FeishuOAuth(config.feishuAppId, config.feishuAppSecret), sendAuthorizationCard, message => gateway.resume(message));
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     requiresAuthorization: message => needsCalendarAuthorization(message.text), ensureAuthorization: message => auth.ensure(message),
-    getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true
+    getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true,
+    perMessageSessions: true, loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([])
   });
   const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName });
   console.log("数字员工配置：");
@@ -102,7 +107,8 @@ async function runEmployee(): Promise<void> {
     gateway.accept({
       channelType: "lark", installationId: config.feishuAppId,
       eventId: `synthetic-${Date.now()}`, messageId: `synthetic-${Date.now()}`,
-      conversationId: recent.chatId, conversationType: "direct", threadId: "", senderId: recent.openId,
+      conversationId: recent.chatId, conversationType: "direct", threadId: "", rootMessageId: "", parentMessageId: "",
+      createTime: Date.now(), senderId: recent.openId,
       tenantId: recent.tenantKey, text: syntheticText, resources: [], mentionedBot: false
     });
   }
@@ -174,6 +180,7 @@ type FeishuRuntime = {
   streamReply?: (message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
   addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
+  loadRecentHistory?: (message: ChannelMessage) => Promise<ChannelHistoryMessage[]>;
   download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
 
@@ -191,10 +198,13 @@ async function createFeishuRuntime(appId: string, appSecret: string): Promise<Fe
       streamReply: (message, producer) => adapter.streamReply(message, producer),
       addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
       removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
+      loadRecentHistory: message => adapter.loadRecentHistory?.(message) || Promise.resolve([]),
       download: (resource, message) => adapter.download(resource, message)
     };
   }
-  const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, Lark] = await Promise.all([import("./feishu.ts"), import("@larksuiteoapi/node-sdk")]);
+  const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, { loadLarkRecentHistory }, Lark] = await Promise.all([
+    import("./feishu.ts"), import("./lark-channel.ts"), import("@larksuiteoapi/node-sdk")
+  ]);
   const client = new Lark.Client({ appId, appSecret });
   const download = createFeishuResourceDownloader(client);
   console.warn("飞书接入层：旧版 node-sdk；建议仅在 Channel SDK 异常时临时使用。");
@@ -208,6 +218,7 @@ async function createFeishuRuntime(appId: string, appSecret: string): Promise<Fe
       const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: message.conversationId, msg_type: msgType, content } });
       assertLarkResponse(response, outbound.type === "card" ? "发送授权卡片" : "发送文本消息");
     },
+    loadRecentHistory: message => loadLarkRecentHistory(client, message),
     download
   };
 }

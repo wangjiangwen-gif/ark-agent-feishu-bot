@@ -12,7 +12,7 @@ export function needsCalendarAuthorization(text: string): boolean {
 type EmployeeAuthArk = Pick<ArkClient, "listVaults" | "createVault" | "listCredentials" | "createEnvironmentVariableCredential" | "updateEnvironmentCredential">;
 
 export class EmployeeAuthorizationManager {
-  private pending = new Map<string, Promise<void>>();
+  private pending = new Map<string, { messages: IncomingMessage[]; task?: Promise<void> }>();
   private store: GatewayStore;
   private ark: EmployeeAuthArk;
   private oauth: FeishuOAuth;
@@ -36,15 +36,30 @@ export class EmployeeAuthorizationManager {
   async ensure(message: IncomingMessage): Promise<boolean> {
     if ((await this.vaultIds(message)).length) return true;
     const key = `${message.tenantId}:${message.senderId}`;
-    if (this.pending.has(key)) return false;
-    const device = await this.oauth.begin(EMPLOYEE_CALENDAR_USER_SCOPES);
-    await this.sendCard(message, device.verificationUrl);
-    const task = this.complete(message, device).finally(() => this.pending.delete(key));
-    this.pending.set(key, task);
+    const existing = this.pending.get(key);
+    if (existing) {
+      existing.messages.push(message);
+      return false;
+    }
+    const pending = { messages: [message] } as { messages: IncomingMessage[]; task?: Promise<void> };
+    this.pending.set(key, pending);
+    try {
+      const device = await this.oauth.begin(EMPLOYEE_CALENDAR_USER_SCOPES);
+      await this.sendCard(message, device.verificationUrl);
+      pending.task = this.complete(key, pending, device).finally(() => this.pending.delete(key));
+    } catch (error) {
+      this.pending.delete(key);
+      throw error;
+    }
     return false;
   }
 
-  private async complete(message: IncomingMessage, device: Awaited<ReturnType<FeishuOAuth["begin"]>>): Promise<void> {
+  private async complete(
+    key: string,
+    pending: { messages: IncomingMessage[] },
+    device: Awaited<ReturnType<FeishuOAuth["begin"]>>
+  ): Promise<void> {
+    const message = pending.messages[0];
     try {
       const tokens = await this.oauth.poll(device);
       const openId = await this.oauth.getUserOpenId(tokens.accessToken);
@@ -56,9 +71,9 @@ export class EmployeeAuthorizationManager {
       if (credential) await this.ark.updateEnvironmentCredential(vault.id, credential.id, tokens.accessToken);
       else credential = { id: await this.ark.createEnvironmentVariableCredential(vault.id, "lark-cli-user-access-token", "LARKSUITE_CLI_USER_ACCESS_TOKEN", tokens.accessToken), displayName: "lark-cli-user-access-token", authType: "environment_variable" };
       this.store.saveEmployeeOAuth({ tenantKey: message.tenantId, openId, vaultId: vault.id, credentialId: credential.id, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt, scopes: EMPLOYEE_CALENDAR_USER_SCOPES });
-      this.resume(message);
+      for (const queued of pending.messages) this.resume(queued);
     } catch (error) {
-      console.error("用户授权失败：", error instanceof Error ? error.message : error);
+      console.error(`用户授权失败（${key}）：`, error instanceof Error ? error.message : error);
     }
   }
 }

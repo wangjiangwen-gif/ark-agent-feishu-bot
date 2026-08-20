@@ -28,12 +28,71 @@ test("Channel SDK message maps to the channel-neutral contract", () => {
   assert.deepEqual(result, {
     channelType: "lark", installationId: "cli-one", eventId: "evt-1", messageId: "om-1",
     tenantId: "tenant-1", conversationId: "oc-1", conversationType: "group", threadId: "omt-1",
+    rootMessageId: "", parentMessageId: "", createTime: result.createTime,
     senderId: "ou-1", text: "请总结", mentionedBot: true,
     resources: [
       { id: "img-1", name: "img-1.jpg", type: "image" },
       { id: "file-1", name: "计划.md", type: "file" }
     ]
   });
+});
+
+test("Channel normalization keeps ordinary reply roots separate from real threads", () => {
+  const result = normalizeLarkChannelMessage(normalized({
+    chatType: "group", rootId: "om-root", replyToMessageId: "om-parent", threadId: undefined
+  }), "cli-one");
+  assert.equal(result.threadId, "");
+  assert.equal(result.rootMessageId, "om-root");
+  assert.equal(result.parentMessageId, "om-parent");
+});
+
+test("Channel adapter loads chat history before the trigger and excludes the trigger message", async () => {
+  const calls: unknown[] = [];
+  const port = historyPort(async payload => {
+    calls.push(payload);
+    return { code: 0, data: { items: [
+      historyItem("om-future", "ou-3", "未来消息", 1_700_000_001_000),
+      historyItem("om-trigger", "ou-2", "当前消息", 1_700_000_000_000),
+      historyItem("om-before", "ou-1", "之前消息", 1_699_999_999_000, "张三")
+    ] } };
+  });
+  const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized({
+    messageId: "om-trigger", chatType: "group", createTime: 1_700_000_000_000, mentionedBot: true
+  }), "cli-one");
+
+  const history = await adapter.loadRecentHistory(inbound);
+
+  assert.deepEqual(history.map(item => item.messageId), ["om-before"]);
+  assert.equal(history[0].senderName, "张三");
+  assert.deepEqual(calls, [{ params: {
+    container_id_type: "chat", container_id: "oc-1", end_time: "1700000000",
+    sort_type: "ByCreateTimeDesc", page_size: 50, with_sender_name: true
+  } }]);
+});
+
+test("Channel adapter uses the thread container and filters its history locally", async () => {
+  const calls: unknown[] = [];
+  const port = historyPort(async payload => {
+    calls.push(payload);
+    return { code: 0, data: { items: [
+      historyItem("om-trigger", "ou-2", "当前话题消息", 1_700_000_000_000),
+      historyItem("om-before", "ou-1", "话题前文", 1_699_999_999_000)
+    ] } };
+  });
+  const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized({
+    messageId: "om-trigger", chatType: "group", threadId: "omt-one", createTime: 1_700_000_000_000,
+    mentionedBot: true
+  }), "cli-one");
+
+  const history = await adapter.loadRecentHistory(inbound);
+
+  assert.deepEqual(history.map(item => item.text), ["话题前文"]);
+  assert.deepEqual(calls, [{ params: {
+    container_id_type: "thread", container_id: "omt-one",
+    sort_type: "ByCreateTimeDesc", page_size: 50, with_sender_name: true
+  } }]);
 });
 
 test("Channel adapter sends normal chats directly and preserves existing topics", async () => {
@@ -283,3 +342,31 @@ test("outbound conversion remains explicit for future channel capabilities", () 
   assert.deepEqual(toLarkSendInput({ type: "markdown", markdown: "**hello**" }), { markdown: "**hello**" });
   assert.deepEqual(toLarkSendInput({ type: "card", card: { schema: "2.0" } }), { card: { schema: "2.0" } });
 });
+
+function historyItem(messageId: string, senderId: string, text: string, createTime: number, senderName?: string) {
+  return {
+    message_id: messageId, msg_type: "text", create_time: String(createTime),
+    sender: { id: senderId, id_type: "open_id", sender_type: "user", sender_name: senderName },
+    body: { content: JSON.stringify({ text }) }
+  };
+}
+
+function historyPort(list: (payload: unknown) => Promise<unknown>): LarkChannelPort {
+  return {
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    on: () => () => undefined,
+    send: async () => ({ messageId: "reply-1" }),
+    stream: async () => ({ messageId: "stream-1" }),
+    addReaction: async () => "reaction-1",
+    removeReaction: async () => undefined,
+    createCard: async () => ({ cardId: "card-1" }),
+    downloadResource: async () => Buffer.alloc(0),
+    rawClient: {
+      im: {
+        message: { list },
+        messageResource: { get: async () => { throw new Error("unused"); } }
+      }
+    }
+  } as unknown as LarkChannelPort;
+}

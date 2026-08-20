@@ -16,6 +16,7 @@ test("bot scopes include message permissions without user OAuth scopes", () => {
   assert.ok(scopes.includes("im:message:send_as_bot"));
   assert.ok(scopes.includes("im:message.p2p_msg:readonly"));
   assert.ok(scopes.includes("im:message.group_at_msg:readonly"));
+  assert.ok(scopes.includes("im:message.group_msg"));
   assert.ok(scopes.includes("im:message.reactions:write_only"));
   assert.ok(scopes.includes("im:message:update"));
   assert.ok(scopes.includes("cardkit:card:write"));
