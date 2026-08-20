@@ -113,7 +113,7 @@ test("per-message group Session receives bounded history and current channel ide
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
     platformAccess: true, perMessageSessions: true, dualIdentity: true,
     loadRecentHistory: async () => [
-      { messageId: "history-1", senderId: "ou-a", senderName: "张三", senderType: "user", text: "下午改到四点", createTime: 1_699_999_999_000 }
+      { messageId: "history-1", senderId: "ou-a", senderName: "张三", senderType: "user", source: "thread", text: "下午改到四点", createTime: 1_699_999_999_000 }
     ]
   });
   gateway.accept(message({
@@ -123,6 +123,7 @@ test("per-message group Session receives bounded history and current channel ide
   await delay(30);
 
   assert.match(prompt, /<conversation_context/);
+  assert.match(prompt, /"context_scope":"thread"/);
   assert.match(prompt, /张三.*下午改到四点/);
   assert.match(prompt, /<current_request>\n帮大家约一下/);
   assert.deepEqual(sessionEnv, {

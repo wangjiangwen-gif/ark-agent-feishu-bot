@@ -65,19 +65,60 @@ test("Channel adapter loads chat history before the trigger and excludes the tri
 
   assert.deepEqual(history.map(item => item.messageId), ["om-before"]);
   assert.equal(history[0].senderName, "张三");
+  assert.equal(history[0].source, "chat");
   assert.deepEqual(calls, [{ params: {
     container_id_type: "chat", container_id: "oc-1", end_time: "1700000000",
     sort_type: "ByCreateTimeDesc", page_size: 50, with_sender_name: true
   } }]);
 });
 
-test("Channel adapter uses the thread container and filters its history locally", async () => {
+test("Channel adapter merges chat and thread history before the trigger", async () => {
   const calls: unknown[] = [];
   const port = historyPort(async payload => {
     calls.push(payload);
+    const containerType = (payload as { params: { container_id_type: string } }).params.container_id_type;
+    return containerType === "chat"
+      ? { code: 0, data: { items: [
+        historyItem("om-chat", "ou-3", "群聊背景", 1_699_999_997_000),
+        historyItem("om-shared", "ou-1", "重复的根消息", 1_699_999_998_000)
+      ] } }
+      : { code: 0, data: { items: [
+        historyItem("om-trigger", "ou-2", "当前话题消息", 1_700_000_000_000),
+        historyItem("om-shared", "ou-1", "重复的根消息", 1_699_999_998_000),
+        historyItem("om-thread", "ou-1", "话题前文", 1_699_999_999_000)
+      ] } };
+  });
+  const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized({
+    messageId: "om-trigger", chatType: "group", threadId: "omt-one", createTime: 1_700_000_000_000,
+    mentionedBot: true
+  }), "cli-one");
+
+  const history = await adapter.loadRecentHistory(inbound);
+
+  assert.deepEqual(history.map(item => [item.text, item.source]), [
+    ["群聊背景", "chat"],
+    ["重复的根消息", "thread"],
+    ["话题前文", "thread"]
+  ]);
+  assert.deepEqual(calls, [
+    { params: {
+      container_id_type: "chat", container_id: "oc-1", end_time: "1700000000",
+      sort_type: "ByCreateTimeDesc", page_size: 50, with_sender_name: true
+    } },
+    { params: {
+      container_id_type: "thread", container_id: "omt-one",
+      sort_type: "ByCreateTimeDesc", page_size: 50, with_sender_name: true
+    } }
+  ]);
+});
+
+test("Thread history remains available when the surrounding chat lookup fails", async () => {
+  const port = historyPort(async payload => {
+    const containerType = (payload as { params: { container_id_type: string } }).params.container_id_type;
+    if (containerType === "chat") throw new Error("chat history unavailable");
     return { code: 0, data: { items: [
-      historyItem("om-trigger", "ou-2", "当前话题消息", 1_700_000_000_000),
-      historyItem("om-before", "ou-1", "话题前文", 1_699_999_999_000)
+      historyItem("om-thread", "ou-1", "话题仍然可用", 1_699_999_999_000)
     ] } };
   });
   const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
@@ -88,11 +129,7 @@ test("Channel adapter uses the thread container and filters its history locally"
 
   const history = await adapter.loadRecentHistory(inbound);
 
-  assert.deepEqual(history.map(item => item.text), ["话题前文"]);
-  assert.deepEqual(calls, [{ params: {
-    container_id_type: "thread", container_id: "omt-one",
-    sort_type: "ByCreateTimeDesc", page_size: 50, with_sender_name: true
-  } }]);
+  assert.deepEqual(history.map(item => [item.text, item.source]), [["话题仍然可用", "thread"]]);
 });
 
 test("Channel adapter sends normal chats directly and preserves existing topics", async () => {

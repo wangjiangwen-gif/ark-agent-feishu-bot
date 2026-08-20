@@ -166,7 +166,7 @@ Bot 的 App Secret 保存在本地安全配置，用于 WebSocket 鉴权和刷�
 
 数字员工会显式申请 `im:message.p2p_msg:readonly` 与 `im:message.group_at_msg:readonly`，分别用于接收用户私聊和群聊中明确 @Bot 的消息；还会申请 `im:message.group_msg`，供 Gateway 和 Session 内的 Bot 读取群聊或话题近期历史。该权限属于敏感群消息权限，可能需要管理员审核并重新发布应用。Gateway 收到请求后先在用户消息上添加 `Get` 表情，使用同一条流式消息逐步更新 Agent 回复，任务成功或失败后都会移除该表情。应用可用范围、原生申请和审批由飞书控制面统一管理，arkagent 不复制这套能力。
 
-数字员工在群聊中采用“一条 @ 消息、一个独立 Managed Agents Session”。多位用户同时 @Bot 时任务直接并行，不按群或话题排队；每个 Session 固定注入本次发送者的 `open_id` 和对应 Vault，因此不会共享用户身份。创建 Session 后的第一条输入会带上截至触发时刻的近期上下文：普通群按 `chat_id` 读取，Thread 按真实 `thread_id` 读取；当前消息和之后产生的消息会被排除。上下文默认限制为最近 20 条、最多 8,000 字符，并标记为不可信背景资料。需要更早记录时，Agent 可使用 Bot 身份调用 `lark-cli im +chat-messages-list` 或 `lark-cli im +threads-messages-list`。单聊仍按飞书会话复用同一个 Session，消息按顺序处理，并支持 `/new` 显式重置。
+数字员工在群聊中采用“一条 @ 消息、一个独立 Managed Agents Session”。多位用户同时 @Bot 时任务直接并行，不按群或话题排队；每个 Session 固定注入本次发送者的 `open_id` 和对应 Vault，因此不会共享用户身份。创建 Session 后的第一条输入会带上截至触发时刻的近期上下文：普通群按 `chat_id` 读取；Thread 同时读取所在群的近期消息与当前 `thread_id` 内消息，再按消息 ID 去重、按时间合并。当前消息和之后产生的消息会被排除。合并后的上下文统一限制为最近 20 条、最多 8,000 字符，并标记来源及“不可信背景资料”。需要更早记录时，Agent 可使用 Bot 身份调用 `lark-cli im +chat-messages-list` 或 `lark-cli im +threads-messages-list`。单聊仍按飞书会话复用同一个 Session，消息按顺序处理，并支持 `/new` 显式重置。
 
 WebUI 首页是数字员工列表；点击员工后进入详情，通过「身份」「行为日志」「访问过的用户」查看该员工。身份页展示当前 Agent 已拥有的飞书 Bot 身份、认证方式、能力和授权范围；只展示方舟 Vault Credential 的脱敏引用，不会返回 App Secret 或 token。身份模型预留了 provider 和 identity type，后续可继续接入飞书用户身份及其他服务身份。「访问过的用户」只表示已经实际使用过 Bot 的用户，完整使用权限仍由飞书应用可用范围管理。
 

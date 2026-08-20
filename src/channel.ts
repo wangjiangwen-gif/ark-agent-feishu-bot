@@ -30,6 +30,7 @@ export type ChannelHistoryMessage = {
   senderId: string;
   senderName?: string;
   senderType: string;
+  source: "chat" | "thread";
   text: string;
   createTime: number;
 };

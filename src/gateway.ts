@@ -352,12 +352,15 @@ ${currentInput}
 }
 
 function buildConversationContextInput(message: IncomingMessage, history: ChannelHistoryMessage[], currentInput: string): string {
-  const scope = message.threadId ? `thread:${message.threadId}` : `chat:${message.conversationId}`;
+  const scope = message.threadId
+    ? `chat:${message.conversationId}+thread:${message.threadId}`
+    : `chat:${message.conversationId}`;
   const lines = history.map(item => safeContextJson({
     message_id: item.messageId,
     sender_open_id: item.senderId,
     sender_name: item.senderName,
     sender_type: item.senderType,
+    context_scope: item.source,
     create_time: item.createTime,
     text: item.text
   }));

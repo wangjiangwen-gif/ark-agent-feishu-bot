@@ -22,12 +22,16 @@ type LarkHistoryItem = {
   mentions?: Array<{ key?: string; name?: string }>;
 };
 
+type LarkMessageListResponse = {
+  code?: number;
+  msg?: string;
+  data?: { has_more?: boolean; page_token?: string; items?: LarkHistoryItem[] };
+};
+
+type LarkMessageList = (payload: unknown) => Promise<LarkMessageListResponse>;
+
 type FeishuCardStreamClient = FeishuResourceClient & {
-  im: FeishuResourceClient["im"] & { message?: { list(payload: unknown): Promise<{
-    code?: number;
-    msg?: string;
-    data?: { has_more?: boolean; page_token?: string; items?: LarkHistoryItem[] };
-  }> } };
+  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList } };
   cardkit?: { v1?: {
     cardElement?: { content(payload: unknown): Promise<unknown> };
     card?: { settings(payload: unknown): Promise<unknown> };
@@ -329,18 +333,46 @@ export async function loadLarkRecentHistory(
   const maxMessages = positiveInteger(options.maxMessages, 20);
   const maxChars = positiveInteger(options.maxChars, 8_000);
   const maxPages = positiveInteger(options.maxPages, 3);
-  const isThread = Boolean(message.threadId);
+  const sources: Array<"chat" | "thread"> = message.threadId ? ["chat", "thread"] : ["chat"];
+  const settled = await Promise.allSettled(sources.map(source => loadHistoryContainer(
+    list.bind(client.im.message), message, source, maxMessages, maxPages
+  )));
+  if (settled.every(result => result.status === "rejected")) {
+    const firstFailure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    throw firstFailure?.reason || new Error("读取飞书会话历史失败");
+  }
+  const resultSets = settled.map(result => result.status === "fulfilled" ? result.value : []);
+  const unique = new Map<string, { item: LarkHistoryItem; source: "chat" | "thread" }>();
+  for (const [index, items] of resultSets.entries()) {
+    const source = sources[index];
+    for (const item of items) if (item.message_id) unique.set(item.message_id, { item, source });
+  }
+  const normalized = [...unique.values()]
+    .map(({ item, source }) => normalizeHistoryItem(item, source))
+    .filter((item): item is ChannelHistoryMessage => Boolean(item))
+    .sort((left, right) => left.createTime - right.createTime)
+    .slice(-maxMessages);
+  return trimHistoryToChars(normalized, maxChars);
+}
+
+async function loadHistoryContainer(
+  list: LarkMessageList,
+  message: ChannelMessage,
+  source: "chat" | "thread",
+  maxMessages: number,
+  maxPages: number
+): Promise<LarkHistoryItem[]> {
   const items: LarkHistoryItem[] = [];
   let pageToken: string | undefined;
   for (let page = 0; page < maxPages; page++) {
     const params: Record<string, string | number | boolean> = {
-      container_id_type: isThread ? "thread" : "chat",
-      container_id: isThread ? message.threadId : message.conversationId,
+      container_id_type: source,
+      container_id: source === "thread" ? message.threadId : message.conversationId,
       sort_type: "ByCreateTimeDesc",
       page_size: 50,
       with_sender_name: true
     };
-    if (!isThread) params.end_time = String(Math.floor(message.createTime / 1000));
+    if (source === "chat") params.end_time = String(Math.floor(message.createTime / 1000));
     if (pageToken) params.page_token = pageToken;
     const response = await list({ params });
     if (response.code && response.code !== 0) throw new Error(`读取飞书会话历史失败：${response.msg || `code ${response.code}`}`);
@@ -349,13 +381,7 @@ export async function loadLarkRecentHistory(
     if (eligibleCount >= maxMessages || !response.data?.has_more || !response.data.page_token) break;
     pageToken = response.data.page_token;
   }
-  const normalized = items
-    .filter(item => isEligibleHistoryItem(item, message))
-    .map(normalizeHistoryItem)
-    .filter((item): item is ChannelHistoryMessage => Boolean(item))
-    .sort((left, right) => left.createTime - right.createTime)
-    .slice(-maxMessages);
-  return trimHistoryToChars(normalized, maxChars);
+  return items.filter(item => isEligibleHistoryItem(item, message));
 }
 
 function isEligibleHistoryItem(item: LarkHistoryItem, trigger: ChannelMessage): boolean {
@@ -363,7 +389,7 @@ function isEligibleHistoryItem(item: LarkHistoryItem, trigger: ChannelMessage): 
   return Boolean(item.message_id && !item.deleted && item.message_id !== trigger.messageId && createTime > 0 && createTime <= trigger.createTime);
 }
 
-function normalizeHistoryItem(item: LarkHistoryItem): ChannelHistoryMessage | undefined {
+function normalizeHistoryItem(item: LarkHistoryItem, source: "chat" | "thread"): ChannelHistoryMessage | undefined {
   const messageId = String(item.message_id || "");
   const text = historyItemText(item);
   if (!messageId || !text) return undefined;
@@ -372,6 +398,7 @@ function normalizeHistoryItem(item: LarkHistoryItem): ChannelHistoryMessage | un
     senderId: String(item.sender?.id || "unknown"),
     senderName: item.sender?.sender_name || undefined,
     senderType: String(item.sender?.sender_type || "unknown"),
+    source,
     text,
     createTime: Number(item.create_time || 0)
   };
