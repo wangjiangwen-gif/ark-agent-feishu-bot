@@ -329,9 +329,13 @@ test("Channel adapter waits for native CardKit typing before closing the stream"
   const updates = operations.filter(operation => operation.type === "content");
   assert.ok(updates.length >= 3, `expected incremental CardKit updates, got ${updates.length}`);
   assert.equal(operations.at(-1)?.type, "settings");
-  const card = operations[0].value as { config: { streaming_config: { print_frequency_ms: { default: number }; print_step: { default: number } } } };
+  const card = operations[0].value as {
+    config: { streaming_config: { print_frequency_ms: { default: number }; print_step: { default: number } } };
+    body: { elements: Array<{ content: string }> };
+  };
   assert.equal(card.config.streaming_config.print_frequency_ms.default, 1);
   assert.equal(card.config.streaming_config.print_step.default, 10);
+  assert.equal(card.body.elements[0].content, "Thinking...");
 });
 
 test("Channel adapter enforces the attachment limit", async () => {

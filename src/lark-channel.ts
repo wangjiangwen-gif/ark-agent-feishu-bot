@@ -55,6 +55,7 @@ const DEFAULT_STREAMING_OPTIONS: Required<StreamingOptions> = {
   printStep: 4,
   settlePaddingMs: 120
 };
+const STREAMING_PLACEHOLDER = "Thinking...";
 
 export class LarkChannelAdapter implements ChannelAdapter {
   readonly channelType = "lark" as const;
@@ -149,7 +150,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
     const push = async (): Promise<void> => {
       await cardkit.cardElement.content({
         path: { card_id: cardId, element_id: elementId },
-        data: { content: content || "...", sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
+        data: { content: content || STREAMING_PLACEHOLDER, sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
       });
     };
 
@@ -220,7 +221,7 @@ function buildNativeStreamingCard(elementId: string, options: Required<Streaming
         print_strategy: "fast"
       }
     },
-    body: { elements: [{ tag: "markdown", element_id: elementId, content: "..." }] }
+    body: { elements: [{ tag: "markdown", element_id: elementId, content: STREAMING_PLACEHOLDER }] }
   };
 }
 
