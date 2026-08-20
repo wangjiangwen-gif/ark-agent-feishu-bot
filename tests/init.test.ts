@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { OFFICE_AGENT_NAME, runGuidedInit, serializeEnv } from "../src/init.ts";
+import { OFFICE_AGENT_CONFIG, OFFICE_AGENT_NAME, runGuidedInit, serializeEnv } from "../src/init.ts";
+
+test("office assistant prompt clarifies ambiguous requests before using tools", () => {
+  assert.match(OFFICE_AGENT_CONFIG.system, /意图判断优先于工具调用/);
+  assert.match(OFFICE_AGENT_CONFIG.system, /不得通过执行命令猜测用户意图/);
+  assert.match(OFFICE_AGENT_CONFIG.system, /禁止运行 lark-cli skills list/);
+  assert.match(OFFICE_AGENT_CONFIG.system, /工具调用超时或失败后，不得改用相似的探测命令继续尝试/);
+});
 
 test("guided init reuses an environment with the stable name", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ark-feishu-init-"));

@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EMPLOYEE_AGENT_NAME, runEmployeeInit } from "../src/employee-init.ts";
+import { EMPLOYEE_AGENT_CONFIG, EMPLOYEE_AGENT_NAME, runEmployeeInit } from "../src/employee-init.ts";
+
+test("employee prompt clarifies ambiguous requests before using tools", () => {
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /意图判断优先于工具调用/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /不得通过执行命令猜测用户意图/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /禁止运行 lark-cli skills list/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /工具调用超时或失败后，不得改用相似的探测命令继续尝试/);
+});
 
 test("employee runtime never mutates the configured user Agent", async () => {
   const source = await readFile(join(process.cwd(), "src/cli.ts"), "utf8");
