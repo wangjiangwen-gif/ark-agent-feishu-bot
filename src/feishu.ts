@@ -11,6 +11,7 @@ type FeishuEvent = {
     root_id?: string;
     parent_id?: string;
     thread_id?: string;
+    create_time?: string;
     chat_id?: string;
     chat_type?: string;
     message_type?: string;
@@ -85,7 +86,10 @@ export function normalizeFeishuMessage(event: FeishuEvent, installationId = "leg
     messageId: message.message_id,
     conversationId: message.chat_id,
     conversationType: message.chat_type === "p2p" ? "direct" : "group",
-    threadId: message.thread_id || message.root_id || message.parent_id || "",
+    threadId: message.thread_id || "",
+    rootMessageId: message.root_id || "",
+    parentMessageId: message.parent_id || "",
+    createTime: Number(message.create_time || Date.now()),
     senderId: event.sender?.sender_id?.open_id || "",
     tenantId: event.tenant_key || "default",
     text: text.trim(),
