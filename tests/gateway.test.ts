@@ -210,6 +210,57 @@ test("successful group execution records the final reply for later context fallb
   store.close();
 });
 
+test("group token_missing suppresses the Agent error and retries in a new authorized Session", async () => {
+  const store = new GatewayStore(":memory:");
+  const replies: string[] = [];
+  let creates = 0;
+  let runs = 0;
+  let authorizationCalls = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => `session-${++creates}`,
+    run: async () => ++runs === 1 ? {
+      terminal: "idle" as const, messages: ["没有用户凭证"],
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+    } : { terminal: "idle" as const, messages: ["今天没有日程"] }
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true,
+    ensureAuthorization: async (_message, request) => { authorizationCalls++; assert.equal(request.domain, "calendar"); return true; }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "看看今天的安排" }));
+  await delay(80);
+
+  assert.equal(authorizationCalls, 1);
+  assert.equal(creates, 2);
+  assert.equal(runs, 2);
+  assert.deepEqual(replies, ["今天没有日程"]);
+  assert.deepEqual(store.listAuditLogs().map(item => item.action), ["message", "authorization_required"]);
+  store.close();
+});
+
+test("repeated token_missing stops after one automatic authorization retry", async () => {
+  const store = new GatewayStore(":memory:");
+  const replies: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session",
+    run: async () => ({
+      terminal: "idle" as const, messages: ["没有用户凭证"],
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+    })
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true, ensureAuthorization: async () => true
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true }));
+  await delay(80);
+
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /授权后仍未获得用户凭证/);
+  store.close();
+});
+
 test("result requires both a successful terminal and a business message", () => {
   assert.throws(() => resultToReply({ terminal: "idle", messages: [] }), /没有产生回复/);
   assert.throws(() => resultToReply({ terminal: "failed", messages: ["partial"] }), /执行失败/);

@@ -1,4 +1,4 @@
-import type { ArkClient, RunResult } from "./ark.ts";
+import type { ArkClient, RunResult, UserAuthorizationRequired } from "./ark.ts";
 import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound } from "./channel.ts";
 import type { ConversationKey, GatewayStore } from "./store.ts";
 
@@ -36,6 +36,7 @@ export class KeyedQueue {
 export class Gateway {
   private queue = new KeyedQueue();
   private sessionStatsCheckedAt = new Map<string, number>();
+  private authorizationRetries = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>;
   private reply: Reply;
@@ -159,7 +160,6 @@ export class Gateway {
       });
       return;
     }
-    if (this.options.requiresAuthorization?.(message) && this.options.ensureAuthorization && !await this.options.ensureAuthorization(message)) return;
     let recentHistoryPromise: Promise<ChannelHistoryMessage[]> | undefined;
     if (this.options.loadRecentHistory && message.conversationType === "group") {
       const fallbackHistory = this.recentAuditHistory(message);
@@ -246,12 +246,19 @@ export class Gateway {
       if (this.options.streamReply) {
         await this.options.streamReply(message, async update => {
           result = await this.ark.run(sessionId, input, this.options.timeoutMs, undefined, update);
-          await update(resultToReply(result));
+          if (result.authorizationRequired) await update("此请求需要用户身份，正在准备授权会话…");
+          else await update(resultToReply(result));
         });
       } else {
         result = await this.ark.run(sessionId, input, this.options.timeoutMs);
       }
       if (!result) throw new Error("流式回复结束，但 Agent Session 没有返回结果");
+      if (result.authorizationRequired) {
+        if (progressTimer) clearTimeout(progressTimer);
+        await progressReply;
+        await this.handleAuthorizationRequired(message, sessionId, startedAt, result.authorizationRequired);
+        return;
+      }
       const finalReply = resultToReply(result);
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
@@ -263,6 +270,7 @@ export class Gateway {
         durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.resources.length),
         responseSummary: summarizeResponse(finalReply), messageCreateTime: message.createTime
       });
+      this.authorizationRetries.delete(this.authorizationRetryKey(message));
     } catch (error) {
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
@@ -275,6 +283,35 @@ export class Gateway {
     } finally {
       if (progressTimer) clearTimeout(progressTimer);
     }
+  }
+
+  private async handleAuthorizationRequired(
+    message: IncomingMessage,
+    sessionId: string,
+    startedAt: number,
+    request: UserAuthorizationRequired
+  ): Promise<void> {
+    const retryKey = this.authorizationRetryKey(message);
+    if (this.authorizationRetries.has(retryKey)) {
+      throw new Error("授权后仍未获得用户凭证，请重新授权或联系管理员检查用户 Vault");
+    }
+    if (!this.options.ensureAuthorization) throw new Error("当前 Gateway 未配置用户授权处理器");
+    this.authorizationRetries.add(retryKey);
+    this.store.addAuditLog({
+      channelType: message.channelType, installationId: message.installationId,
+      tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
+      messageId: message.messageId, sessionId, action: "authorization_required", status: "succeeded",
+      durationMs: Date.now() - startedAt, summary: `${request.domain || "unknown"}: ${request.errorType}/${request.subtype}`,
+      messageCreateTime: message.createTime
+    });
+    const ready = await this.options.ensureAuthorization(message, request);
+    if (!ready) return;
+    if (this.usesIsolatedSession(message)) this.resume(message);
+    else this.resumeWithHandoff(message);
+  }
+
+  private authorizationRetryKey(message: IncomingMessage): string {
+    return [message.channelType, message.installationId, message.messageId].join(":");
   }
 
   private async shouldRotateSession(sessionId: string): Promise<boolean> {
@@ -364,8 +401,7 @@ export type GatewayOptions = {
   removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
   beforeCreateSession?: () => Promise<void>;
   platformAccess?: boolean;
-  requiresAuthorization?: (message: IncomingMessage) => boolean;
-  ensureAuthorization?: (message: IncomingMessage) => Promise<boolean>;
+  ensureAuthorization?: (message: IncomingMessage, request: UserAuthorizationRequired) => Promise<boolean>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   perMessageSessions?: boolean;
   loadRecentHistory?: (message: IncomingMessage) => Promise<ChannelHistoryMessage[]>;

@@ -1,14 +1,26 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { EmployeeAuthorizationManager, EMPLOYEE_CALENDAR_USER_SCOPES, needsCalendarAuthorization } from "../src/employee-auth.ts";
+import { EmployeeAuthorizationManager, EMPLOYEE_CALENDAR_USER_SCOPES } from "../src/employee-auth.ts";
 import type { IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
 
-test("calendar scheduling requests require user authorization", () => {
-  assert.equal(needsCalendarAuthorization("帮我安排明天下午的日程"), true);
-  assert.equal(needsCalendarAuthorization("帮我创建一份飞书文档"), false);
+test("employee authorization maps only explicit calendar tool failures to calendar scopes", () => {
   assert.ok(EMPLOYEE_CALENDAR_USER_SCOPES.includes("calendar:calendar.free_busy:read"));
+});
+
+test("unsupported lark-cli domains do not open an unrelated calendar OAuth flow", async () => {
+  const store = new GatewayStore(":memory:");
+  const auth = new EmployeeAuthorizationManager(store, {
+    listVaults: async () => [], createVault: async () => "vlt-user", listCredentials: async () => [],
+    createEnvironmentVariableCredential: async () => "vcrd-user", updateEnvironmentCredential: async () => undefined
+  }, { begin: async () => { throw new Error("should not begin"); } } as never,
+  async () => undefined, () => undefined, () => undefined);
+
+  await assert.rejects(auth.ensure(authMessage("om-doc"), {
+    identity: "user", errorType: "authentication", subtype: "token_missing", domain: "docs"
+  }), /尚未配置.*docs.*用户授权/);
+  store.close();
 });
 
 test("concurrent authorization requests from one user all resume after one OAuth flow", async () => {
@@ -31,8 +43,8 @@ test("concurrent authorization requests from one user all resume after one OAuth
   message => { resumed.push(message.messageId); },
   () => undefined);
 
-  assert.equal(await auth.ensure(authMessage("om-one")), false);
-  assert.equal(await auth.ensure(authMessage("om-two")), false);
+  assert.equal(await auth.ensure(authMessage("om-one"), calendarRequest()), false);
+  assert.equal(await auth.ensure(authMessage("om-two"), calendarRequest()), false);
   assert.deepEqual(cards, ["om-one"]);
   releasePoll?.({ accessToken: "token", refreshToken: "refresh", expiresAt: Date.now() + 60_000 });
   await delay(20);
@@ -59,9 +71,9 @@ test("authorization handoff is used once per direct conversation while groups re
   message => { resumed.push(message.messageId); },
   message => { handedOff.push(message.messageId); });
 
-  assert.equal(await auth.ensure(authMessage("om-group")), false);
-  assert.equal(await auth.ensure(authMessage("om-direct-one", "direct")), false);
-  assert.equal(await auth.ensure(authMessage("om-direct-two", "direct")), false);
+  assert.equal(await auth.ensure(authMessage("om-group"), calendarRequest()), false);
+  assert.equal(await auth.ensure(authMessage("om-direct-one", "direct"), calendarRequest()), false);
+  assert.equal(await auth.ensure(authMessage("om-direct-two", "direct"), calendarRequest()), false);
   releasePoll?.({ accessToken: "token", refreshToken: "refresh", expiresAt: Date.now() + 60_000 });
   await delay(20);
 
@@ -77,4 +89,8 @@ function authMessage(messageId: string, conversationType: "direct" | "group" = "
     threadId: "", rootMessageId: "", parentMessageId: "", createTime: Date.now(),
     senderId: "ou-one", text: "帮我查看日程", resources: [], mentionedBot: conversationType === "group"
   };
+}
+
+function calendarRequest() {
+  return { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" };
 }

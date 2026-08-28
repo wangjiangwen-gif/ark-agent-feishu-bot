@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ArkClient, drainEventBuffer, eventProgress, eventText, resultFromEvents } from "../src/ark.ts";
+import { ArkClient, drainEventBuffer, eventProgress, eventText, eventUserAuthorizationRequired, resultFromEvents } from "../src/ark.ts";
 
 test("Ark network failures identify the failed API operation", async () => {
   const client = new ArkClient("key", "https://ark.example.com", async () => {
@@ -24,6 +24,59 @@ test("drainEventBuffer parses NDJSON without treating chunks as events", () => {
 
 test("eventText joins text blocks only", () => {
   assert.equal(eventText({ content: [{ type: "text", text: "甲" }, { type: "image" }, { type: "text", text: "乙" }] }), "甲\n乙");
+});
+
+test("lark-cli user token_missing is parsed from a successful MA tool_result envelope", () => {
+  const toolUse = {
+    type: "agent.tool_use", id: "call-one", name: "bash",
+    input: { command: "lark-cli calendar +agenda --as user", description: "查询日程" }
+  };
+  const toolResult = {
+    type: "agent.tool_result", tool_use_id: "call-one", is_error: false,
+    content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{\n  "ok": false,\n  "identity": "user",\n  "error": {\n    "type": "authentication",\n    "subtype": "token_missing",\n    "message": "no access token available for user"\n  }\n}` }]
+  };
+
+  assert.deepEqual(eventUserAuthorizationRequired(toolResult, new Map([["call-one", "calendar"]])), {
+    identity: "user", errorType: "authentication", subtype: "token_missing", domain: "calendar"
+  });
+  assert.equal(eventUserAuthorizationRequired({ ...toolResult, content: [{ type: "text", text: "exit_code: 2\n--- stderr ---\n{}" }] }, new Map()), undefined);
+  assert.equal(eventUserAuthorizationRequired({ ...toolResult, content: [{ type: "text", text: `exit_code: 3\n--- stderr ---\n{"ok":false,"identity":"bot","error":{"type":"authorization","subtype":"app_scope_not_applied"}}` }] }, new Map()), undefined);
+  assert.equal((toolUse.input.command.match(/lark-cli\s+([\w-]+)/) || [])[1], "calendar");
+});
+
+test("resultFromEvents preserves user authorization requirements despite MA is_error false", () => {
+  const processedAt = new Date(Date.now() + 1_000).toISOString();
+  const result = resultFromEvents([
+    { type: "agent.tool_use", id: "call-one", name: "bash", input: { command: "lark-cli calendar +agenda --as user" }, processed_at: processedAt },
+    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_missing"}}` }], processed_at: processedAt },
+    { type: "agent.message", content: [{ type: "text", text: "请先授权" }], processed_at: processedAt },
+    { type: "session.status_idle", processed_at: processedAt }
+  ], Date.now());
+
+  assert.deepEqual(result?.authorizationRequired, {
+    identity: "user", errorType: "authentication", subtype: "token_missing", domain: "calendar"
+  });
+});
+
+test("run stops streaming Agent denial text after lark-cli requests user authorization", async () => {
+  const snapshots: string[] = [];
+  const events = [
+    { type: "agent.tool_use", id: "call-one", name: "bash", input: { command: "lark-cli calendar +agenda --as user" } },
+    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_missing"}}` }] },
+    { type: "agent.message", content: [{ type: "text", text: "你没有凭证，请自行授权" }] },
+    { type: "session.status_idle" }
+  ];
+  const client = new ArkClient("key", "https://ark.example/api/v3", async url => {
+    if (String(url).includes("/events/stream")) {
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  });
+
+  const result = await client.run("session-1", "查日程", 5_000, undefined, async snapshot => { snapshots.push(snapshot); });
+
+  assert.deepEqual(snapshots, []);
+  assert.equal(result.authorizationRequired?.domain, "calendar");
 });
 
 test("Ark requests configure lark-cli, Vault credential and Session binding", async () => {

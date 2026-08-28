@@ -3,6 +3,14 @@ export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; p
 export type RunResult = {
   terminal: "idle" | "failed";
   messages: string[];
+  authorizationRequired?: UserAuthorizationRequired;
+};
+
+export type UserAuthorizationRequired = {
+  identity: "user";
+  errorType: "authentication";
+  subtype: "token_missing";
+  domain?: string;
 };
 
 export type SessionStats = {
@@ -340,10 +348,14 @@ export class ArkClient {
     const messages: string[] = [];
     const seen = new Set<string>();
     const previews = new Map<string, Map<number, string>>();
+    const toolDomains = new Map<string, string>();
+    let authorizationRequired: UserAuthorizationRequired | undefined;
     let lastSnapshot = "";
     for await (const event of await streamPromise) {
       if (event.id && seen.has(event.id)) continue;
       if (event.id) seen.add(event.id);
+      rememberLarkCliToolDomain(event, toolDomains);
+      authorizationRequired ||= eventUserAuthorizationRequired(event, toolDomains);
       if (event.type === "event_start") {
         const preview = event.event && typeof event.event === "object" ? event.event as Record<string, unknown> : undefined;
         if (preview?.type === "agent.message" && typeof preview.id === "string") previews.set(preview.id, new Map());
@@ -356,7 +368,7 @@ export class ArkClient {
         if (blocks && delta?.type === "content_delta" && content?.type === "text" && typeof content.text === "string") {
           blocks.set(index, `${blocks.get(index) || ""}${content.text}`);
           const snapshot = [...blocks.entries()].sort(([left], [right]) => left - right).map(([, value]) => value).join("\n");
-          if (snapshot && snapshot !== lastSnapshot) {
+          if (!authorizationRequired && snapshot && snapshot !== lastSnapshot) {
             lastSnapshot = snapshot;
             await onDelta?.(snapshot);
           }
@@ -366,7 +378,7 @@ export class ArkClient {
         const text = eventText(event);
         if (text) {
           messages.push(text);
-          if (text !== lastSnapshot) {
+          if (!authorizationRequired && text !== lastSnapshot) {
             lastSnapshot = text;
             await onDelta?.(text);
           }
@@ -375,8 +387,8 @@ export class ArkClient {
       }
       const progress = eventProgress(event);
       if (progress) await onProgress?.(progress);
-      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages };
-      if (event.type === "session.status_idle") return { terminal: "idle", messages };
+      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+      if (event.type === "session.status_idle") return { terminal: "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
     }
     throw new Error("事件流结束，但未观察到 Session 终态");
   }
@@ -489,7 +501,37 @@ export function resultFromEvents(events: ArkEvent[], startedAt: number): RunResu
   const idle = current.some(event => event.type === "session.status_idle");
   if (!failed && !idle) return undefined;
   const messages = current.filter(event => event.type === "agent.message").map(eventText).filter(Boolean);
-  return { terminal: failed ? "failed" : "idle", messages };
+  const toolDomains = new Map<string, string>();
+  for (const event of current) rememberLarkCliToolDomain(event, toolDomains);
+  const authorizationRequired = current.map(event => eventUserAuthorizationRequired(event, toolDomains)).find(Boolean);
+  return { terminal: failed ? "failed" : "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+}
+
+function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, string>): void {
+  if (event.type !== "agent.tool_use" || typeof event.id !== "string") return;
+  const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
+  if (typeof input?.command !== "string") return;
+  const match = input.command.match(/(?:^|[;&|]\s*|\s)lark-cli\s+([a-z][\w-]*)\b/i);
+  if (match) toolDomains.set(event.id, match[1].toLowerCase());
+}
+
+export function eventUserAuthorizationRequired(
+  event: ArkEvent,
+  toolDomains: ReadonlyMap<string, string> = new Map()
+): UserAuthorizationRequired | undefined {
+  if (event.type !== "agent.tool_result") return undefined;
+  const text = eventText(event).trim();
+  if (!/^exit_code:\s*3\b/m.test(text)) return undefined;
+  const marker = text.match(/--- stderr ---\s*\n([\s\S]+)$/);
+  if (!marker) return undefined;
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(marker[1].trim()) as Record<string, unknown>; }
+  catch { return undefined; }
+  const error = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : undefined;
+  if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication" || error.subtype !== "token_missing") return undefined;
+  const toolUseId = typeof event.tool_use_id === "string" ? event.tool_use_id : "";
+  const domain = toolDomains.get(toolUseId);
+  return { identity: "user", errorType: "authentication", subtype: "token_missing", ...(domain ? { domain } : {}) };
 }
 
 function parseEventBlock(block: string): ArkEvent[] {

@@ -1,13 +1,9 @@
-import type { ArkClient } from "./ark.ts";
+import type { ArkClient, UserAuthorizationRequired } from "./ark.ts";
 import type { IncomingMessage } from "./gateway.ts";
 import type { FeishuOAuth } from "./oauth.ts";
 import type { GatewayStore } from "./store.ts";
 
 export const EMPLOYEE_CALENDAR_USER_SCOPES = ["offline_access", "auth:user.id:read", "calendar:calendar:read", "calendar:calendar.event:read", "calendar:calendar.free_busy:read"];
-
-export function needsCalendarAuthorization(text: string): boolean {
-  return /(?:日程|日历|会议|约个?时间|schedule|calendar)/i.test(text) && /(?:约|安排|创建|新建|查看|查询|空闲|冲突|有空|schedule|book)/i.test(text);
-}
 
 type EmployeeAuthArk = Pick<ArkClient, "listVaults" | "createVault" | "listCredentials" | "createEnvironmentVariableCredential" | "updateEnvironmentCredential">;
 
@@ -37,7 +33,8 @@ export class EmployeeAuthorizationManager {
     return [current.vaultId];
   }
 
-  async ensure(message: IncomingMessage): Promise<boolean> {
+  async ensure(message: IncomingMessage, request: UserAuthorizationRequired): Promise<boolean> {
+    if (request.domain !== "calendar") throw new Error(`尚未配置 ${request.domain || "未知"} 域的用户授权，无法自动发起 OAuth`);
     if ((await this.vaultIds(message)).length) return true;
     const key = `${message.tenantId}:${message.senderId}`;
     const existing = this.pending.get(key);

@@ -54,7 +54,7 @@ async function repairEmployeeEnvironment(): Promise<void> {
 
 async function runEmployee(): Promise<void> {
   loadSavedEmployeeEnvironment();
-  const [{ loadEmployeeConfig }, { ArkClient }, { Gateway }, { GatewayStore }, { startEmployeeWeb }, { FeishuOAuth }, { EmployeeAuthorizationManager, needsCalendarAuthorization }] = await Promise.all([
+  const [{ loadEmployeeConfig }, { ArkClient }, { Gateway }, { GatewayStore }, { startEmployeeWeb }, { FeishuOAuth }, { EmployeeAuthorizationManager }] = await Promise.all([
     import("./config.ts"), import("./ark.ts"), import("./gateway.ts"), import("./store.ts"), import("./web.ts"), import("./oauth.ts"), import("./employee-auth.ts")
   ]);
   const config = loadEmployeeConfig();
@@ -96,7 +96,7 @@ async function runEmployee(): Promise<void> {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
-    requiresAuthorization: message => needsCalendarAuthorization(message.text), ensureAuthorization: message => auth.ensure(message),
+    ensureAuthorization: (message, request) => auth.ensure(message, request),
     getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true,
     perMessageSessions: true, loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([])
   });
