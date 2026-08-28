@@ -165,8 +165,14 @@ test("group history loading overlaps Session creation", async () => {
   store.close();
 });
 
-test("group requests still run when recent history cannot be loaded", async () => {
+test("group history falls back to prior Gateway requests and replies when Feishu history cannot be loaded", async () => {
   const store = new GatewayStore(":memory:");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-test", tenantKey: "tenant-1", openId: "ou-a",
+    chatId: "chat-1", messageId: "history-message", action: "message", status: "succeeded",
+    summary: "读取文档 https://example.com/wiki/one", responseSummary: "文档标题是测试方案",
+    messageCreateTime: Date.now()
+  });
   let prompt = "";
   const gateway = new Gateway(store, {
     createSession: async () => "session-one",
@@ -177,11 +183,30 @@ test("group requests still run when recent history cannot be loaded", async () =
     loadRecentHistory: async () => { throw new Error("missing scope"); }
   });
 
-  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "只处理当前请求" }));
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "你用的什么凭证", createTime: Date.now() + 10_000 }));
   await delay(30);
 
-  assert.equal(prompt, "只处理当前请求");
+  assert.match(prompt, /读取文档 https:\/\/example\.com\/wiki\/one/);
+  assert.match(prompt, /文档标题是测试方案/);
+  assert.match(prompt, /<current_request>\n你用的什么凭证/);
   assert.equal(store.listAuditLogs()[0].status, "succeeded");
+  store.close();
+});
+
+test("successful group execution records the final reply for later context fallback", async () => {
+  const store = new GatewayStore(":memory:");
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-one",
+    run: async () => ({ terminal: "idle" as const, messages: ["最终业务回复"] })
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "读取这个文档" }));
+  await delay(30);
+
+  assert.equal(store.listAuditLogs()[0].responseSummary, "最终业务回复");
   store.close();
 });
 

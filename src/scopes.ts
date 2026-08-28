@@ -15,6 +15,8 @@ const BOT_BASE_SCOPES = [
   "im:message.p2p_msg:readonly",
   "im:message.group_at_msg:readonly",
   "im:message.group_msg",
+  "im:chat:readonly",
+  "im:chat.members:read",
   "im:message.reactions:write_only",
   "im:message:update",
   "cardkit:card:write",

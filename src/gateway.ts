@@ -155,21 +155,22 @@ export class Gateway {
       if (this.options.platformAccess) this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
-        messageId: message.messageId, action: "reset_session", status: "succeeded"
+        messageId: message.messageId, action: "reset_session", status: "succeeded", messageCreateTime: message.createTime
       });
       return;
     }
     if (this.options.requiresAuthorization?.(message) && this.options.ensureAuthorization && !await this.options.ensureAuthorization(message)) return;
     let recentHistoryPromise: Promise<ChannelHistoryMessage[]> | undefined;
     if (this.options.loadRecentHistory && message.conversationType === "group") {
+      const fallbackHistory = this.recentAuditHistory(message);
       try {
-        recentHistoryPromise = this.options.loadRecentHistory(message).catch(error => {
-          console.warn("读取近期群聊上下文失败，将仅处理当前消息：", error instanceof Error ? error.message : error);
-          return [];
+        recentHistoryPromise = this.options.loadRecentHistory(message).then(history => history.length ? history : fallbackHistory).catch(error => {
+          console.warn("读取近期群聊上下文失败，将使用 Gateway 本地审计上下文：", error instanceof Error ? error.message : error);
+          return fallbackHistory;
         });
       } catch (error) {
-        console.warn("读取近期群聊上下文失败，将仅处理当前消息：", error instanceof Error ? error.message : error);
-        recentHistoryPromise = Promise.resolve([]);
+        console.warn("读取近期群聊上下文失败，将使用 Gateway 本地审计上下文：", error instanceof Error ? error.message : error);
+        recentHistoryPromise = Promise.resolve(fallbackHistory);
       }
     }
     await this.options.beforeCreateSession?.();
@@ -251,21 +252,24 @@ export class Gateway {
         result = await this.ark.run(sessionId, input, this.options.timeoutMs);
       }
       if (!result) throw new Error("流式回复结束，但 Agent Session 没有返回结果");
+      const finalReply = resultToReply(result);
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
-      if (!this.options.streamReply) await this.replyText(message, resultToReply(result));
+      if (!this.options.streamReply) await this.replyText(message, finalReply);
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
         sessionId, action: message.resources.length ? "file_message" : "message", status: "succeeded",
-        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.resources.length)
+        durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.resources.length),
+        responseSummary: summarizeResponse(finalReply), messageCreateTime: message.createTime
       });
     } catch (error) {
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
         sessionId, action: message.resources.length ? "file_message" : "message", status: "failed",
-        durationMs: Date.now() - startedAt, summary: error instanceof Error ? error.message.slice(0, 240) : "执行失败"
+        durationMs: Date.now() - startedAt, summary: error instanceof Error ? error.message.slice(0, 240) : "执行失败",
+        messageCreateTime: message.createTime
       });
       throw error;
     } finally {
@@ -295,6 +299,31 @@ export class Gateway {
 
   private replyText(message: IncomingMessage, text: string): Promise<void> {
     return this.reply(message, { type: "text", text });
+  }
+
+  private recentAuditHistory(message: IncomingMessage): ChannelHistoryMessage[] {
+    const history = this.store.listConversationAudit({
+      channelType: message.channelType,
+      installationId: message.installationId,
+      tenantKey: message.tenantId,
+      chatId: message.conversationId,
+      beforeCreateTime: message.createTime,
+      limit: 12
+    }).flatMap(log => {
+      const completedAt = Date.parse(log.createdAt) || Math.max(1, message.createTime - 1);
+      const actorAt = log.messageCreateTime || Math.max(1, completedAt - 1);
+      const history: ChannelHistoryMessage[] = [];
+      if (log.summary) history.push({
+        messageId: log.messageId, senderId: log.openId, senderType: "user", source: "chat",
+        text: log.summary, createTime: actorAt
+      });
+      if (log.responseSummary && completedAt < message.createTime) history.push({
+        messageId: `${log.messageId}:gateway-response`, senderId: message.installationId, senderType: "bot", source: "chat",
+        text: log.responseSummary, createTime: completedAt
+      });
+      return history;
+    }).sort((left, right) => left.createTime - right.createTime);
+    return trimConversationHistory(history, 8_000);
   }
 
   private defaultSessionEnvironment(message: IncomingMessage): Record<string, string> {
@@ -391,6 +420,23 @@ function safeContextJson(value: unknown): string {
 function summarizeInput(text: string, attachmentCount: number): string {
   const clean = text.replace(/\s+/g, " ").trim().slice(0, 160);
   return [clean, attachmentCount ? `${attachmentCount} 个附件` : ""].filter(Boolean).join(" · ") || "空消息";
+}
+
+function summarizeResponse(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 2_000);
+}
+
+function trimConversationHistory(history: ChannelHistoryMessage[], maxChars: number): ChannelHistoryMessage[] {
+  const selected: ChannelHistoryMessage[] = [];
+  let chars = 0;
+  for (let index = history.length - 1; index >= 0; index--) {
+    const item = history[index];
+    const size = Array.from(item.text).length;
+    if (selected.length && chars + size > maxChars) break;
+    selected.unshift(size <= maxChars ? item : { ...item, text: Array.from(item.text).slice(-maxChars).join("") });
+    chars += Math.min(size, maxChars);
+  }
+  return selected;
 }
 
 function safeFilename(value: string, index: number): string {

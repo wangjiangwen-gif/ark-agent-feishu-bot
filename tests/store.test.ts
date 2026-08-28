@@ -97,3 +97,31 @@ test("audit logs are newest first", () => {
   assert.equal(logs[0].openId, "user-2");
   store.close();
 });
+
+test("conversation audit keeps request and response summaries for history fallback", () => {
+  const store = new GatewayStore(":memory:");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-1", action: "message", status: "succeeded",
+    summary: "读取文档 https://example.com/wiki/one", responseSummary: "已使用 Bot 身份读取文档", messageCreateTime: 100
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-two", tenantKey: "tenant", openId: "user-2",
+    chatId: "chat", messageId: "message-2", action: "message", status: "succeeded", summary: "另一个应用"
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-3",
+    chatId: "chat", messageId: "message-future", action: "message", status: "succeeded",
+    summary: "未来消息", messageCreateTime: 300
+  });
+
+  const logs = store.listConversationAudit({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", chatId: "chat", beforeCreateTime: 200, limit: 10
+  });
+
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].summary, "读取文档 https://example.com/wiki/one");
+  assert.equal(logs[0].responseSummary, "已使用 Bot 身份读取文档");
+  assert.equal(logs[0].messageCreateTime, 100);
+  store.close();
+});

@@ -68,16 +68,22 @@ export class ArkClient {
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
-    const response = await this.fetcher(`${this.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-        ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
-        ...init.headers
-      },
-      signal: init.signal || AbortSignal.timeout(30_000)
-    });
+    const method = init.method || "GET";
+    let response: Response;
+    try {
+      response = await this.fetcher(`${this.baseUrl}${path}`, {
+        ...init,
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+          ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
+          ...init.headers
+        },
+        signal: init.signal || AbortSignal.timeout(30_000)
+      });
+    } catch (error) {
+      throw new Error(`方舟网络请求失败（${method} ${path}）：${networkErrorDetail(error)}`, { cause: error });
+    }
     if (!response.ok) {
       const requestId = response.headers.get("x-request-id");
       const body = await response.text();
@@ -400,6 +406,12 @@ export class ArkClient {
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
     return parseEventStream(response.body);
   }
+}
+
+function networkErrorDetail(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause instanceof Error ? error.cause.message : typeof error.cause === "string" ? error.cause : "";
+  return [error.message, cause].filter(Boolean).join("；").slice(0, 180);
 }
 
 function waitFor(ms: number, signal: AbortSignal): Promise<void> {

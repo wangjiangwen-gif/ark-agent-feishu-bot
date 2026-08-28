@@ -26,16 +26,19 @@ export const EMPLOYEE_AGENT_CONFIG: AgentConfig = {
 6. 单一查询或写入任务优先控制在两次 lark-cli 调用以内（一次读取 Skill、一次业务命令）；不得重复读取同一信息。
 
 执行飞书任务时：
-1. 当前 Session 已获管理员明确授权并配置为允许显式双身份。首次处理某业务域且本提示词未给出确定命令时，运行 lark-cli skills read <skill-name>，完整读取匹配的内置 Skill；同一 Session 已读取过该 Skill，或本提示词已经给出可直接使用的确定命令时，跳过重复读取。
+1. 当前 Session 已获管理员明确授权并配置为允许显式双身份。首次处理某业务域且本提示词未给出确定命令时，读取准确命名的内置 Skill：即时通信用 lark-cli skills read lark-im，Wiki 用 lark-cli skills read lark-wiki，云文档用 lark-cli skills read lark-doc，云空间用 lark-cli skills read lark-drive，日历用 lark-cli skills read lark-calendar。skills read 命令本身不得附加 --as。不要猜测 im、wiki、docx 等缩写 Skill 名。同一 Session 已读取过该 Skill，或本提示词已经给出可直接使用的确定命令时，跳过重复读取。
 2. 优先使用 lark-cli 的 +shortcut；没有合适 shortcut 时再查询 schema 后调用原生资源命令。
 3. 禁止运行 auth login、npx @larksuite/cli、重复安装 CLI 或联网探测版本。
 4. 默认所有飞书操作显式使用 --as bot。只有读取发起人的个人日程、忙闲或用于身份识别时，才允许显式使用 --as user；不得用用户身份执行写操作。
 5. 约日程时，先用 --as user 查询发起人的日程或忙闲，再用 --as bot 创建日程，并将 FEISHU_USER_OPEN_ID 作为参与人加入。若未注入用户凭证，不得猜测日程，直接说明需要用户授权。
 6. FEISHU_USER_OPEN_ID 是本次消息发起人的身份标识；只有同时存在用户凭证时才代表该用户已授权。
-7. 不读取、不打印、不写入任何 Token、App Secret 或其他凭证。
+7. 不读取、不打印、不写入任何 Token、App Secret 或其他凭证值。用户询问访问身份或凭证时，可以说明凭证类型和来源：Bot 身份使用应用的 tenant access token，用户身份使用当前发送者授权后注入的 user access token；不得因此拒绝回答，也不得展示实际值。
 8. lark-cli 标记为 high-risk-write 的操作必须先向用户确认，不得自动追加 --yes。
 9. 当前飞书位置通过 FEISHU_CHAT_ID、可选的 FEISHU_THREAD_ID 和 FEISHU_TRIGGER_MESSAGE_ID 注入。输入已包含近期会话快照时，不得再次读取相同范围；只有任务确实依赖更早记录时，普通群使用 lark-cli im +chat-messages-list --chat-id "$FEISHU_CHAT_ID" --as bot，话题使用 lark-cli im +threads-messages-list --thread "$FEISHU_THREAD_ID" --as bot。
-10. 完成后返回结果摘要和可访问的飞书链接。`,
+10. 已知的确定命令直接执行，不先读 Skill、不查看 help：查询当前群成员使用 lark-cli im +chat-members-list --chat-id "$FEISHU_CHAT_ID" --as bot --page-all；读取用户给出的 /wiki/ 或 /docx/ 链接使用 lark-cli docs +fetch --doc "<用户原始链接>" --as bot。参数报错或缺少权限时直接依据错误说明，不再运行 help、能力枚举或替代探测命令。
+11. 群成员是否能向你发消息、应用是否对其可见，可用范围由飞书平台的应用可用范围和事件投递决定；Gateway 不维护额外用户白名单。不要声称只服务 init 扫码者，也不要把“能收到消息”和“能访问某项飞书资源”混为一谈。
+12. 默认先用 Bot 身份访问团队资源；如果 Bot 已能读取用户分享的文档，不需要额外申请用户授权。只有任务确实依赖发起人的私有数据且 Bot 无权访问时，才说明需要对应的用户授权。
+13. 完成后返回结果摘要和可访问的飞书链接。`,
   tools: [{ type: "agent_toolset_20260701" }],
   skills: [],
   mcp_servers: [],
@@ -62,9 +65,22 @@ export async function runEmployeeInit(options: {
   const botScopes = resolveLarkBotScopes(DEFAULT_LARK_DOMAINS);
   const app = await options.createFeishuApp(botScopes, EMPLOYEE_CALENDAR_USER_SCOPES);
 
-  const vaultName = `ark-employee-${sanitizeName(agent.id)}-${sanitizeName(app.appId)}`.slice(0, 100);
-  let vault = (await ark.listVaults()).find(item => item.displayName === vaultName);
+  const vaultBaseName = `ark-employee-${sanitizeName(agent.id)}-${sanitizeName(app.appId)}`;
+  const vaultName = vaultBaseName.slice(0, 100);
+  const vaults = await ark.listVaults();
+  let vault = vaults.find(item => item.displayName === vaultName);
   if (!vault) vault = { id: await ark.createVault(vaultName), displayName: vaultName };
+  else {
+    const legacyCredentials = await ark.listCredentials(vault.id);
+    if (legacyCredentials.some(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN")) {
+      // 早期版本曾把短效 TAT 写入 Vault。lark-cli 会优先使用它，从而遮蔽仍然有效的
+      // App Secret，并在两小时后持续返回 Invalid access token。保留旧 Vault 供回滚，
+      // 新 init 改绑到只含 App Secret 的干净 Vault。
+      const cleanVaultName = `${vaultBaseName.slice(0, 86)}-app-secret-v2`;
+      vault = vaults.find(item => item.displayName === cleanVaultName)
+        || { id: await ark.createVault(cleanVaultName), displayName: cleanVaultName };
+    }
+  }
   const credentialName = "lark-cli-bot-app-secret";
   let credential = (await ark.listCredentials(vault.id)).find(item => item.displayName === credentialName && item.authType === "environment_variable" && item.secretName === "LARKSUITE_CLI_APP_SECRET");
   if (credential) await ark.updateEnvironmentCredential(vault.id, credential.id, app.appSecret);

@@ -2,6 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ArkClient, drainEventBuffer, eventProgress, eventText, resultFromEvents } from "../src/ark.ts";
 
+test("Ark network failures identify the failed API operation", async () => {
+  const client = new ArkClient("key", "https://ark.example.com", async () => {
+    throw new TypeError("fetch failed", { cause: new Error("ECONNRESET") });
+  });
+
+  await assert.rejects(client.getAgent("agent-one"), /方舟网络请求失败.*GET \/agents\/agent-one.*ECONNRESET/);
+});
+
 test("drainEventBuffer parses SSE frames split from network chunks", () => {
   const first = drainEventBuffer('data: {"type":"agent.message","id":"1"}\n\ndata: {"type":"session.');
   assert.equal(first.events.length, 1);

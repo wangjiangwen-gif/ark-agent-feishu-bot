@@ -13,6 +13,13 @@ test("employee prompt clarifies ambiguous requests before using tools", () => {
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /输入已包含近期会话快照时，不得再次读取相同范围/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /单一查询或写入任务优先控制在两次 lark-cli 调用以内/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /同一 Session 已读取过该 Skill.*跳过重复读取/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /lark-cli skills read lark-im/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /lark-cli skills read lark-wiki/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /lark-cli skills read lark-doc/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /lark-cli im \+chat-members-list --chat-id "\$FEISHU_CHAT_ID" --as bot/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /lark-cli docs \+fetch --doc/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /可用范围由飞书平台的应用可用范围和事件投递决定/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /可以说明凭证类型.*tenant access token/);
 });
 
 test("employee runtime never mutates the configured user Agent", async () => {
@@ -50,6 +57,39 @@ test("employee init creates bot credential without user OAuth", async () => {
     assert.match(config, /ARKAGENT_MODE="employee"/);
     assert.doesNotMatch(config, /FEISHU_ADMIN_OPEN_ID/);
     assert.doesNotMatch(config, /FEISHU_REFRESH_TOKEN/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("employee init replaces a legacy Vault whose expired tenant token shadows the App Secret", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "arkagent-employee-legacy-vault-"));
+  const createdVaults: string[] = [];
+  let credentialVault = "";
+  try {
+    const result = await runEmployeeInit({
+      askSecret: async () => "ark-secret",
+      createArk: () => ({
+        createAgent: async config => ({ id: "agent-employee", name: config.name }),
+        listEnvironments: async () => [], createEnvironment: async name => ({ id: "env-employee", name }),
+        listVaults: async () => [{ id: "vlt-legacy", displayName: "ark-employee-agent-employee-cli-employee" }],
+        createVault: async name => { createdVaults.push(name); return "vlt-clean"; },
+        listCredentials: async vaultId => vaultId === "vlt-legacy" ? [
+          { id: "vcrd-stale", displayName: "legacy-tat", authType: "environment_variable", secretName: "LARKSUITE_CLI_TENANT_ACCESS_TOKEN" },
+          { id: "vcrd-secret", displayName: "lark-cli-bot-app-secret", authType: "environment_variable", secretName: "LARKSUITE_CLI_APP_SECRET" }
+        ] : [],
+        createEnvironmentVariableCredential: async (vaultId) => { credentialVault = vaultId; return "vcrd-clean"; },
+        updateEnvironmentCredential: async () => undefined
+      }),
+      createFeishuApp: async () => ({ appId: "cli-employee", appSecret: "app-secret" }),
+      envPath: join(dir, "config.env"), gatewayDatabasePath: join(dir, "gateway.db")
+    });
+
+    assert.deepEqual(createdVaults, ["ark-employee-agent-employee-cli-employee-app-secret-v2"]);
+    assert.equal(credentialVault, "vlt-clean");
+    const config = await readFile(result.envPath, "utf8");
+    assert.match(config, /ARK_VAULT_ID="vlt-clean"/);
+    assert.match(config, /ARK_CREDENTIAL_ID="vcrd-clean"/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
