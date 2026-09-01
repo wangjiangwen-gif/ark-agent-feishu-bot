@@ -24,12 +24,13 @@ export type Reply = (message: IncomingMessage, outbound: ChannelOutbound) => Pro
 export class KeyedQueue {
   private tails = new Map<string, Promise<void>>();
 
-  enqueue(key: string, task: () => Promise<void>): void {
-    const previous = this.tails.get(key) || Promise.resolve();
-    const current = previous.catch(() => undefined).then(task).finally(() => {
+  enqueue(key: string, task: () => Promise<void>): boolean {
+    const previous = this.tails.get(key);
+    const current = (previous || Promise.resolve()).catch(() => undefined).then(task).finally(() => {
       if (this.tails.get(key) === current) this.tails.delete(key);
     });
     this.tails.set(key, current);
+    return Boolean(previous);
   }
 }
 
@@ -101,7 +102,24 @@ export class Gateway {
       void Promise.resolve().then(task);
       return;
     }
-    this.queue.enqueue(this.store.conversationKey(key), task);
+    let queuedReaction = Promise.resolve<string | undefined>(undefined);
+    const queued = this.queue.enqueue(this.store.conversationKey(key), async () => {
+      const reactionId = await queuedReaction;
+      if (reactionId && this.options.removeReaction) {
+        try { await this.options.removeReaction(message, reactionId); }
+        catch (error) { console.warn("移除排队中表情失败：", error instanceof Error ? error.message : error); }
+      }
+      await task();
+    });
+    if (
+      queued && message.conversationType === "group" && this.options.sharedGroupSessions
+      && this.options.addReaction && this.options.removeReaction
+    ) {
+      queuedReaction = this.options.addReaction(message, "OnIt").catch(error => {
+        console.warn("添加排队中表情失败，将直接等待执行：", error instanceof Error ? error.message : error);
+        return undefined;
+      });
+    }
   }
 
   private usesIsolatedSession(message: IncomingMessage): boolean {

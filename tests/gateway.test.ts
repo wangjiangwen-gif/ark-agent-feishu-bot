@@ -37,6 +37,7 @@ test("shared group mode queues users in one Session and never mounts user Vaults
   const store = new GatewayStore(":memory:");
   const started: string[] = [];
   const vaultLists: string[][] = [];
+  const reactions: string[] = [];
   let creates = 0;
   let releaseFirst: (() => void) | undefined;
   const gateway = new Gateway(store, {
@@ -52,7 +53,12 @@ test("shared group mode queues users in one Session and never mounts user Vaults
   }, async () => undefined, {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
     platformAccess: true, sharedGroupSessions: true,
-    getUserVaultIds: async () => ["vlt-user"]
+    getUserVaultIds: async () => ["vlt-user"],
+    addReaction: async (incoming, emoji) => {
+      reactions.push(`add:${incoming.messageId}:${emoji}`);
+      return `${emoji.toLowerCase()}-${incoming.messageId}`;
+    },
+    removeReaction: async (incoming, reactionId) => { reactions.push(`remove:${incoming.messageId}:${reactionId}`); }
   });
 
   gateway.accept(message({
@@ -66,11 +72,16 @@ test("shared group mode queues users in one Session and never mounts user Vaults
   await delay(20);
 
   assert.deepEqual(started, ["session-1:群任务 A"]);
+  assert.deepEqual([...reactions].sort(), ["add:message-a:Get", "add:message-b:OnIt"].sort());
   releaseFirst?.();
   await delay(30);
   assert.deepEqual(started, ["session-1:群任务 A", "session-1:群任务 B"]);
   assert.deepEqual(vaultLists, [["vlt-bot"]]);
   assert.equal(creates, 1);
+  assert.equal(reactions.length, 6);
+  assert.ok(reactions.indexOf("add:message-b:OnIt") < reactions.indexOf("remove:message-b:onit-message-b"));
+  assert.ok(reactions.indexOf("remove:message-b:onit-message-b") < reactions.indexOf("add:message-b:Get"));
+  assert.ok(reactions.indexOf("add:message-b:Get") < reactions.indexOf("remove:message-b:get-message-b"));
   store.close();
 });
 
@@ -78,6 +89,7 @@ test("shared group mode gives each thread its own reusable Session", async () =>
   const store = new GatewayStore(":memory:");
   let creates = 0;
   const runs: string[] = [];
+  const emojis: string[] = [];
   const gateway = new Gateway(store, {
     createSession: async () => `session-${++creates}`,
     run: async (sessionId, input) => {
@@ -86,16 +98,51 @@ test("shared group mode gives each thread its own reusable Session", async () =>
     }
   }, async () => undefined, {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
-    platformAccess: true, sharedGroupSessions: true
+    platformAccess: true, sharedGroupSessions: true,
+    addReaction: async (_incoming, emoji) => { emojis.push(emoji); return `reaction-${emojis.length}`; },
+    removeReaction: async () => undefined
   });
 
   gateway.accept(message({ eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true, threadId: "omt-a", senderId: "ou-a", text: "A1" }));
   gateway.accept(message({ eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true, threadId: "omt-b", senderId: "ou-b", text: "B1" }));
+  await delay(30);
+  assert.equal(emojis.includes("OnIt"), false);
   gateway.accept(message({ eventId: "event-c", messageId: "message-c", conversationType: "group", mentionedBot: true, threadId: "omt-a", senderId: "ou-c", text: "A2" }));
-  await delay(50);
+  await delay(30);
 
   assert.equal(creates, 2);
   assert.deepEqual(runs, ["session-1:A1", "session-2:B1", "session-1:A2"]);
+  store.close();
+});
+
+test("queued group requests still execute when the OnIt reaction fails", async () => {
+  const store = new GatewayStore(":memory:");
+  const started: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async (_sessionId, input) => {
+      started.push(input);
+      if (input === "A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    addReaction: async (_incoming, emoji) => {
+      if (emoji === "OnIt") throw new Error("reaction unavailable");
+      return "get-reaction";
+    },
+    removeReaction: async () => undefined
+  });
+
+  gateway.accept(message({ eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true, text: "A" }));
+  gateway.accept(message({ eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true, text: "B" }));
+  await delay(20);
+  releaseFirst?.();
+  await delay(30);
+
+  assert.deepEqual(started, ["A", "B"]);
   store.close();
 });
 
