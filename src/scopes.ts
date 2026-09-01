@@ -22,6 +22,7 @@ const BOT_BASE_SCOPES = [
   "cardkit:card:write",
   "cardkit:card:read",
   "calendar:calendar",
+  "calendar:calendar.free_busy:read",
   "calendar:calendar.event:create",
   "calendar:calendar.event:read"
 ];

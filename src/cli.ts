@@ -97,8 +97,13 @@ async function runEmployee(): Promise<void> {
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     ensureAuthorization: (message, request) => auth.ensure(message, request),
-    getUserVaultIds: message => auth.vaultIds(message), beforeCreateSession: ensureBotToken, dualIdentity: true,
-    perMessageSessions: true, loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([])
+    getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
+    beforeCreateSession: ensureBotToken, dualIdentity: true, sharedGroupSessions: true,
+    sessionEnvironment: message => ({
+      FEISHU_IDENTITY_MODE: message.conversationType === "group" ? "bot_only" : "bot_with_user_oauth",
+      LARKSUITE_CLI_STRICT_MODE: message.conversationType === "group" ? "on" : "off"
+    }),
+    loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([])
   });
   const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName });
   console.log("数字员工配置：");

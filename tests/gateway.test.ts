@@ -22,11 +22,80 @@ test("group messages require an explicit bot mention", () => {
   assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: true })), true);
 });
 
-test("group conversations are isolated by the sender open_id", () => {
+test("shared group conversations ignore sender but keep threads isolated", () => {
   const first = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-1" });
   const second = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-2" });
+  const thread = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-2", threadId: "omt-one" });
   const store = new GatewayStore(":memory:");
   assert.notEqual(store.conversationKey(toConversationKey(first)), store.conversationKey(toConversationKey(second)));
+  assert.equal(store.conversationKey(toConversationKey(first, true)), store.conversationKey(toConversationKey(second, true)));
+  assert.notEqual(store.conversationKey(toConversationKey(first, true)), store.conversationKey(toConversationKey(thread, true)));
+  store.close();
+});
+
+test("shared group mode queues users in one Session and never mounts user Vaults", async () => {
+  const store = new GatewayStore(":memory:");
+  const started: string[] = [];
+  const vaultLists: string[][] = [];
+  let creates = 0;
+  let releaseFirst: (() => void) | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async (_agentId, _environmentId, vaultIds) => {
+      vaultLists.push(vaultIds);
+      return `session-${++creates}`;
+    },
+    run: async (sessionId, input) => {
+      started.push(`${sessionId}:${input}`);
+      if (input === "群任务 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      return { terminal: "idle" as const, messages: [`${input} 完成`] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    getUserVaultIds: async () => ["vlt-user"]
+  });
+
+  gateway.accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    senderId: "ou-a", text: "群任务 A"
+  }));
+  gateway.accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    senderId: "ou-b", text: "群任务 B"
+  }));
+  await delay(20);
+
+  assert.deepEqual(started, ["session-1:群任务 A"]);
+  releaseFirst?.();
+  await delay(30);
+  assert.deepEqual(started, ["session-1:群任务 A", "session-1:群任务 B"]);
+  assert.deepEqual(vaultLists, [["vlt-bot"]]);
+  assert.equal(creates, 1);
+  store.close();
+});
+
+test("shared group mode gives each thread its own reusable Session", async () => {
+  const store = new GatewayStore(":memory:");
+  let creates = 0;
+  const runs: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => `session-${++creates}`,
+    run: async (sessionId, input) => {
+      runs.push(`${sessionId}:${input}`);
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true
+  });
+
+  gateway.accept(message({ eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true, threadId: "omt-a", senderId: "ou-a", text: "A1" }));
+  gateway.accept(message({ eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true, threadId: "omt-b", senderId: "ou-b", text: "B1" }));
+  gateway.accept(message({ eventId: "event-c", messageId: "message-c", conversationType: "group", mentionedBot: true, threadId: "omt-a", senderId: "ou-c", text: "A2" }));
+  await delay(50);
+
+  assert.equal(creates, 2);
+  assert.deepEqual(runs, ["session-1:A1", "session-2:B1", "session-1:A2"]);
   store.close();
 });
 
@@ -128,6 +197,7 @@ test("per-message group Session receives bounded history and current channel ide
   assert.match(prompt, /<current_request>\n帮大家约一下/);
   assert.deepEqual(sessionEnv, {
     FEISHU_USER_OPEN_ID: "ou-b",
+    FEISHU_CONVERSATION_TYPE: "group",
     FEISHU_CHAT_ID: "chat-1",
     FEISHU_THREAD_ID: "omt-one",
     FEISHU_TRIGGER_MESSAGE_ID: "message-1",
@@ -239,6 +309,31 @@ test("group token_missing suppresses the Agent error and retries in a new author
   store.close();
 });
 
+test("shared group mode never starts user OAuth when the Agent requests UAT", async () => {
+  const store = new GatewayStore(":memory:");
+  const replies: string[] = [];
+  let authorizationCalls = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async () => ({
+      terminal: "idle" as const, messages: ["缺少用户凭证"],
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+    })
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    ensureAuthorization: async () => { authorizationCalls++; return true; }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "查询我的私人日程" }));
+  await delay(40);
+
+  assert.equal(authorizationCalls, 0);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /群聊场景仅使用 Bot 身份/);
+  store.close();
+});
+
 test("repeated token_missing stops after one automatic authorization retry", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
@@ -315,6 +410,7 @@ test("gateway creates a session bound to the user Vault", async () => {
   assert.deepEqual(sessionVaultIds, ["vlt-1"]);
   assert.deepEqual(sessionEnv, {
     FEISHU_USER_OPEN_ID: "ou-current-user",
+    FEISHU_CONVERSATION_TYPE: "direct",
     LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
     LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
   });

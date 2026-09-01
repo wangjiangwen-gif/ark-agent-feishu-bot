@@ -58,7 +58,7 @@ export class Gateway {
     if (!shouldHandleMessage(message)) return false;
     // 飞书可能为同一条消息重复投递不同 event_id；message_id 才是业务幂等键。
     if (!this.store.claimEvent(message.channelType, message.installationId, message.messageId)) return false;
-    const key = toConversationKey(message);
+    const key = this.conversationKey(message);
     this.schedule(message, key, async () => {
       try {
         await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
@@ -73,7 +73,7 @@ export class Gateway {
   }
 
   resume(message: IncomingMessage): void {
-    const key = toConversationKey(message);
+    const key = this.conversationKey(message);
     this.schedule(message, key, async () => {
       try { await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction)); }
       catch (error) { await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
@@ -81,7 +81,7 @@ export class Gateway {
   }
 
   resumeWithHandoff(message: IncomingMessage): void {
-    const key = toConversationKey(message);
+    const key = this.conversationKey(message);
     this.schedule(message, key, async () => {
       try {
         await this.withReaction(message, async hasReaction => {
@@ -106,6 +106,10 @@ export class Gateway {
 
   private usesIsolatedSession(message: IncomingMessage): boolean {
     return Boolean(this.options.perMessageSessions && message.conversationType === "group");
+  }
+
+  private conversationKey(message: IncomingMessage): ConversationKey {
+    return toConversationKey(message, Boolean(this.options.sharedGroupSessions));
   }
 
   private async withReaction(message: IncomingMessage, task: (hasReaction: boolean) => Promise<void>): Promise<void> {
@@ -195,7 +199,11 @@ export class Gateway {
       }
     }
     if (!sessionId) {
-      const extraVaultIds = await this.options.getUserVaultIds?.(message) || [];
+      // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
+      // 用户凭证只允许进入按发送者隔离的单聊 Session。
+      const extraVaultIds = message.conversationType === "group" && this.options.sharedGroupSessions
+        ? []
+        : await this.options.getUserVaultIds?.(message) || [];
       sessionId = await this.ark.createSession(
         this.options.agentId,
         this.options.environmentId,
@@ -291,6 +299,9 @@ export class Gateway {
     startedAt: number,
     request: UserAuthorizationRequired
   ): Promise<void> {
+    if (message.conversationType === "group" && this.options.sharedGroupSessions) {
+      throw new Error("群聊场景仅使用 Bot 身份，不能挂载或申请个人用户凭证；请改用 Bot 可访问的群级能力，或私聊数字员工完成需要个人身份的操作");
+    }
     const retryKey = this.authorizationRetryKey(message);
     if (this.authorizationRetries.has(retryKey)) {
       throw new Error("授权后仍未获得用户凭证，请重新授权或联系管理员检查用户 Vault");
@@ -367,6 +378,7 @@ export class Gateway {
     if (message.channelType !== "lark") return {};
     return {
       FEISHU_USER_OPEN_ID: message.senderId,
+      FEISHU_CONVERSATION_TYPE: message.conversationType,
       ...(this.options.platformAccess ? {
         FEISHU_CHAT_ID: message.conversationId,
         ...(message.threadId ? { FEISHU_THREAD_ID: message.threadId } : {}),
@@ -404,6 +416,7 @@ export type GatewayOptions = {
   ensureAuthorization?: (message: IncomingMessage, request: UserAuthorizationRequired) => Promise<boolean>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   perMessageSessions?: boolean;
+  sharedGroupSessions?: boolean;
   loadRecentHistory?: (message: IncomingMessage) => Promise<ChannelHistoryMessage[]>;
   dualIdentity?: boolean;
   sessionEnvironment?: (message: IncomingMessage) => Record<string, string>;
@@ -488,14 +501,14 @@ function sessionVisibleFilePath(mountPath: string): string {
   return `${SESSION_UPLOAD_ROOT}/${mountPath.replace(/^\/+/, "")}`;
 }
 
-export function toConversationKey(message: IncomingMessage): ConversationKey {
+export function toConversationKey(message: IncomingMessage, sharedGroupSessions = false): ConversationKey {
   return {
     channelType: message.channelType,
     installationId: message.installationId,
     tenantId: message.tenantId,
     conversationId: message.conversationId,
     threadId: message.threadId,
-    senderId: message.senderId
+    senderId: sharedGroupSessions && message.conversationType === "group" ? "" : message.senderId
   };
 }
 
