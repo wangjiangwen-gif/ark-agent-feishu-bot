@@ -310,6 +310,79 @@ test("group history falls back to prior Gateway requests and replies when Feishu
   store.close();
 });
 
+test("shared group Session injects a full snapshot once and only new group messages afterwards", async () => {
+  const store = new GatewayStore(":memory:");
+  const prompts: string[] = [];
+  let history = [
+    { messageId: "before-first", senderId: "ou-a", senderType: "user" as const, source: "chat" as const, text: "第一次请求前的背景", createTime: 100 }
+  ];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async (_sessionId, input) => { prompts.push(input); return { terminal: "idle" as const, messages: ["完成"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    loadRecentHistory: async () => history
+  });
+
+  gateway.accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    senderId: "ou-a", text: "第一次请求", createTime: 200
+  }));
+  await delay(30);
+
+  history = [
+    ...history,
+    { messageId: "between", senderId: "ou-b", senderType: "user" as const, source: "chat" as const, text: "两次请求之间的新消息", createTime: 250 }
+  ];
+  gateway.accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    senderId: "ou-b", text: "第二次请求", createTime: 300
+  }));
+  await delay(30);
+
+  assert.match(prompts[0], /第一次请求前的背景/);
+  assert.match(prompts[0], /<current_request>\n第一次请求/);
+  assert.doesNotMatch(prompts[1], /第一次请求前的背景/);
+  assert.match(prompts[1], /两次请求之间的新消息/);
+  assert.match(prompts[1], /<current_request>\n第二次请求/);
+  store.close();
+});
+
+test("shared group context cursor survives a Gateway restart", async () => {
+  const store = new GatewayStore(":memory:");
+  const firstPrompts: string[] = [];
+  const history = [
+    { messageId: "old", senderId: "ou-a", senderType: "user" as const, source: "chat" as const, text: "旧背景不应重复", createTime: 100 },
+    { messageId: "new", senderId: "ou-b", senderType: "user" as const, source: "chat" as const, text: "重启后的新增消息", createTime: 250 }
+  ];
+  const createGateway = (prompts: string[]) => new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async (_sessionId, input) => { prompts.push(input); return { terminal: "idle" as const, messages: ["完成"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    loadRecentHistory: async () => history
+  });
+
+  createGateway(firstPrompts).accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    text: "第一次请求", createTime: 200
+  }));
+  await delay(30);
+
+  const restartedPrompts: string[] = [];
+  createGateway(restartedPrompts).accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    text: "重启后请求", createTime: 300
+  }));
+  await delay(30);
+
+  assert.doesNotMatch(restartedPrompts[0], /旧背景不应重复/);
+  assert.match(restartedPrompts[0], /重启后的新增消息/);
+  store.close();
+});
+
 test("successful group execution records the final reply for later context fallback", async () => {
   const store = new GatewayStore(":memory:");
   const gateway = new Gateway(store, {

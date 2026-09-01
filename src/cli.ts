@@ -101,7 +101,7 @@ async function runEmployee(): Promise<void> {
     beforeCreateSession: ensureBotToken, dualIdentity: true, sharedGroupSessions: true,
     sessionEnvironment: message => ({
       FEISHU_IDENTITY_MODE: message.conversationType === "group" ? "bot_only" : "bot_with_user_oauth",
-      LARKSUITE_CLI_STRICT_MODE: message.conversationType === "group" ? "on" : "off"
+      LARKSUITE_CLI_STRICT_MODE: message.conversationType === "group" ? "bot" : "off"
     }),
     loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([])
   });

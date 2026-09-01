@@ -77,6 +77,23 @@ test("store resets every session without clearing event deduplication", () => {
   store.close();
 });
 
+test("group context cursors are session-bound, monotonic and cleared with the session", () => {
+  const store = new GatewayStore(":memory:");
+  store.saveSession(key, "session-1", "agent-1");
+  store.saveConversationContextCursor(key, "session-1", 200);
+  store.saveConversationContextCursor(key, "session-1", 100);
+  assert.equal(store.getConversationContextCursor(key, "session-1"), 200);
+
+  store.saveSession(key, "session-2", "agent-1");
+  store.saveConversationContextCursor(key, "session-2", 50);
+  assert.equal(store.getConversationContextCursor(key, "session-1"), undefined);
+  assert.equal(store.getConversationContextCursor(key, "session-2"), 50);
+
+  store.resetSession(key);
+  assert.equal(store.getConversationContextCursor(key, "session-2"), undefined);
+  store.close();
+});
+
 test("employee users are observed with first, latest and usage count", () => {
   const store = new GatewayStore(":memory:");
   const first = store.observeEmployeeUser("tenant", "user-1");

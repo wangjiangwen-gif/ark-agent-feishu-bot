@@ -36,7 +36,7 @@ test("employee runtime never mutates the configured user Agent", async () => {
   assert.match(runtime, /sharedGroupSessions: true/);
   assert.match(runtime, /message\.conversationType === "direct" \? auth\.vaultIds\(message\) : Promise\.resolve\(\[\]\)/);
   assert.match(runtime, /FEISHU_IDENTITY_MODE: message\.conversationType === "group" \? "bot_only" : "bot_with_user_oauth"/);
-  assert.match(runtime, /LARKSUITE_CLI_STRICT_MODE: message\.conversationType === "group" \? "on" : "off"/);
+  assert.match(runtime, /LARKSUITE_CLI_STRICT_MODE: message\.conversationType === "group" \? "bot" : "off"/);
 });
 
 test("employee init creates bot credential without user OAuth", async () => {

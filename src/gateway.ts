@@ -199,6 +199,7 @@ export class Gateway {
     const startedAt = Date.now();
     const reusableSession = !this.usesIsolatedSession(message);
     let sessionId = reusableSession ? this.store.getSession(key) : undefined;
+    let createdSession = false;
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
     if (!hasReaction) {
@@ -228,6 +229,7 @@ export class Gateway {
         [this.options.vaultId, ...extraVaultIds],
         { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
       );
+      createdSession = true;
       if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId);
     }
     let input = message.text;
@@ -262,7 +264,11 @@ export class Gateway {
         input = sections.join("\n\n");
       }
       if (recentHistoryPromise) {
-        const history = await recentHistoryPromise;
+        let history = await recentHistoryPromise;
+        if (message.conversationType === "group" && this.options.sharedGroupSessions && !createdSession) {
+          const cursor = this.store.getConversationContextCursor(key, sessionId);
+          if (cursor !== undefined) history = history.filter(item => item.createTime > cursor);
+        }
         if (history.length) input = buildConversationContextInput(message, history, input);
       }
       if (handoff) input = buildHandoffInput(handoff, input);
@@ -279,6 +285,9 @@ export class Gateway {
         result = await this.ark.run(sessionId, input, this.options.timeoutMs);
       }
       if (!result) throw new Error("流式回复结束，但 Agent Session 没有返回结果");
+      if (message.conversationType === "group" && this.options.sharedGroupSessions) {
+        this.store.saveConversationContextCursor(key, sessionId, message.createTime);
+      }
       if (result.authorizationRequired) {
         if (progressTimer) clearTimeout(progressTimer);
         await progressReply;

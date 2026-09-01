@@ -64,6 +64,11 @@ export class GatewayStore {
         status TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS conversation_context_cursors (
+        conversation_key TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        message_create_time INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS employee_users (
         tenant_key TEXT NOT NULL,
         open_id TEXT NOT NULL,
@@ -139,13 +144,42 @@ export class GatewayStore {
     `).run(this.conversationKey(key), sessionId, agentId, agentVersion || null, new Date().toISOString());
   }
 
+  getConversationContextCursor(key: ConversationKey, sessionId: string): number | undefined {
+    const row = this.db.prepare(`
+      SELECT message_create_time FROM conversation_context_cursors
+      WHERE conversation_key = ? AND session_id = ?
+    `).get(this.conversationKey(key), sessionId) as { message_create_time: number } | undefined;
+    return row ? Number(row.message_create_time) : undefined;
+  }
+
+  saveConversationContextCursor(key: ConversationKey, sessionId: string, messageCreateTime: number): void {
+    this.db.prepare(`
+      INSERT INTO conversation_context_cursors (conversation_key, session_id, message_create_time)
+      VALUES (?, ?, ?)
+      ON CONFLICT(conversation_key) DO UPDATE SET
+        session_id = excluded.session_id,
+        message_create_time = CASE
+          WHEN conversation_context_cursors.session_id = excluded.session_id
+          THEN MAX(conversation_context_cursors.message_create_time, excluded.message_create_time)
+          ELSE excluded.message_create_time
+        END
+    `).run(this.conversationKey(key), sessionId, messageCreateTime);
+  }
+
   resetSession(key: ConversationKey): void {
-    this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(this.conversationKey(key));
-    if (key.channelType === "lark") this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(this.legacyConversationKey(key));
+    const conversationKey = this.conversationKey(key);
+    this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(conversationKey);
+    this.db.prepare("DELETE FROM conversation_context_cursors WHERE conversation_key = ?").run(conversationKey);
+    if (key.channelType === "lark") {
+      const legacyKey = this.legacyConversationKey(key);
+      this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(legacyKey);
+      this.db.prepare("DELETE FROM conversation_context_cursors WHERE conversation_key = ?").run(legacyKey);
+    }
   }
 
   resetAllSessions(): number {
     const result = this.db.prepare("DELETE FROM conversations").run();
+    this.db.prepare("DELETE FROM conversation_context_cursors").run();
     return Number(result.changes);
   }
 
