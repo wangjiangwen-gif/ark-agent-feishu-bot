@@ -149,7 +149,7 @@ test("Ark createSession preserves the complete native Session request", async ()
     resources: [
       { type: "file", file_id: "file-1", mount_path: "/mnt/data/a.pdf" },
       { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
-      { type: "tos", tos_bucket: "bucket-1", tos_key: "inputs/a.csv", tos_region: "cn-beijing", mount_path: "/mnt/data/a.csv" }
+      { type: "tos", tos_bucket: "bucket-1", tos_key: "inputs/a/", tos_region: "cn-beijing", mount_path: "/mnt/data/a" }
     ],
     vault_ids: ["vlt-1", "vlt-2"],
     title: "飞书任务",

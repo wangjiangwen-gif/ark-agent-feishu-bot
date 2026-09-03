@@ -875,7 +875,7 @@ test("gateway lets a Session builder preserve native options and adds initial at
       tags: [{ key: "source", value: "lark" }],
       resources: [
         { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
-        { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context.json", mount_path: "/mnt/data/context.json" },
+        { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context/", mount_path: "/mnt/data/context" },
         ...(draft.resources || [])
       ],
       future_session_field: "kept"
@@ -891,7 +891,7 @@ test("gateway lets a Session builder preserve native options and adds initial at
   assert.equal(createRequest.future_session_field, "kept");
   assert.deepEqual(createRequest.resources, [
     { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
-    { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context.json", mount_path: "/mnt/data/context.json" },
+    { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context/", mount_path: "/mnt/data/context" },
     { type: "file", file_id: "file-1", mount_path: "/mnt/data/报告.pdf" }
   ]);
   store.close();

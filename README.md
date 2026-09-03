@@ -301,7 +301,13 @@ const request: SessionCreateRequest = {
   },
   resources: [
     { type: "memory_store", memory_store_id: "mem-xxx", access: "read_write" },
-    { type: "tos", tos_bucket: "employee-input", tos_key: "seed/context.json", mount_path: "/mnt/data/context.json" }
+    {
+      type: "tos",
+      tos_bucket: "employee-input",
+      tos_key: "seed/context/",
+      tos_region: "cn-beijing",
+      mount_path: "/mnt/data/context"
+    }
   ],
   vault_ids: ["vlt-xxx"],
   title: "飞书任务",
@@ -312,6 +318,8 @@ const sessionId = await ark.createSession(request);
 ```
 
 Gateway 的 `buildSessionRequest(message, draft)` 可在每次真正创建新 Session 前调整完整请求。默认 Agent、Environment、飞书上下文环境变量和身份隔离策略已经写入 `draft`；回调应在此基础上合并业务所需的 Agent 版本、Memory Store、TOS、title、tags 或未来新增字段。新 Session 收到的非文本附件会先上传到 Ark Files，并合并进同一次创建请求的 `resources`；已有 Session 则通过通用会话资源接口追加。
+
+当前线上 TOS resource 按目录挂载：`tos_key` 必须是已存在且以 `/` 结尾的前缀，`mount_path` 是沙箱内的只读目录；Bucket 必须与 Managed Agents 服务同地域。Environment 的产物 TOS 同样要求 Bucket、Prefix 已存在且方舟服务角色拥有读写权限。
 
 ## Docker
 
