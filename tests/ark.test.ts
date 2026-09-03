@@ -131,6 +131,53 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
   assert.equal(calls.at(-1)?.body?.environment_id, undefined);
 });
 
+test("Ark createSession preserves the complete native Session request", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new ArkClient("key", "https://ark.example/api/v3", async (_url, init) => {
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ id: "sesn-native" }), { status: 200 });
+  });
+  const request = {
+    agent: {
+      id: "agent-1", type: "agent_with_overrides", version: 7,
+      system: "本次会话提示词", skills: [], tools: [], future_agent_field: { enabled: true }
+    },
+    environment: {
+      id: "env-1", type: "environment_with_overrides",
+      config: { type: "cloud", tos: {}, future_environment_field: "kept" }
+    },
+    resources: [
+      { type: "file", file_id: "file-1", mount_path: "/mnt/data/a.pdf" },
+      { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
+      { type: "tos", tos_bucket: "bucket-1", tos_key: "inputs/a.csv", tos_region: "cn-beijing", mount_path: "/mnt/data/a.csv" }
+    ],
+    vault_ids: ["vlt-1", "vlt-2"],
+    title: "飞书任务",
+    tags: [{ key: "channel", value: "lark" }],
+    future_session_field: { mode: "preview" }
+  };
+
+  assert.equal(await client.createSession(request), "sesn-native");
+  assert.deepEqual(body, request);
+  assert.deepEqual((body.environment as { config: { tos: object } }).config.tos, {});
+  assert.deepEqual((body.agent as { skills: unknown[] }).skills, []);
+});
+
+test("Ark createSession rejects ambiguous Environment selection before sending", async () => {
+  let calls = 0;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async () => {
+    calls++;
+    return new Response(JSON.stringify({ id: "never" }), { status: 200 });
+  });
+
+  await assert.rejects(client.createSession({
+    agent: "agent-1",
+    environment_id: "env-1",
+    environment: { id: "env-1", type: "environment_with_overrides", config: { type: "cloud" } }
+  }), /environment 与 environment_id 必须且只能传一个/);
+  assert.equal(calls, 0);
+});
+
 test("Ark creates an office Agent with the requested tools and system prompt", async () => {
   let body: Record<string, unknown> = {};
   const client = new ArkClient("key", "https://ark.example/api/v3", async (_url, init) => {
@@ -249,7 +296,7 @@ test("getSessionStats reports event count and latest model input tokens", async 
   assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611 });
 });
 
-test("Ark uploads a file and mounts it read-only in a Session", async () => {
+test("Ark uploads a file and mounts it in a Session", async () => {
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
   const client = new ArkClient("key", "https://ark.example/api/v3", async (url, init) => {
     const path = String(url).replace("https://ark.example/api/v3", "");
@@ -264,6 +311,6 @@ test("Ark uploads a file and mounts it read-only in a Session", async () => {
   assert.ok(calls[0].body instanceof FormData);
   assert.equal((calls[0].body as FormData).get("purpose"), "user_data");
   assert.deepEqual(JSON.parse(String(calls[1].body)), {
-    type: "file", file_id: "file-1", access: "read_only", mount_path: "/mnt/data/report.pdf"
+    type: "file", file_id: "file-1", mount_path: "/mnt/data/report.pdf"
   });
 });

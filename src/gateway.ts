@@ -1,4 +1,6 @@
-import type { ArkClient, RunResult, UserAuthorizationRequired } from "./ark.ts";
+import type {
+  ArkClient, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, UserAuthorizationRequired
+} from "./ark.ts";
 import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound } from "./channel.ts";
 import type { ConversationKey, GatewayStore } from "./store.ts";
 
@@ -39,13 +41,17 @@ export class Gateway {
   private sessionStatsCheckedAt = new Map<string, number>();
   private authorizationRetries = new Set<string>();
   private store: GatewayStore;
-  private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>;
+  private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
+    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats"
+  >>;
   private reply: Reply;
   private options: GatewayOptions;
 
   constructor(
     store: GatewayStore,
-    ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<ArkClient, "uploadFile" | "addSessionFile" | "getSessionStats">>,
+    ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
+      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats"
+    >>,
     reply: Reply,
     options: GatewayOptions
   ) {
@@ -209,35 +215,13 @@ export class Gateway {
         });
       }, this.options.progressDelayMs ?? 2_500);
     }
-    if (sessionId) {
-      if (await this.shouldRotateSession(sessionId)) {
-        handoff ||= await this.createSessionHandoff(key);
-        this.store.resetSession(key);
-        this.sessionStatsCheckedAt.delete(sessionId);
-        sessionId = undefined;
-      }
-    }
-    if (!sessionId) {
-      // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
-      // 用户凭证只允许进入按发送者隔离的单聊 Session。
-      const extraVaultIds = message.conversationType === "group" && this.options.sharedGroupSessions
-        ? []
-        : await this.options.getUserVaultIds?.(message) || [];
-      sessionId = await this.ark.createSession(
-        this.options.agentId,
-        this.options.environmentId,
-        [this.options.vaultId, ...extraVaultIds],
-        { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
-      );
-      createdSession = true;
-      if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId);
-    }
     let input = message.text;
     try {
+      const initialResources: SessionResource[] = [];
+      const mounted: string[] = [];
+      const inlineTexts: Array<{ name: string; text: string }> = [];
       if (message.resources.length) {
-        if (!this.options.downloadAttachment || !this.ark.uploadFile || !this.ark.addSessionFile) throw new Error("当前 Gateway 未配置文件处理能力");
-        const mounted: string[] = [];
-        const inlineTexts: Array<{ name: string; text: string }> = [];
+        if (!this.options.downloadAttachment) throw new Error("当前 Gateway 未配置附件下载能力");
         for (const [index, attachment] of message.resources.entries()) {
           const downloaded = await this.options.downloadAttachment(attachment, message);
           const name = safeFilename(attachment.name, index);
@@ -249,9 +233,10 @@ export class Gateway {
             inlineTexts.push({ name, text });
             continue;
           }
+          if (!this.ark.uploadFile) throw new Error("当前 Gateway 未配置方舟文件上传能力");
           const file = await this.ark.uploadFile(name, downloaded.mimeType, downloaded.bytes);
           const mountPath = `/mnt/data/${name}`;
-          await this.ark.addSessionFile(sessionId, file.id, mountPath);
+          initialResources.push({ type: "file", file_id: file.id, mount_path: mountPath });
           mounted.push(sessionVisibleFilePath(mountPath));
         }
         const instruction = message.text.trim() || "请读取并总结用户发送的文件；说明文件的主要内容、关键信息和需要用户关注的事项。";
@@ -263,6 +248,31 @@ export class Gateway {
         ].join("\n")).join("\n\n"));
         input = sections.join("\n\n");
       }
+
+      if (sessionId && await this.shouldRotateSession(sessionId)) {
+        handoff ||= await this.createSessionHandoff(key);
+        this.store.resetSession(key);
+        this.sessionStatsCheckedAt.delete(sessionId);
+        sessionId = undefined;
+      }
+      if (!sessionId) {
+        // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
+        // 用户凭证只允许进入按发送者隔离的单聊 Session。
+        const extraVaultIds = message.conversationType === "group" && this.options.sharedGroupSessions
+          ? []
+          : await this.options.getUserVaultIds?.(message) || [];
+        const request = await this.buildSessionCreateRequest(
+          message,
+          [this.options.vaultId, ...extraVaultIds],
+          initialResources
+        );
+        sessionId = await this.ark.createSession(request);
+        createdSession = true;
+        if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId);
+      } else if (initialResources.length) {
+        for (const resource of initialResources) await this.addSessionResource(sessionId, resource);
+      }
+
       if (recentHistoryPromise) {
         let history = await recentHistoryPromise;
         if (message.conversationType === "group" && this.options.sharedGroupSessions && !createdSession) {
@@ -401,6 +411,42 @@ export class Gateway {
     return trimConversationHistory(history, 8_000);
   }
 
+  private async buildSessionCreateRequest(
+    message: IncomingMessage,
+    vaultIds: string[],
+    initialResources: SessionResource[]
+  ): Promise<SessionCreateRequest> {
+    const defaults: SessionCreateDefaults = {
+      agentId: this.options.agentId,
+      environmentId: this.options.environmentId,
+      vaultIds,
+      envOverrides: { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
+    };
+    const base = this.ark.buildSessionCreateRequest
+      ? await this.ark.buildSessionCreateRequest(defaults)
+      : fallbackSessionCreateRequest(defaults);
+    const draft = initialResources.length ? {
+      ...base,
+      resources: [...(base.resources || []), ...initialResources]
+    } : base;
+    if (!this.options.buildSessionRequest) return draft;
+    const request = await this.options.buildSessionRequest(message, structuredClone(draft));
+    if (!request || typeof request !== "object") throw new Error("buildSessionRequest 必须返回 Session Create 请求对象");
+    return request;
+  }
+
+  private async addSessionResource(sessionId: string, resource: SessionResource): Promise<void> {
+    if (this.ark.addSessionResource) {
+      await this.ark.addSessionResource(sessionId, resource);
+      return;
+    }
+    if (resource.type === "file" && this.ark.addSessionFile && typeof resource.file_id === "string") {
+      await this.ark.addSessionFile(sessionId, resource.file_id, String(resource.mount_path || ""));
+      return;
+    }
+    throw new Error(`当前 Gateway 不支持向已有 Session 追加 ${resource.type} 资源`);
+  }
+
   private defaultSessionEnvironment(message: IncomingMessage): Record<string, string> {
     if (message.channelType !== "lark") return {};
     return {
@@ -447,8 +493,25 @@ export type GatewayOptions = {
   loadRecentHistory?: (message: IncomingMessage) => Promise<ChannelHistoryMessage[]>;
   dualIdentity?: boolean;
   sessionEnvironment?: (message: IncomingMessage) => Record<string, string>;
+  buildSessionRequest?: (
+    message: IncomingMessage,
+    draft: SessionCreateRequest
+  ) => SessionCreateRequest | Promise<SessionCreateRequest>;
   downloadAttachment?: (attachment: IncomingMessage["resources"][number], message: IncomingMessage) => Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
+
+function fallbackSessionCreateRequest(defaults: SessionCreateDefaults): SessionCreateRequest {
+  const envOverrides = defaults.envOverrides || {};
+  return {
+    agent: defaults.agentId,
+    environment: {
+      id: defaults.environmentId,
+      type: "environment_with_overrides",
+      config: { type: "cloud", env: envOverrides }
+    },
+    ...((defaults.vaultIds || []).length ? { vault_ids: defaults.vaultIds } : {})
+  };
+}
 
 function buildHandoffInput(handoff: SessionHandoff, currentInput: string): string {
   return `<session_handoff>

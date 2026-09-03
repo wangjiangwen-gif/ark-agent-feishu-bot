@@ -43,6 +43,33 @@ export type EnvironmentConfig = {
   [key: string]: unknown;
 };
 
+export type SessionResource = {
+  type: string;
+  [key: string]: unknown;
+};
+
+export type SessionCreateRequest = {
+  agent: string | (Record<string, unknown> & { id: string; type: string });
+  environment_id?: string;
+  environment?: Record<string, unknown> & {
+    id: string;
+    type: "environment_with_overrides" | (string & {});
+    config?: EnvironmentConfig;
+  };
+  resources?: SessionResource[];
+  tags?: Array<Record<string, unknown> & { key: string; value?: string }>;
+  title?: string;
+  vault_ids?: string[];
+  [key: string]: unknown;
+};
+
+export type SessionCreateDefaults = {
+  agentId: string;
+  environmentId: string;
+  vaultIds?: string[];
+  envOverrides?: Record<string, string>;
+};
+
 const LARK_CLI_VERSION = "1.0.88";
 const LARK_CLI_SETUP_SCRIPT = `set -e
 case "$(uname -m)" in
@@ -226,21 +253,46 @@ export class ArkClient {
     return config;
   }
 
-  async createSession(agentId: string, environmentId: string, vaultIds: string[] = [], envOverrides: Record<string, string> = {}): Promise<string> {
-    const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(environmentId) : undefined;
+  async buildSessionCreateRequest(defaults: SessionCreateDefaults): Promise<SessionCreateRequest> {
+    const vaultIds = defaults.vaultIds || [];
+    const envOverrides = defaults.envOverrides || {};
+    const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(defaults.environmentId) : undefined;
+    return {
+      agent: defaults.agentId,
+      ...(environmentConfig ? {
+        environment: {
+          id: defaults.environmentId,
+          type: "environment_with_overrides",
+          config: { ...environmentConfig, env: { ...(environmentConfig.env || {}), ...envOverrides } }
+        }
+      } : { environment_id: defaults.environmentId }),
+      ...(vaultIds.length ? { vault_ids: vaultIds } : {})
+    };
+  }
+
+  async createSession(request: SessionCreateRequest): Promise<string>;
+  async createSession(agentId: string, environmentId: string, vaultIds?: string[], envOverrides?: Record<string, string>): Promise<string>;
+  async createSession(
+    requestOrAgentId: SessionCreateRequest | string,
+    environmentId?: string,
+    vaultIds: string[] = [],
+    envOverrides: Record<string, string> = {}
+  ): Promise<string> {
+    if (typeof requestOrAgentId === "string" && !environmentId) {
+      throw new Error("创建 Session 必须提供 environmentId");
+    }
+    const request = typeof requestOrAgentId === "string"
+      ? await this.buildSessionCreateRequest({
+        agentId: requestOrAgentId,
+        environmentId: environmentId || "",
+        vaultIds,
+        envOverrides
+      })
+      : requestOrAgentId;
+    validateSessionCreateRequest(request);
     const response = await this.request("/sessions", {
       method: "POST",
-      body: JSON.stringify({
-        agent: agentId,
-        ...(environmentConfig ? {
-          environment: {
-            id: environmentId,
-            type: "environment_with_overrides",
-            config: { ...environmentConfig, env: { ...(environmentConfig.env || {}), ...envOverrides } }
-          }
-        } : { environment_id: environmentId }),
-        ...(vaultIds.length ? { vault_ids: vaultIds } : {})
-      })
+      body: JSON.stringify(request)
     });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
@@ -252,7 +304,7 @@ export class ArkClient {
   async uploadFile(name: string, mimeType: string, bytes: Uint8Array): Promise<{ id: string; name: string }> {
     const form = new FormData();
     form.set("purpose", "user_data");
-    form.set("file", new Blob([bytes], { type: mimeType || "application/octet-stream" }), name);
+    form.set("file", new Blob([new Uint8Array(bytes)], { type: mimeType || "application/octet-stream" }), name);
     const response = await this.request("/files", { method: "POST", body: form });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
@@ -262,9 +314,13 @@ export class ArkClient {
   }
 
   async addSessionFile(sessionId: string, fileId: string, mountPath: string): Promise<void> {
+    await this.addSessionResource(sessionId, { type: "file", file_id: fileId, mount_path: mountPath });
+  }
+
+  async addSessionResource(sessionId: string, resource: SessionResource): Promise<void> {
     await this.request(`/sessions/${encodeURIComponent(sessionId)}/resources`, {
       method: "POST",
-      body: JSON.stringify({ type: "file", file_id: fileId, access: "read_only", mount_path: mountPath })
+      body: JSON.stringify(resource)
     });
   }
 
@@ -417,6 +473,17 @@ export class ArkClient {
     });
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
     return parseEventStream(response.body);
+  }
+}
+
+function validateSessionCreateRequest(request: SessionCreateRequest): void {
+  if (!request || !request.agent || (typeof request.agent !== "string" && typeof request.agent !== "object")) {
+    throw new Error("创建 Session 必须提供 agent");
+  }
+  const hasEnvironment = request.environment !== undefined;
+  const hasEnvironmentId = request.environment_id !== undefined;
+  if (hasEnvironment === hasEnvironmentId) {
+    throw new Error("environment 与 environment_id 必须且只能传一个");
   }
 }
 

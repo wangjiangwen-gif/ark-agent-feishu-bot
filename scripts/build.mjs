@@ -3,7 +3,7 @@ import { build } from "esbuild";
 
 await rm("dist", { recursive: true, force: true });
 await build({
-  entryPoints: ["src/cli.ts"],
+  entryPoints: ["src/cli.ts", "src/core.ts"],
   outdir: "dist",
   bundle: true,
   splitting: true,

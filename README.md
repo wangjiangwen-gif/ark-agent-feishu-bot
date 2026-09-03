@@ -278,7 +278,40 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
 - Markdown/TXT 原文直接内联到本次 Session 消息；其他单聊文件上传到方舟 Files，再只读挂载到 `/mnt/data/`。文件本体不写入 Gateway 数据库。
-- 群聊文件、音视频、富文本与交互卡片暂不处理。
+- 群聊中明确 `@Bot` 的文本、文件和图片可进入 Agent；音视频和交互卡片暂不作为任务输入处理。
+
+## 二次开发：完整 Session Create 请求
+
+`arkagent/core` 暴露 `ArkClient`、`Gateway`、Channel 契约以及对应 TypeScript 类型。`ArkClient.createSession(request)` 直接接受方舟原生 Session Create 请求，不会丢弃未知扩展字段、显式空数组或 `tos: {}` 等 wire 语义：
+
+```ts
+import { ArkClient, Gateway, type SessionCreateRequest } from "arkagent/core";
+
+const ark = new ArkClient(process.env.ARK_API_KEY!, "https://ark.cn-beijing.volces.com/api/v3");
+
+const request: SessionCreateRequest = {
+  agent: { id: "agent-xxx", type: "agent", version: 3 },
+  environment: {
+    id: "env-xxx",
+    type: "environment_with_overrides",
+    config: {
+      type: "cloud",
+      tos: { bucket: "employee-output", prefix: "tenant-a/" }
+    }
+  },
+  resources: [
+    { type: "memory_store", memory_store_id: "mem-xxx", access: "read_write" },
+    { type: "tos", tos_bucket: "employee-input", tos_key: "seed/context.json", mount_path: "/mnt/data/context.json" }
+  ],
+  vault_ids: ["vlt-xxx"],
+  title: "飞书任务",
+  tags: [{ key: "channel", value: "lark" }]
+};
+
+const sessionId = await ark.createSession(request);
+```
+
+Gateway 的 `buildSessionRequest(message, draft)` 可在每次真正创建新 Session 前调整完整请求。默认 Agent、Environment、飞书上下文环境变量和身份隔离策略已经写入 `draft`；回调应在此基础上合并业务所需的 Agent 版本、Memory Store、TOS、title、tags 或未来新增字段。新 Session 收到的非文本附件会先上传到 Ark Files，并合并进同一次创建请求的 `resources`；已有 Session 则通过通用会话资源接口追加。
 
 ## Docker
 

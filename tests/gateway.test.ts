@@ -41,8 +41,8 @@ test("shared group mode queues users in one Session and never mounts user Vaults
   let creates = 0;
   let releaseFirst: (() => void) | undefined;
   const gateway = new Gateway(store, {
-    createSession: async (_agentId, _environmentId, vaultIds) => {
-      vaultLists.push(vaultIds);
+    createSession: async request => {
+      vaultLists.push(request.vault_ids || []);
       return `session-${++creates}`;
     },
     run: async (sessionId, input) => {
@@ -152,9 +152,10 @@ test("per-message mode starts same-chat group requests concurrently in isolated 
   const started: string[] = [];
   const releases = new Map<string, () => void>();
   const gateway = new Gateway(store, {
-    createSession: async (_agentId, _environmentId, _vaultIds, env) => {
+    createSession: async request => {
       const sessionId = `session-${created.length + 1}`;
-      created.push({ sessionId, env });
+      const environment = request.environment as { config?: { env?: Record<string, string> } };
+      created.push({ sessionId, env: environment.config?.env || {} });
       return sessionId;
     },
     run: async sessionId => {
@@ -223,7 +224,11 @@ test("per-message group Session receives bounded history and current channel ide
   let prompt = "";
   let sessionEnv: Record<string, string> = {};
   const gateway = new Gateway(store, {
-    createSession: async (_agentId, _environmentId, _vaultIds, env) => { sessionEnv = env; return "session-one"; },
+    createSession: async request => {
+      const environment = request.environment as { config?: { env?: Record<string, string> } };
+      sessionEnv = environment.config?.env || {};
+      return "session-one";
+    },
     run: async (_sessionId, input) => { prompt = input; return { terminal: "idle" as const, messages: ["完成"] }; }
   }, async () => undefined, {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
@@ -514,11 +519,12 @@ test("gateway creates a session bound to the user Vault", async () => {
   let sessionVaultIds: string[] | undefined;
   let sessionEnv: Record<string, string> | undefined;
   const gateway = new Gateway(store, {
-    createSession: async (agentId, environmentId, vaultIds, env) => {
-      sessionAgentId = agentId;
-      sessionEnvironmentId = environmentId;
-      sessionVaultIds = vaultIds;
-      sessionEnv = env;
+    createSession: async request => {
+      const environment = request.environment as { id?: string; config?: { env?: Record<string, string> } };
+      sessionAgentId = String(request.agent);
+      sessionEnvironmentId = environment.id || String(request.environment_id || "");
+      sessionVaultIds = request.vault_ids;
+      sessionEnv = environment.config?.env;
       return "session-1";
     },
     run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
@@ -545,9 +551,9 @@ test("gateway compacts the old session before resuming in a user-authorized sess
   let resumedInput = "";
   let sessionVaultIds: string[] = [];
   const gateway = new Gateway(store, {
-    createSession: async (_agentId, _environmentId, vaultIds) => {
+    createSession: async request => {
       operations.push("create:session-new");
-      sessionVaultIds = vaultIds;
+      sessionVaultIds = request.vault_ids || [];
       return "session-new";
     },
     run: async (sessionId, input) => {
@@ -807,17 +813,19 @@ test("/new resets the session without refreshing an expired credential", async (
   store.close();
 });
 
-test("gateway downloads, uploads and mounts a Feishu file before running the Agent", async () => {
+test("gateway uploads a Feishu file and mounts it while creating a new Session", async () => {
   const store = new GatewayStore(":memory:");
   const operations: string[] = [];
   let prompt = "";
   const gateway = new Gateway(store, {
-    createSession: async () => { operations.push("session"); return "session-1"; },
+    createSession: async request => {
+      operations.push(`session:${JSON.stringify(request.resources || [])}`);
+      return "session-1";
+    },
     uploadFile: async (name, mimeType, bytes) => {
       operations.push(`upload:${name}:${mimeType}:${bytes.byteLength}`);
       return { id: "file-1", name };
     },
-    addSessionFile: async (_sessionId, _fileId, mountPath) => { operations.push(`mount:${mountPath}`); },
     run: async (_sessionId, text) => { prompt = text; operations.push("run"); return { terminal: "idle" as const, messages: ["文件摘要"] }; }
   }, async () => undefined, {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
@@ -825,8 +833,102 @@ test("gateway downloads, uploads and mounts a Feishu file before running the Age
   });
   gateway.accept(message({ text: "", resources: [{ id: "file-key", name: "季度计划.pdf", type: "file" }] }));
   await delay(30);
-  assert.deepEqual(operations, ["session", "upload:季度计划.pdf:application/pdf:2", "mount:/mnt/data/季度计划.pdf", "run"]);
+  assert.deepEqual(operations, [
+    "upload:季度计划.pdf:application/pdf:2",
+    'session:[{"type":"file","file_id":"file-1","mount_path":"/mnt/data/季度计划.pdf"}]',
+    "run"
+  ]);
   assert.match(prompt, /文件已挂载到：\n- \/mnt\/session\/uploads\/mnt\/data\/季度计划\.pdf/);
+  store.close();
+});
+
+test("gateway lets a Session builder preserve native options and adds initial attachment resources", async () => {
+  const store = new GatewayStore(":memory:");
+  const operations: string[] = [];
+  let createRequest: Record<string, unknown> = {};
+  const gateway = new Gateway(store, {
+    buildSessionCreateRequest: async defaults => ({
+      agent: defaults.agentId,
+      environment_id: defaults.environmentId,
+      vault_ids: defaults.vaultIds
+    }),
+    createSession: async request => {
+      createRequest = request;
+      operations.push("session");
+      return "session-1";
+    },
+    uploadFile: async (name, _mimeType, _bytes) => {
+      operations.push(`upload:${name}`);
+      return { id: "file-1", name };
+    },
+    run: async () => {
+      operations.push("run");
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
+    downloadAttachment: async () => ({ bytes: new Uint8Array([1, 2]), mimeType: "application/pdf" }),
+    buildSessionRequest: async (_message, draft) => ({
+      ...draft,
+      agent: { id: "agent-1", type: "agent", version: 3 },
+      title: "开发者标题",
+      tags: [{ key: "source", value: "lark" }],
+      resources: [
+        { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
+        { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context.json", mount_path: "/mnt/data/context.json" },
+        ...(draft.resources || [])
+      ],
+      future_session_field: "kept"
+    })
+  });
+
+  gateway.accept(message({ text: "总结附件", resources: [{ id: "file-key", name: "报告.pdf", type: "file" }] }));
+  await delay(40);
+
+  assert.deepEqual(operations, ["upload:报告.pdf", "session", "run"]);
+  assert.deepEqual(createRequest.agent, { id: "agent-1", type: "agent", version: 3 });
+  assert.equal(createRequest.title, "开发者标题");
+  assert.equal(createRequest.future_session_field, "kept");
+  assert.deepEqual(createRequest.resources, [
+    { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
+    { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context.json", mount_path: "/mnt/data/context.json" },
+    { type: "file", file_id: "file-1", mount_path: "/mnt/data/报告.pdf" }
+  ]);
+  store.close();
+});
+
+test("gateway appends a generic resource when an existing Session receives a file", async () => {
+  const store = new GatewayStore(":memory:");
+  const incoming = message({ text: "继续分析", resources: [{ id: "file-key", name: "补充.pdf", type: "file" }] });
+  store.saveSession(toConversationKey(incoming), "session-existing", "agent-1");
+  const operations: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => { throw new Error("不应创建新 Session"); },
+    uploadFile: async name => {
+      operations.push(`upload:${name}`);
+      return { id: "file-2", name };
+    },
+    addSessionResource: async (sessionId, resource) => {
+      operations.push(`append:${sessionId}:${JSON.stringify(resource)}`);
+    },
+    run: async sessionId => {
+      operations.push(`run:${sessionId}`);
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
+    sessionRotation: false,
+    downloadAttachment: async () => ({ bytes: new Uint8Array([1]), mimeType: "application/pdf" })
+  });
+
+  gateway.accept(incoming);
+  await delay(40);
+
+  assert.deepEqual(operations, [
+    "upload:补充.pdf",
+    'append:session-existing:{"type":"file","file_id":"file-2","mount_path":"/mnt/data/补充.pdf"}',
+    "run:session-existing"
+  ]);
   store.close();
 });
 

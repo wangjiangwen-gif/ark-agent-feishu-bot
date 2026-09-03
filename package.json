@@ -6,8 +6,15 @@
   "bin": {
     "arkagent": "dist/cli.js"
   },
+  "exports": {
+    "./core": {
+      "types": "./src/core.ts",
+      "import": "./dist/core.js"
+    }
+  },
   "files": [
     "dist/",
+    "src/",
     "README.md"
   ],
   "repository": {
