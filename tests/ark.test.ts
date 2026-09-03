@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ArkClient, drainEventBuffer, eventProgress, eventText, resultFromEvents } from "../src/ark.ts";
+import { ArkClient, drainEventBuffer, eventProgress, eventText, eventUserAuthorizationRequired, resultFromEvents } from "../src/ark.ts";
+
+test("Ark network failures identify the failed API operation", async () => {
+  const client = new ArkClient("key", "https://ark.example.com", async () => {
+    throw new TypeError("fetch failed", { cause: new Error("ECONNRESET") });
+  });
+
+  await assert.rejects(client.getAgent("agent-one"), /方舟网络请求失败.*GET \/agents\/agent-one.*ECONNRESET/);
+});
 
 test("drainEventBuffer parses SSE frames split from network chunks", () => {
   const first = drainEventBuffer('data: {"type":"agent.message","id":"1"}\n\ndata: {"type":"session.');
@@ -16,6 +24,59 @@ test("drainEventBuffer parses NDJSON without treating chunks as events", () => {
 
 test("eventText joins text blocks only", () => {
   assert.equal(eventText({ content: [{ type: "text", text: "甲" }, { type: "image" }, { type: "text", text: "乙" }] }), "甲\n乙");
+});
+
+test("lark-cli user token_missing is parsed from a successful MA tool_result envelope", () => {
+  const toolUse = {
+    type: "agent.tool_use", id: "call-one", name: "bash",
+    input: { command: "lark-cli calendar +agenda --as user", description: "查询日程" }
+  };
+  const toolResult = {
+    type: "agent.tool_result", tool_use_id: "call-one", is_error: false,
+    content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{\n  "ok": false,\n  "identity": "user",\n  "error": {\n    "type": "authentication",\n    "subtype": "token_missing",\n    "message": "no access token available for user"\n  }\n}` }]
+  };
+
+  assert.deepEqual(eventUserAuthorizationRequired(toolResult, new Map([["call-one", "calendar"]])), {
+    identity: "user", errorType: "authentication", subtype: "token_missing", domain: "calendar"
+  });
+  assert.equal(eventUserAuthorizationRequired({ ...toolResult, content: [{ type: "text", text: "exit_code: 2\n--- stderr ---\n{}" }] }, new Map()), undefined);
+  assert.equal(eventUserAuthorizationRequired({ ...toolResult, content: [{ type: "text", text: `exit_code: 3\n--- stderr ---\n{"ok":false,"identity":"bot","error":{"type":"authorization","subtype":"app_scope_not_applied"}}` }] }, new Map()), undefined);
+  assert.equal((toolUse.input.command.match(/lark-cli\s+([\w-]+)/) || [])[1], "calendar");
+});
+
+test("resultFromEvents preserves user authorization requirements despite MA is_error false", () => {
+  const processedAt = new Date(Date.now() + 1_000).toISOString();
+  const result = resultFromEvents([
+    { type: "agent.tool_use", id: "call-one", name: "bash", input: { command: "lark-cli calendar +agenda --as user" }, processed_at: processedAt },
+    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_missing"}}` }], processed_at: processedAt },
+    { type: "agent.message", content: [{ type: "text", text: "请先授权" }], processed_at: processedAt },
+    { type: "session.status_idle", processed_at: processedAt }
+  ], Date.now());
+
+  assert.deepEqual(result?.authorizationRequired, {
+    identity: "user", errorType: "authentication", subtype: "token_missing", domain: "calendar"
+  });
+});
+
+test("run stops streaming Agent denial text after lark-cli requests user authorization", async () => {
+  const snapshots: string[] = [];
+  const events = [
+    { type: "agent.tool_use", id: "call-one", name: "bash", input: { command: "lark-cli calendar +agenda --as user" } },
+    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_missing"}}` }] },
+    { type: "agent.message", content: [{ type: "text", text: "你没有凭证，请自行授权" }] },
+    { type: "session.status_idle" }
+  ];
+  const client = new ArkClient("key", "https://ark.example/api/v3", async url => {
+    if (String(url).includes("/events/stream")) {
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { status: 200 });
+    }
+    return new Response("{}", { status: 200 });
+  });
+
+  const result = await client.run("session-1", "查日程", 5_000, undefined, async snapshot => { snapshots.push(snapshot); });
+
+  assert.deepEqual(snapshots, []);
+  assert.equal(result.authorizationRequired?.domain, "calendar");
 });
 
 test("Ark requests configure lark-cli, Vault credential and Session binding", async () => {
@@ -43,10 +104,17 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
     name: "env",
     config: {
       type: "cloud", networking: { type: "unrestricted" },
-      env: { LARKSUITE_CLI_APP_ID: "cli-1" },
-      setup_script: "set -e\nnpm install -g @larksuite/cli@latest\nnpx --yes @larksuite/cli@latest install </dev/null\nlark-cli config strict-mode off\ntimeout 30 lark-cli --version"
+      env: {
+        LARKSUITE_CLI_APP_ID: "cli-1",
+        LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+        LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
+        LARKSUITE_CLI_STRICT_MODE: "off"
+      },
+      setup_script: (calls[0].body?.config as Record<string, unknown>).setup_script
     }
   });
+  assert.match(String((calls[0].body?.config as Record<string, unknown>).setup_script), /sha256sum -c -/);
+  assert.doesNotMatch(String((calls[0].body?.config as Record<string, unknown>).setup_script), /\bnpm(?:\s|$)|\bnpx(?:\s|$)/);
   assert.deepEqual(calls.at(-1)?.body, {
     agent: "agent-1",
     environment: {
@@ -61,6 +129,53 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
     vault_ids: ["vlt-1"]
   });
   assert.equal(calls.at(-1)?.body?.environment_id, undefined);
+});
+
+test("Ark createSession preserves the complete native Session request", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new ArkClient("key", "https://ark.example/api/v3", async (_url, init) => {
+    body = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ id: "sesn-native" }), { status: 200 });
+  });
+  const request = {
+    agent: {
+      id: "agent-1", type: "agent_with_overrides", version: 7,
+      system: "本次会话提示词", skills: [], tools: [], future_agent_field: { enabled: true }
+    },
+    environment: {
+      id: "env-1", type: "environment_with_overrides",
+      config: { type: "cloud", tos: {}, future_environment_field: "kept" }
+    },
+    resources: [
+      { type: "file", file_id: "file-1", mount_path: "/mnt/data/a.pdf" },
+      { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
+      { type: "tos", tos_bucket: "bucket-1", tos_key: "inputs/a/", tos_region: "cn-beijing", mount_path: "/mnt/data/a" }
+    ],
+    vault_ids: ["vlt-1", "vlt-2"],
+    title: "飞书任务",
+    tags: [{ key: "channel", value: "lark" }],
+    future_session_field: { mode: "preview" }
+  };
+
+  assert.equal(await client.createSession(request), "sesn-native");
+  assert.deepEqual(body, request);
+  assert.deepEqual((body.environment as { config: { tos: object } }).config.tos, {});
+  assert.deepEqual((body.agent as { skills: unknown[] }).skills, []);
+});
+
+test("Ark createSession rejects ambiguous Environment selection before sending", async () => {
+  let calls = 0;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async () => {
+    calls++;
+    return new Response(JSON.stringify({ id: "never" }), { status: 200 });
+  });
+
+  await assert.rejects(client.createSession({
+    agent: "agent-1",
+    environment_id: "env-1",
+    environment: { id: "env-1", type: "environment_with_overrides", config: { type: "cloud" } }
+  }), /environment 与 environment_id 必须且只能传一个/);
+  assert.equal(calls, 0);
 });
 
 test("Ark creates an office Agent with the requested tools and system prompt", async () => {
@@ -181,7 +296,7 @@ test("getSessionStats reports event count and latest model input tokens", async 
   assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611 });
 });
 
-test("Ark uploads a file and mounts it read-only in a Session", async () => {
+test("Ark uploads a file and mounts it in a Session", async () => {
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
   const client = new ArkClient("key", "https://ark.example/api/v3", async (url, init) => {
     const path = String(url).replace("https://ark.example/api/v3", "");
@@ -196,6 +311,6 @@ test("Ark uploads a file and mounts it read-only in a Session", async () => {
   assert.ok(calls[0].body instanceof FormData);
   assert.equal((calls[0].body as FormData).get("purpose"), "user_data");
   assert.deepEqual(JSON.parse(String(calls[1].body)), {
-    type: "file", file_id: "file-1", access: "read_only", mount_path: "/mnt/data/report.pdf"
+    type: "file", file_id: "file-1", mount_path: "/mnt/data/report.pdf"
   });
 });

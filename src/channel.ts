@@ -16,10 +16,23 @@ export type ChannelMessage = {
   conversationId: string;
   conversationType: "direct" | "group";
   threadId: string;
+  rootMessageId: string;
+  parentMessageId: string;
+  createTime: number;
   senderId: string;
   text: string;
   resources: ChannelResource[];
   mentionedBot: boolean;
+};
+
+export type ChannelHistoryMessage = {
+  messageId: string;
+  senderId: string;
+  senderName?: string;
+  senderType: string;
+  source: "chat" | "thread";
+  text: string;
+  createTime: number;
 };
 
 export type ChannelOutbound =
@@ -47,5 +60,6 @@ export interface ChannelAdapter {
   streamReply?(message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>): Promise<void>;
   addReaction?(message: ChannelMessage, emojiType: string): Promise<string>;
   removeReaction?(message: ChannelMessage, reactionId: string): Promise<void>;
+  loadRecentHistory?(message: ChannelMessage): Promise<ChannelHistoryMessage[]>;
   download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
 }

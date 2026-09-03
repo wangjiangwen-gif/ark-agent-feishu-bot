@@ -1,5 +1,5 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
-import type { ChannelAdapter, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
 
 type RawLarkMessage = {
@@ -12,7 +12,26 @@ export type LarkChannelPort = Pick<LarkChannel,
   "addReaction" | "connect" | "createCard" | "disconnect" | "downloadResource" | "on" | "removeReaction" | "send" | "stream"
 > & { rawClient?: FeishuCardStreamClient };
 
+type LarkHistoryItem = {
+  message_id?: string;
+  msg_type?: string;
+  create_time?: string;
+  deleted?: boolean;
+  sender?: { id?: string; sender_type?: string; sender_name?: string };
+  body?: { content?: string };
+  mentions?: Array<{ key?: string; name?: string }>;
+};
+
+type LarkMessageListResponse = {
+  code?: number;
+  msg?: string;
+  data?: { has_more?: boolean; page_token?: string; items?: LarkHistoryItem[] };
+};
+
+type LarkMessageList = (payload: unknown) => Promise<LarkMessageListResponse>;
+
 type FeishuCardStreamClient = FeishuResourceClient & {
+  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList } };
   cardkit?: { v1?: {
     cardElement?: { content(payload: unknown): Promise<unknown> };
     card?: { settings(payload: unknown): Promise<unknown> };
@@ -36,6 +55,7 @@ const DEFAULT_STREAMING_OPTIONS: Required<StreamingOptions> = {
   printStep: 4,
   settlePaddingMs: 120
 };
+const STREAMING_PLACEHOLDER = "Thinking...";
 
 export class LarkChannelAdapter implements ChannelAdapter {
   readonly channelType = "lark" as const;
@@ -69,8 +89,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
       httpTimeoutMs: 30_000,
       keepalive: { enabled: true },
       policy: { dmMode: "open", requireMention: true, respondToMentionAll: false },
-      // Gateway 已经提供持久去重和按“会话”粒度的队列。SDK 只保留内存去重，
-      // 关闭 chatQueue，避免群聊内不同用户被二次串行化。
+      // Gateway 已经提供持久去重；数字员工模式下每条消息都使用独立 Session 并发执行。
+      // 关闭 SDK chatQueue，避免同一群聊内的请求被接入层再次串行化。
       safety: { chatQueue: { enabled: false }, staleMessageWindowMs: 5 * 60_000 }
     });
     // Channel SDK 的 downloadResource 返回完整 Buffer。真实 SDK 同时公开 rawClient，
@@ -130,7 +150,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
     const push = async (): Promise<void> => {
       await cardkit.cardElement.content({
         path: { card_id: cardId, element_id: elementId },
-        data: { content: content || "...", sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
+        data: { content: content || STREAMING_PLACEHOLDER, sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
       });
     };
 
@@ -175,6 +195,12 @@ export class LarkChannelAdapter implements ChannelAdapter {
     return this.channel.removeReaction(message.messageId, reactionId);
   }
 
+  loadRecentHistory(message: ChannelMessage): Promise<ChannelHistoryMessage[]> {
+    const client = this.channel.rawClient;
+    if (!client?.im.message?.list) throw new Error("当前飞书 Channel 未提供群消息历史接口");
+    return loadLarkRecentHistory(client, message);
+  }
+
   async download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }> {
     if (this.streamingDownloader) return this.streamingDownloader(resource, message);
     const bytes = await this.channel.downloadResource(message.messageId, resource.id, resource.type);
@@ -195,7 +221,7 @@ function buildNativeStreamingCard(elementId: string, options: Required<Streaming
         print_strategy: "fast"
       }
     },
-    body: { elements: [{ tag: "markdown", element_id: elementId, content: "..." }] }
+    body: { elements: [{ tag: "markdown", element_id: elementId, content: STREAMING_PLACEHOLDER }] }
   };
 }
 
@@ -281,7 +307,10 @@ export function normalizeLarkChannelMessage(message: NormalizedMessage, installa
     tenantId: raw.sender?.tenant_key || raw.tenant_key || "default",
     conversationId: message.chatId,
     conversationType: message.chatType === "p2p" ? "direct" : "group",
-    threadId: message.threadId || message.rootId || "",
+    threadId: message.threadId || "",
+    rootMessageId: message.rootId || "",
+    parentMessageId: message.replyToMessageId || "",
+    createTime: Number(message.createTime || Date.now()),
     senderId: message.senderId,
     text: message.content.trim(),
     resources: message.resources
@@ -293,6 +322,124 @@ export function normalizeLarkChannelMessage(message: NormalizedMessage, installa
       })),
     mentionedBot: message.mentionedBot
   };
+}
+
+export async function loadLarkRecentHistory(
+  client: Pick<FeishuCardStreamClient, "im">,
+  message: ChannelMessage,
+  options: { maxMessages?: number; maxChars?: number; maxPages?: number } = {}
+): Promise<ChannelHistoryMessage[]> {
+  const list = client.im.message?.list;
+  if (!list) throw new Error("飞书 OpenAPI Client 缺少 im.message.list");
+  const maxMessages = positiveInteger(options.maxMessages, 20);
+  const maxChars = positiveInteger(options.maxChars, 8_000);
+  const maxPages = positiveInteger(options.maxPages, 3);
+  const sources: Array<"chat" | "thread"> = message.threadId ? ["chat", "thread"] : ["chat"];
+  const settled = await Promise.allSettled(sources.map(source => loadHistoryContainer(
+    list.bind(client.im.message), message, source, maxMessages, maxPages
+  )));
+  if (settled.every(result => result.status === "rejected")) {
+    const firstFailure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    throw firstFailure?.reason || new Error("读取飞书会话历史失败");
+  }
+  const resultSets = settled.map(result => result.status === "fulfilled" ? result.value : []);
+  const unique = new Map<string, { item: LarkHistoryItem; source: "chat" | "thread" }>();
+  for (const [index, items] of resultSets.entries()) {
+    const source = sources[index];
+    for (const item of items) if (item.message_id) unique.set(item.message_id, { item, source });
+  }
+  const normalized = [...unique.values()]
+    .map(({ item, source }) => normalizeHistoryItem(item, source))
+    .filter((item): item is ChannelHistoryMessage => Boolean(item))
+    .sort((left, right) => left.createTime - right.createTime)
+    .slice(-maxMessages);
+  return trimHistoryToChars(normalized, maxChars);
+}
+
+async function loadHistoryContainer(
+  list: LarkMessageList,
+  message: ChannelMessage,
+  source: "chat" | "thread",
+  maxMessages: number,
+  maxPages: number
+): Promise<LarkHistoryItem[]> {
+  const items: LarkHistoryItem[] = [];
+  let pageToken: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const params: Record<string, string | number | boolean> = {
+      container_id_type: source,
+      container_id: source === "thread" ? message.threadId : message.conversationId,
+      sort_type: "ByCreateTimeDesc",
+      page_size: 50,
+      with_sender_name: true
+    };
+    if (source === "chat") params.end_time = String(Math.floor(message.createTime / 1000));
+    if (pageToken) params.page_token = pageToken;
+    const response = await list({ params });
+    if (response.code && response.code !== 0) throw new Error(`读取飞书会话历史失败：${response.msg || `code ${response.code}`}`);
+    items.push(...(response.data?.items || []));
+    const eligibleCount = items.filter(item => isEligibleHistoryItem(item, message)).length;
+    if (eligibleCount >= maxMessages || !response.data?.has_more || !response.data.page_token) break;
+    pageToken = response.data.page_token;
+  }
+  return items.filter(item => isEligibleHistoryItem(item, message));
+}
+
+function isEligibleHistoryItem(item: LarkHistoryItem, trigger: ChannelMessage): boolean {
+  const createTime = Number(item.create_time || 0);
+  return Boolean(item.message_id && !item.deleted && item.message_id !== trigger.messageId && createTime > 0 && createTime <= trigger.createTime);
+}
+
+function normalizeHistoryItem(item: LarkHistoryItem, source: "chat" | "thread"): ChannelHistoryMessage | undefined {
+  const messageId = String(item.message_id || "");
+  const text = historyItemText(item);
+  if (!messageId || !text) return undefined;
+  return {
+    messageId,
+    senderId: String(item.sender?.id || "unknown"),
+    senderName: item.sender?.sender_name || undefined,
+    senderType: String(item.sender?.sender_type || "unknown"),
+    source,
+    text,
+    createTime: Number(item.create_time || 0)
+  };
+}
+
+function historyItemText(item: LarkHistoryItem): string {
+  const content = item.body?.content || "";
+  let value: unknown;
+  try { value = JSON.parse(content); }
+  catch { return content.trim().slice(0, 2_000); }
+  let text = "";
+  if (item.msg_type === "text") text = String((value as { text?: unknown })?.text || "");
+  else if (item.msg_type === "post") text = collectText(value).join("\n");
+  else if (item.msg_type === "file") text = `[文件：${String((value as { file_name?: unknown })?.file_name || "未命名文件")}]`;
+  else if (item.msg_type === "image") text = "[图片]";
+  else if (item.msg_type) text = `[${item.msg_type} 消息]`;
+  for (const mention of item.mentions || []) if (mention.key) text = text.replaceAll(mention.key, mention.name ? `@${mention.name}` : "");
+  return text.replace(/\s+/g, " ").trim().slice(0, 2_000);
+}
+
+function collectText(value: unknown): string[] {
+  if (typeof value === "string") return [];
+  if (Array.isArray(value)) return value.flatMap(collectText);
+  if (!value || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const own = typeof record.text === "string" ? [record.text] : [];
+  return own.concat(Object.entries(record).filter(([key]) => key !== "text").flatMap(([, child]) => collectText(child)));
+}
+
+function trimHistoryToChars(messages: ChannelHistoryMessage[], maxChars: number): ChannelHistoryMessage[] {
+  const selected: ChannelHistoryMessage[] = [];
+  let total = 0;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    const size = Array.from(message.text).length;
+    if (selected.length && total + size > maxChars) break;
+    selected.unshift(size <= maxChars ? message : { ...message, text: Array.from(message.text).slice(-maxChars).join("") });
+    total += Math.min(size, maxChars);
+  }
+  return selected;
 }
 
 export function toLarkSendInput(outbound: ChannelOutbound): SendInput {

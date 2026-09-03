@@ -34,6 +34,8 @@ export type AuditLog = {
   durationMs?: number;
   requestId?: string;
   summary?: string;
+  responseSummary?: string;
+  messageCreateTime?: number;
   createdAt: string;
 };
 
@@ -62,6 +64,11 @@ export class GatewayStore {
         status TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS conversation_context_cursors (
+        conversation_key TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        message_create_time INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS employee_users (
         tenant_key TEXT NOT NULL,
         open_id TEXT NOT NULL,
@@ -84,6 +91,8 @@ export class GatewayStore {
         duration_ms INTEGER,
         request_id TEXT,
         summary TEXT,
+        response_summary TEXT,
+        message_create_time INTEGER,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS employee_oauth (
@@ -97,6 +106,8 @@ export class GatewayStore {
     `);
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
+    this.ensureColumn("audit_logs", "response_summary", "TEXT");
+    this.ensureColumn("audit_logs", "message_create_time", "INTEGER");
     if (path !== ":memory:") try { chmodSync(path, 0o600); } catch { /* directory permissions remain the outer boundary */ }
   }
 
@@ -133,13 +144,42 @@ export class GatewayStore {
     `).run(this.conversationKey(key), sessionId, agentId, agentVersion || null, new Date().toISOString());
   }
 
+  getConversationContextCursor(key: ConversationKey, sessionId: string): number | undefined {
+    const row = this.db.prepare(`
+      SELECT message_create_time FROM conversation_context_cursors
+      WHERE conversation_key = ? AND session_id = ?
+    `).get(this.conversationKey(key), sessionId) as { message_create_time: number } | undefined;
+    return row ? Number(row.message_create_time) : undefined;
+  }
+
+  saveConversationContextCursor(key: ConversationKey, sessionId: string, messageCreateTime: number): void {
+    this.db.prepare(`
+      INSERT INTO conversation_context_cursors (conversation_key, session_id, message_create_time)
+      VALUES (?, ?, ?)
+      ON CONFLICT(conversation_key) DO UPDATE SET
+        session_id = excluded.session_id,
+        message_create_time = CASE
+          WHEN conversation_context_cursors.session_id = excluded.session_id
+          THEN MAX(conversation_context_cursors.message_create_time, excluded.message_create_time)
+          ELSE excluded.message_create_time
+        END
+    `).run(this.conversationKey(key), sessionId, messageCreateTime);
+  }
+
   resetSession(key: ConversationKey): void {
-    this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(this.conversationKey(key));
-    if (key.channelType === "lark") this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(this.legacyConversationKey(key));
+    const conversationKey = this.conversationKey(key);
+    this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(conversationKey);
+    this.db.prepare("DELETE FROM conversation_context_cursors WHERE conversation_key = ?").run(conversationKey);
+    if (key.channelType === "lark") {
+      const legacyKey = this.legacyConversationKey(key);
+      this.db.prepare("DELETE FROM conversations WHERE conversation_key = ?").run(legacyKey);
+      this.db.prepare("DELETE FROM conversation_context_cursors WHERE conversation_key = ?").run(legacyKey);
+    }
   }
 
   resetAllSessions(): number {
     const result = this.db.prepare("DELETE FROM conversations").run();
+    this.db.prepare("DELETE FROM conversation_context_cursors").run();
     return Number(result.changes);
   }
 
@@ -185,9 +225,9 @@ export class GatewayStore {
   addAuditLog(input: Omit<AuditLog, "id" | "createdAt" | "channelType" | "installationId"> & Partial<Pick<AuditLog, "channelType" | "installationId">>): AuditLog {
     const log: AuditLog = { channelType: "lark", installationId: "legacy", ...input, id: randomUUID(), createdAt: new Date().toISOString() };
     this.db.prepare(`INSERT INTO audit_logs
-      (id, channel_type, installation_id, tenant_key, open_id, chat_id, message_id, session_id, action, status, duration_ms, request_id, summary, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(log.id, log.channelType, log.installationId, log.tenantKey, log.openId, log.chatId, log.messageId, log.sessionId || null, log.action, log.status, log.durationMs ?? null, log.requestId || null, log.summary || null, log.createdAt);
+      (id, channel_type, installation_id, tenant_key, open_id, chat_id, message_id, session_id, action, status, duration_ms, request_id, summary, response_summary, message_create_time, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(log.id, log.channelType, log.installationId, log.tenantKey, log.openId, log.chatId, log.messageId, log.sessionId || null, log.action, log.status, log.durationMs ?? null, log.requestId || null, log.summary || null, log.responseSummary || null, log.messageCreateTime ?? null, log.createdAt);
     return log;
   }
 
@@ -200,7 +240,60 @@ export class GatewayStore {
       action: String(row.action), status: row.status as AuditLog["status"],
       durationMs: row.duration_ms === null ? undefined : Number(row.duration_ms),
       requestId: row.request_id ? String(row.request_id) : undefined,
-      summary: row.summary ? String(row.summary) : undefined, createdAt: String(row.created_at)
+      summary: row.summary ? String(row.summary) : undefined,
+      responseSummary: row.response_summary ? String(row.response_summary) : undefined,
+      messageCreateTime: row.message_create_time === null ? undefined : Number(row.message_create_time),
+      createdAt: String(row.created_at)
+    }));
+  }
+
+  listSessionAudit(sessionId: string, limit = 12): AuditLog[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM audit_logs
+        WHERE session_id = ? AND status = 'succeeded' AND action IN ('message', 'file_message')
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?
+      ) ORDER BY created_at ASC
+    `).all(sessionId, limit) as Record<string, unknown>[];
+    return rows.map(row => ({
+      id: String(row.id), tenantKey: String(row.tenant_key), openId: String(row.open_id), chatId: String(row.chat_id),
+      channelType: String(row.channel_type || "lark"), installationId: String(row.installation_id || "legacy"),
+      messageId: String(row.message_id), sessionId: row.session_id ? String(row.session_id) : undefined,
+      action: String(row.action), status: row.status as AuditLog["status"],
+      durationMs: row.duration_ms === null ? undefined : Number(row.duration_ms),
+      requestId: row.request_id ? String(row.request_id) : undefined,
+      summary: row.summary ? String(row.summary) : undefined,
+      responseSummary: row.response_summary ? String(row.response_summary) : undefined,
+      messageCreateTime: row.message_create_time === null ? undefined : Number(row.message_create_time),
+      createdAt: String(row.created_at)
+    }));
+  }
+
+  listConversationAudit(input: {
+    channelType: string; installationId: string; tenantKey: string; chatId: string; beforeCreateTime?: number; limit?: number;
+  }): AuditLog[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM audit_logs
+        WHERE channel_type = ? AND installation_id = ? AND tenant_key = ? AND chat_id = ?
+          AND status = 'succeeded' AND action IN ('message', 'file_message')
+          AND (message_create_time IS NULL OR message_create_time < ?)
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?
+      ) ORDER BY created_at ASC
+    `).all(input.channelType, input.installationId, input.tenantKey, input.chatId, input.beforeCreateTime ?? Number.MAX_SAFE_INTEGER, input.limit ?? 12) as Record<string, unknown>[];
+    return rows.map(row => ({
+      id: String(row.id), tenantKey: String(row.tenant_key), openId: String(row.open_id), chatId: String(row.chat_id),
+      channelType: String(row.channel_type || "lark"), installationId: String(row.installation_id || "legacy"),
+      messageId: String(row.message_id), sessionId: row.session_id ? String(row.session_id) : undefined,
+      action: String(row.action), status: row.status as AuditLog["status"],
+      durationMs: row.duration_ms === null ? undefined : Number(row.duration_ms),
+      requestId: row.request_id ? String(row.request_id) : undefined,
+      summary: row.summary ? String(row.summary) : undefined,
+      responseSummary: row.response_summary ? String(row.response_summary) : undefined,
+      messageCreateTime: row.message_create_time === null ? undefined : Number(row.message_create_time),
+      createdAt: String(row.created_at)
     }));
   }
 

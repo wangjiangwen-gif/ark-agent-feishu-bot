@@ -77,6 +77,23 @@ test("store resets every session without clearing event deduplication", () => {
   store.close();
 });
 
+test("group context cursors are session-bound, monotonic and cleared with the session", () => {
+  const store = new GatewayStore(":memory:");
+  store.saveSession(key, "session-1", "agent-1");
+  store.saveConversationContextCursor(key, "session-1", 200);
+  store.saveConversationContextCursor(key, "session-1", 100);
+  assert.equal(store.getConversationContextCursor(key, "session-1"), 200);
+
+  store.saveSession(key, "session-2", "agent-1");
+  store.saveConversationContextCursor(key, "session-2", 50);
+  assert.equal(store.getConversationContextCursor(key, "session-1"), undefined);
+  assert.equal(store.getConversationContextCursor(key, "session-2"), 50);
+
+  store.resetSession(key);
+  assert.equal(store.getConversationContextCursor(key, "session-2"), undefined);
+  store.close();
+});
+
 test("employee users are observed with first, latest and usage count", () => {
   const store = new GatewayStore(":memory:");
   const first = store.observeEmployeeUser("tenant", "user-1");
@@ -95,5 +112,59 @@ test("audit logs are newest first", () => {
   const logs = store.listAuditLogs();
   assert.equal(logs.length, 2);
   assert.equal(logs[0].openId, "user-2");
+  store.close();
+});
+
+test("conversation audit keeps request and response summaries for history fallback", () => {
+  const store = new GatewayStore(":memory:");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-1", action: "message", status: "succeeded",
+    summary: "读取文档 https://example.com/wiki/one", responseSummary: "已使用 Bot 身份读取文档", messageCreateTime: 100
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-two", tenantKey: "tenant", openId: "user-2",
+    chatId: "chat", messageId: "message-2", action: "message", status: "succeeded", summary: "另一个应用"
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-3",
+    chatId: "chat", messageId: "message-future", action: "message", status: "succeeded",
+    summary: "未来消息", messageCreateTime: 300
+  });
+
+  const logs = store.listConversationAudit({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", chatId: "chat", beforeCreateTime: 200, limit: 10
+  });
+
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].summary, "读取文档 https://example.com/wiki/one");
+  assert.equal(logs[0].responseSummary, "已使用 Bot 身份读取文档");
+  assert.equal(logs[0].messageCreateTime, 100);
+  store.close();
+});
+
+test("session audit fallback is scoped to one Managed Agents Session", () => {
+  const store = new GatewayStore(":memory:");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-1", sessionId: "session-old", action: "message", status: "succeeded",
+    summary: "项目代号是北极星", responseSummary: "已记住项目代号", messageCreateTime: 100
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-2", sessionId: "session-other", action: "message", status: "succeeded",
+    summary: "不应串入", responseSummary: "其他会话", messageCreateTime: 200
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-3", sessionId: "session-old", action: "authorization_required", status: "succeeded",
+    summary: "不应作为对话上下文"
+  });
+
+  const logs = store.listSessionAudit("session-old", 10);
+
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].summary, "项目代号是北极星");
+  assert.equal(logs[0].responseSummary, "已记住项目代号");
   store.close();
 });

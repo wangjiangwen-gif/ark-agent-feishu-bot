@@ -3,6 +3,14 @@ export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; p
 export type RunResult = {
   terminal: "idle" | "failed";
   messages: string[];
+  authorizationRequired?: UserAuthorizationRequired;
+};
+
+export type UserAuthorizationRequired = {
+  identity: "user";
+  errorType: "authentication";
+  subtype: "token_missing";
+  domain?: string;
 };
 
 export type SessionStats = {
@@ -35,6 +43,47 @@ export type EnvironmentConfig = {
   [key: string]: unknown;
 };
 
+export type SessionResource = {
+  type: string;
+  [key: string]: unknown;
+};
+
+export type SessionCreateRequest = {
+  agent: string | (Record<string, unknown> & { id: string; type: string });
+  environment_id?: string;
+  environment?: Record<string, unknown> & {
+    id: string;
+    type: "environment_with_overrides" | (string & {});
+    config?: EnvironmentConfig;
+  };
+  resources?: SessionResource[];
+  tags?: Array<Record<string, unknown> & { key: string; value?: string }>;
+  title?: string;
+  vault_ids?: string[];
+  [key: string]: unknown;
+};
+
+export type SessionCreateDefaults = {
+  agentId: string;
+  environmentId: string;
+  vaultIds?: string[];
+  envOverrides?: Record<string, string>;
+};
+
+const LARK_CLI_VERSION = "1.0.88";
+const LARK_CLI_SETUP_SCRIPT = `set -e
+case "$(uname -m)" in
+  x86_64) ARCH=amd64; SHA=497de20939acdd2aae4c898fea7a0ca71d5a459ed543202e762a8bcb3228effe ;;
+  aarch64|arm64) ARCH=arm64; SHA=96a3cac444947456ce9971c912946323f20d14416434da7e274bd9d77d7ac28b ;;
+  *) echo "unsupported architecture" >&2; exit 1 ;;
+esac
+ARCHIVE=/tmp/lark-cli.tar.gz
+curl --fail --location --silent --show-error --connect-timeout 10 --max-time 120 "https://registry.npmmirror.com/-/binary/lark-cli/v${LARK_CLI_VERSION}/lark-cli-${LARK_CLI_VERSION}-linux-$ARCH.tar.gz" -o "$ARCHIVE"
+echo "$SHA  $ARCHIVE" | sha256sum -c -
+tar -xzf "$ARCHIVE" -C /usr/local/bin lark-cli
+chmod 0755 /usr/local/bin/lark-cli
+rm -f "$ARCHIVE"`;
+
 export class ArkClient {
   private apiKey: string;
   private baseUrl: string;
@@ -54,16 +103,22 @@ export class ArkClient {
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
-    const response = await this.fetcher(`${this.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-        ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
-        ...init.headers
-      },
-      signal: init.signal || AbortSignal.timeout(30_000)
-    });
+    const method = init.method || "GET";
+    let response: Response;
+    try {
+      response = await this.fetcher(`${this.baseUrl}${path}`, {
+        ...init,
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+          ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
+          ...init.headers
+        },
+        signal: init.signal || AbortSignal.timeout(30_000)
+      });
+    } catch (error) {
+      throw new Error(`方舟网络请求失败（${method} ${path}）：${networkErrorDetail(error)}`, { cause: error });
+    }
     if (!response.ok) {
       const requestId = response.headers.get("x-request-id");
       const body = await response.text();
@@ -124,8 +179,13 @@ export class ArkClient {
       method: "POST",
       body: JSON.stringify({ name, config: {
         type: "cloud", networking: { type: "unrestricted" },
-        env: { LARKSUITE_CLI_APP_ID: feishuAppId },
-        setup_script: "set -e\nnpm install -g @larksuite/cli@latest\nnpx --yes @larksuite/cli@latest install </dev/null\nlark-cli config strict-mode off\ntimeout 30 lark-cli --version"
+        env: {
+          LARKSUITE_CLI_APP_ID: feishuAppId,
+          LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+          LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1",
+          LARKSUITE_CLI_STRICT_MODE: "off"
+        },
+        setup_script: LARK_CLI_SETUP_SCRIPT
       } })
     });
     const payload = await response.json() as Record<string, unknown>;
@@ -193,21 +253,46 @@ export class ArkClient {
     return config;
   }
 
-  async createSession(agentId: string, environmentId: string, vaultIds: string[] = [], envOverrides: Record<string, string> = {}): Promise<string> {
-    const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(environmentId) : undefined;
+  async buildSessionCreateRequest(defaults: SessionCreateDefaults): Promise<SessionCreateRequest> {
+    const vaultIds = defaults.vaultIds || [];
+    const envOverrides = defaults.envOverrides || {};
+    const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(defaults.environmentId) : undefined;
+    return {
+      agent: defaults.agentId,
+      ...(environmentConfig ? {
+        environment: {
+          id: defaults.environmentId,
+          type: "environment_with_overrides",
+          config: { ...environmentConfig, env: { ...(environmentConfig.env || {}), ...envOverrides } }
+        }
+      } : { environment_id: defaults.environmentId }),
+      ...(vaultIds.length ? { vault_ids: vaultIds } : {})
+    };
+  }
+
+  async createSession(request: SessionCreateRequest): Promise<string>;
+  async createSession(agentId: string, environmentId: string, vaultIds?: string[], envOverrides?: Record<string, string>): Promise<string>;
+  async createSession(
+    requestOrAgentId: SessionCreateRequest | string,
+    environmentId?: string,
+    vaultIds: string[] = [],
+    envOverrides: Record<string, string> = {}
+  ): Promise<string> {
+    if (typeof requestOrAgentId === "string" && !environmentId) {
+      throw new Error("创建 Session 必须提供 environmentId");
+    }
+    const request = typeof requestOrAgentId === "string"
+      ? await this.buildSessionCreateRequest({
+        agentId: requestOrAgentId,
+        environmentId: environmentId || "",
+        vaultIds,
+        envOverrides
+      })
+      : requestOrAgentId;
+    validateSessionCreateRequest(request);
     const response = await this.request("/sessions", {
       method: "POST",
-      body: JSON.stringify({
-        agent: agentId,
-        ...(environmentConfig ? {
-          environment: {
-            id: environmentId,
-            type: "environment_with_overrides",
-            config: { ...environmentConfig, env: { ...(environmentConfig.env || {}), ...envOverrides } }
-          }
-        } : { environment_id: environmentId }),
-        ...(vaultIds.length ? { vault_ids: vaultIds } : {})
-      })
+      body: JSON.stringify(request)
     });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
@@ -219,7 +304,7 @@ export class ArkClient {
   async uploadFile(name: string, mimeType: string, bytes: Uint8Array): Promise<{ id: string; name: string }> {
     const form = new FormData();
     form.set("purpose", "user_data");
-    form.set("file", new Blob([bytes], { type: mimeType || "application/octet-stream" }), name);
+    form.set("file", new Blob([new Uint8Array(bytes)], { type: mimeType || "application/octet-stream" }), name);
     const response = await this.request("/files", { method: "POST", body: form });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
@@ -229,9 +314,13 @@ export class ArkClient {
   }
 
   async addSessionFile(sessionId: string, fileId: string, mountPath: string): Promise<void> {
+    await this.addSessionResource(sessionId, { type: "file", file_id: fileId, mount_path: mountPath });
+  }
+
+  async addSessionResource(sessionId: string, resource: SessionResource): Promise<void> {
     await this.request(`/sessions/${encodeURIComponent(sessionId)}/resources`, {
       method: "POST",
-      body: JSON.stringify({ type: "file", file_id: fileId, access: "read_only", mount_path: mountPath })
+      body: JSON.stringify(resource)
     });
   }
 
@@ -315,10 +404,14 @@ export class ArkClient {
     const messages: string[] = [];
     const seen = new Set<string>();
     const previews = new Map<string, Map<number, string>>();
+    const toolDomains = new Map<string, string>();
+    let authorizationRequired: UserAuthorizationRequired | undefined;
     let lastSnapshot = "";
     for await (const event of await streamPromise) {
       if (event.id && seen.has(event.id)) continue;
       if (event.id) seen.add(event.id);
+      rememberLarkCliToolDomain(event, toolDomains);
+      authorizationRequired ||= eventUserAuthorizationRequired(event, toolDomains);
       if (event.type === "event_start") {
         const preview = event.event && typeof event.event === "object" ? event.event as Record<string, unknown> : undefined;
         if (preview?.type === "agent.message" && typeof preview.id === "string") previews.set(preview.id, new Map());
@@ -331,7 +424,7 @@ export class ArkClient {
         if (blocks && delta?.type === "content_delta" && content?.type === "text" && typeof content.text === "string") {
           blocks.set(index, `${blocks.get(index) || ""}${content.text}`);
           const snapshot = [...blocks.entries()].sort(([left], [right]) => left - right).map(([, value]) => value).join("\n");
-          if (snapshot && snapshot !== lastSnapshot) {
+          if (!authorizationRequired && snapshot && snapshot !== lastSnapshot) {
             lastSnapshot = snapshot;
             await onDelta?.(snapshot);
           }
@@ -341,7 +434,7 @@ export class ArkClient {
         const text = eventText(event);
         if (text) {
           messages.push(text);
-          if (text !== lastSnapshot) {
+          if (!authorizationRequired && text !== lastSnapshot) {
             lastSnapshot = text;
             await onDelta?.(text);
           }
@@ -350,8 +443,8 @@ export class ArkClient {
       }
       const progress = eventProgress(event);
       if (progress) await onProgress?.(progress);
-      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages };
-      if (event.type === "session.status_idle") return { terminal: "idle", messages };
+      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+      if (event.type === "session.status_idle") return { terminal: "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
     }
     throw new Error("事件流结束，但未观察到 Session 终态");
   }
@@ -381,6 +474,23 @@ export class ArkClient {
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
     return parseEventStream(response.body);
   }
+}
+
+function validateSessionCreateRequest(request: SessionCreateRequest): void {
+  if (!request || !request.agent || (typeof request.agent !== "string" && typeof request.agent !== "object")) {
+    throw new Error("创建 Session 必须提供 agent");
+  }
+  const hasEnvironment = request.environment !== undefined;
+  const hasEnvironmentId = request.environment_id !== undefined;
+  if (hasEnvironment === hasEnvironmentId) {
+    throw new Error("environment 与 environment_id 必须且只能传一个");
+  }
+}
+
+function networkErrorDetail(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause instanceof Error ? error.cause.message : typeof error.cause === "string" ? error.cause : "";
+  return [error.message, cause].filter(Boolean).join("；").slice(0, 180);
 }
 
 function waitFor(ms: number, signal: AbortSignal): Promise<void> {
@@ -458,7 +568,37 @@ export function resultFromEvents(events: ArkEvent[], startedAt: number): RunResu
   const idle = current.some(event => event.type === "session.status_idle");
   if (!failed && !idle) return undefined;
   const messages = current.filter(event => event.type === "agent.message").map(eventText).filter(Boolean);
-  return { terminal: failed ? "failed" : "idle", messages };
+  const toolDomains = new Map<string, string>();
+  for (const event of current) rememberLarkCliToolDomain(event, toolDomains);
+  const authorizationRequired = current.map(event => eventUserAuthorizationRequired(event, toolDomains)).find(Boolean);
+  return { terminal: failed ? "failed" : "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+}
+
+function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, string>): void {
+  if (event.type !== "agent.tool_use" || typeof event.id !== "string") return;
+  const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
+  if (typeof input?.command !== "string") return;
+  const match = input.command.match(/(?:^|[;&|]\s*|\s)lark-cli\s+([a-z][\w-]*)\b/i);
+  if (match) toolDomains.set(event.id, match[1].toLowerCase());
+}
+
+export function eventUserAuthorizationRequired(
+  event: ArkEvent,
+  toolDomains: ReadonlyMap<string, string> = new Map()
+): UserAuthorizationRequired | undefined {
+  if (event.type !== "agent.tool_result") return undefined;
+  const text = eventText(event).trim();
+  if (!/^exit_code:\s*3\b/m.test(text)) return undefined;
+  const marker = text.match(/--- stderr ---\s*\n([\s\S]+)$/);
+  if (!marker) return undefined;
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(marker[1].trim()) as Record<string, unknown>; }
+  catch { return undefined; }
+  const error = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : undefined;
+  if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication" || error.subtype !== "token_missing") return undefined;
+  const toolUseId = typeof event.tool_use_id === "string" ? event.tool_use_id : "";
+  const domain = toolDomains.get(toolUseId);
+  return { identity: "user", errorType: "authentication", subtype: "token_missing", ...(domain ? { domain } : {}) };
 }
 
 function parseEventBlock(block: string): ArkEvent[] {

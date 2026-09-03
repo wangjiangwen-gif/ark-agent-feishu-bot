@@ -5,7 +5,12 @@ import { Gateway, resultToReply, shouldHandleMessage, toConversationKey, type In
 import { GatewayStore } from "../src/store.ts";
 
 function message(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
-  return { channelType: "lark", installationId: "cli-test", eventId: "event-1", messageId: "message-1", conversationId: "chat-1", conversationType: "direct", threadId: "", senderId: "user-1", tenantId: "tenant-1", text: "你好", resources: [], mentionedBot: false, ...overrides };
+  return {
+    channelType: "lark", installationId: "cli-test", eventId: "event-1", messageId: "message-1",
+    conversationId: "chat-1", conversationType: "direct", threadId: "", rootMessageId: "", parentMessageId: "",
+    createTime: 1_700_000_000_000, senderId: "user-1", tenantId: "tenant-1", text: "你好",
+    resources: [], mentionedBot: false, ...overrides
+  };
 }
 
 const collectText = (target: string[]) => async (_message: IncomingMessage, outbound: { type: "text"; text: string } | { type: "markdown"; markdown: string } | { type: "card"; card: Record<string, unknown> }): Promise<void> => {
@@ -17,11 +22,466 @@ test("group messages require an explicit bot mention", () => {
   assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: true })), true);
 });
 
-test("group conversations are isolated by the sender open_id", () => {
+test("shared group conversations ignore sender but keep threads isolated", () => {
   const first = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-1" });
   const second = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-2" });
+  const thread = message({ conversationType: "group", mentionedBot: true, senderId: "ou-user-2", threadId: "omt-one" });
   const store = new GatewayStore(":memory:");
   assert.notEqual(store.conversationKey(toConversationKey(first)), store.conversationKey(toConversationKey(second)));
+  assert.equal(store.conversationKey(toConversationKey(first, true)), store.conversationKey(toConversationKey(second, true)));
+  assert.notEqual(store.conversationKey(toConversationKey(first, true)), store.conversationKey(toConversationKey(thread, true)));
+  store.close();
+});
+
+test("shared group mode queues users in one Session and never mounts user Vaults", async () => {
+  const store = new GatewayStore(":memory:");
+  const started: string[] = [];
+  const vaultLists: string[][] = [];
+  const reactions: string[] = [];
+  let creates = 0;
+  let releaseFirst: (() => void) | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async request => {
+      vaultLists.push(request.vault_ids || []);
+      return `session-${++creates}`;
+    },
+    run: async (sessionId, input) => {
+      started.push(`${sessionId}:${input}`);
+      if (input === "群任务 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      return { terminal: "idle" as const, messages: [`${input} 完成`] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    getUserVaultIds: async () => ["vlt-user"],
+    addReaction: async (incoming, emoji) => {
+      reactions.push(`add:${incoming.messageId}:${emoji}`);
+      return `${emoji.toLowerCase()}-${incoming.messageId}`;
+    },
+    removeReaction: async (incoming, reactionId) => { reactions.push(`remove:${incoming.messageId}:${reactionId}`); }
+  });
+
+  gateway.accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    senderId: "ou-a", text: "群任务 A"
+  }));
+  gateway.accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    senderId: "ou-b", text: "群任务 B"
+  }));
+  await delay(20);
+
+  assert.deepEqual(started, ["session-1:群任务 A"]);
+  assert.deepEqual([...reactions].sort(), ["add:message-a:Get", "add:message-b:OnIt"].sort());
+  releaseFirst?.();
+  await delay(30);
+  assert.deepEqual(started, ["session-1:群任务 A", "session-1:群任务 B"]);
+  assert.deepEqual(vaultLists, [["vlt-bot"]]);
+  assert.equal(creates, 1);
+  assert.equal(reactions.length, 6);
+  assert.ok(reactions.indexOf("add:message-b:OnIt") < reactions.indexOf("remove:message-b:onit-message-b"));
+  assert.ok(reactions.indexOf("remove:message-b:onit-message-b") < reactions.indexOf("add:message-b:Get"));
+  assert.ok(reactions.indexOf("add:message-b:Get") < reactions.indexOf("remove:message-b:get-message-b"));
+  store.close();
+});
+
+test("shared group mode gives each thread its own reusable Session", async () => {
+  const store = new GatewayStore(":memory:");
+  let creates = 0;
+  const runs: string[] = [];
+  const emojis: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => `session-${++creates}`,
+    run: async (sessionId, input) => {
+      runs.push(`${sessionId}:${input}`);
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    addReaction: async (_incoming, emoji) => { emojis.push(emoji); return `reaction-${emojis.length}`; },
+    removeReaction: async () => undefined
+  });
+
+  gateway.accept(message({ eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true, threadId: "omt-a", senderId: "ou-a", text: "A1" }));
+  gateway.accept(message({ eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true, threadId: "omt-b", senderId: "ou-b", text: "B1" }));
+  await delay(30);
+  assert.equal(emojis.includes("OnIt"), false);
+  gateway.accept(message({ eventId: "event-c", messageId: "message-c", conversationType: "group", mentionedBot: true, threadId: "omt-a", senderId: "ou-c", text: "A2" }));
+  await delay(30);
+
+  assert.equal(creates, 2);
+  assert.deepEqual(runs, ["session-1:A1", "session-2:B1", "session-1:A2"]);
+  store.close();
+});
+
+test("queued group requests still execute when the OnIt reaction fails", async () => {
+  const store = new GatewayStore(":memory:");
+  const started: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async (_sessionId, input) => {
+      started.push(input);
+      if (input === "A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    addReaction: async (_incoming, emoji) => {
+      if (emoji === "OnIt") throw new Error("reaction unavailable");
+      return "get-reaction";
+    },
+    removeReaction: async () => undefined
+  });
+
+  gateway.accept(message({ eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true, text: "A" }));
+  gateway.accept(message({ eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true, text: "B" }));
+  await delay(20);
+  releaseFirst?.();
+  await delay(30);
+
+  assert.deepEqual(started, ["A", "B"]);
+  store.close();
+});
+
+test("per-message mode starts same-chat group requests concurrently in isolated sessions", async () => {
+  const store = new GatewayStore(":memory:");
+  const created: Array<{ sessionId: string; env: Record<string, string> }> = [];
+  const started: string[] = [];
+  const releases = new Map<string, () => void>();
+  const gateway = new Gateway(store, {
+    createSession: async request => {
+      const sessionId = `session-${created.length + 1}`;
+      const environment = request.environment as { config?: { env?: Record<string, string> } };
+      created.push({ sessionId, env: environment.config?.env || {} });
+      return sessionId;
+    },
+    run: async sessionId => {
+      started.push(sessionId);
+      await new Promise<void>(resolve => releases.set(sessionId, resolve));
+      return { terminal: "idle" as const, messages: [`${sessionId} 完成`] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true
+  });
+
+  gateway.accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    senderId: "ou-a", text: "任务 A"
+  }));
+  gateway.accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    senderId: "ou-b", text: "任务 B"
+  }));
+  await delay(20);
+
+  assert.deepEqual(started, ["session-1", "session-2"]);
+  assert.equal(created[0].env.FEISHU_USER_OPEN_ID, "ou-a");
+  assert.equal(created[1].env.FEISHU_USER_OPEN_ID, "ou-b");
+  releases.get("session-2")?.();
+  releases.get("session-1")?.();
+  await delay(20);
+  assert.equal(store.getSession(toConversationKey(message({ senderId: "ou-a" }))), undefined);
+  assert.equal(store.listAuditLogs().length, 2);
+  store.close();
+});
+
+test("per-message mode still queues direct messages and reuses one Session", async () => {
+  const store = new GatewayStore(":memory:");
+  let creates = 0;
+  const started: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const gateway = new Gateway(store, {
+    createSession: async () => `session-${++creates}`,
+    run: async (_sessionId, input) => {
+      started.push(input);
+      if (input === "私聊 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      return { terminal: "idle" as const, messages: [`${input} 完成`] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true
+  });
+
+  gateway.accept(message({ eventId: "event-a", messageId: "message-a", text: "私聊 A" }));
+  gateway.accept(message({ eventId: "event-b", messageId: "message-b", text: "私聊 B" }));
+  await delay(20);
+
+  assert.deepEqual(started, ["私聊 A"]);
+  releaseFirst?.();
+  await delay(30);
+  assert.deepEqual(started, ["私聊 A", "私聊 B"]);
+  assert.equal(creates, 1);
+  assert.equal(store.getSession(toConversationKey(message())), "session-1");
+  store.close();
+});
+
+test("per-message group Session receives bounded history and current channel identifiers", async () => {
+  const store = new GatewayStore(":memory:");
+  let prompt = "";
+  let sessionEnv: Record<string, string> = {};
+  const gateway = new Gateway(store, {
+    createSession: async request => {
+      const environment = request.environment as { config?: { env?: Record<string, string> } };
+      sessionEnv = environment.config?.env || {};
+      return "session-one";
+    },
+    run: async (_sessionId, input) => { prompt = input; return { terminal: "idle" as const, messages: ["完成"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true, dualIdentity: true,
+    loadRecentHistory: async () => [
+      { messageId: "history-1", senderId: "ou-a", senderName: "张三", senderType: "user", source: "thread", text: "下午改到四点", createTime: 1_699_999_999_000 }
+    ]
+  });
+  gateway.accept(message({
+    conversationType: "group", mentionedBot: true, senderId: "ou-b", text: "帮大家约一下",
+    threadId: "omt-one", rootMessageId: "om-root", parentMessageId: "om-root"
+  }));
+  await delay(30);
+
+  assert.match(prompt, /<conversation_context/);
+  assert.match(prompt, /role="reference"/);
+  assert.doesNotMatch(prompt, /untrusted="true"/);
+  assert.match(prompt, /飞书提供的真实会话记录/);
+  assert.match(prompt, /不构成本轮指令、授权或操作确认/);
+  assert.match(prompt, /"context_scope":"thread"/);
+  assert.match(prompt, /张三.*下午改到四点/);
+  assert.match(prompt, /<current_request>\n帮大家约一下/);
+  assert.deepEqual(sessionEnv, {
+    FEISHU_USER_OPEN_ID: "ou-b",
+    FEISHU_CONVERSATION_TYPE: "group",
+    FEISHU_CHAT_ID: "chat-1",
+    FEISHU_THREAD_ID: "omt-one",
+    FEISHU_TRIGGER_MESSAGE_ID: "message-1",
+    FEISHU_TRIGGER_CREATE_TIME: "1700000000000",
+    LARKSUITE_CLI_STRICT_MODE: "off",
+    LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+    LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
+  });
+  store.close();
+});
+
+test("group history loading overlaps Session creation", async () => {
+  const store = new GatewayStore(":memory:");
+  const operations: string[] = [];
+  let releaseHistory: (() => void) | undefined;
+  const historyPending = new Promise<void>(resolve => { releaseHistory = resolve; });
+  const gateway = new Gateway(store, {
+    createSession: async () => { operations.push("session"); return "session-one"; },
+    run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true,
+    loadRecentHistory: async () => {
+      operations.push("history");
+      await historyPending;
+      return [];
+    }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true }));
+  await delay(20);
+  assert.deepEqual(operations, ["history", "session"]);
+  releaseHistory?.();
+  await delay(30);
+  store.close();
+});
+
+test("group history falls back to prior Gateway requests and replies when Feishu history cannot be loaded", async () => {
+  const store = new GatewayStore(":memory:");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-test", tenantKey: "tenant-1", openId: "ou-a",
+    chatId: "chat-1", messageId: "history-message", action: "message", status: "succeeded",
+    summary: "读取文档 https://example.com/wiki/one", responseSummary: "文档标题是测试方案",
+    messageCreateTime: Date.now()
+  });
+  let prompt = "";
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-one",
+    run: async (_sessionId, input) => { prompt = input; return { terminal: "idle" as const, messages: ["完成"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true,
+    loadRecentHistory: async () => { throw new Error("missing scope"); }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "你用的什么凭证", createTime: Date.now() + 10_000 }));
+  await delay(30);
+
+  assert.match(prompt, /读取文档 https:\/\/example\.com\/wiki\/one/);
+  assert.match(prompt, /文档标题是测试方案/);
+  assert.match(prompt, /<current_request>\n你用的什么凭证/);
+  assert.equal(store.listAuditLogs()[0].status, "succeeded");
+  store.close();
+});
+
+test("shared group Session injects a full snapshot once and only new group messages afterwards", async () => {
+  const store = new GatewayStore(":memory:");
+  const prompts: string[] = [];
+  let history = [
+    { messageId: "before-first", senderId: "ou-a", senderType: "user" as const, source: "chat" as const, text: "第一次请求前的背景", createTime: 100 }
+  ];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async (_sessionId, input) => { prompts.push(input); return { terminal: "idle" as const, messages: ["完成"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    loadRecentHistory: async () => history
+  });
+
+  gateway.accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    senderId: "ou-a", text: "第一次请求", createTime: 200
+  }));
+  await delay(30);
+
+  history = [
+    ...history,
+    { messageId: "between", senderId: "ou-b", senderType: "user" as const, source: "chat" as const, text: "两次请求之间的新消息", createTime: 250 }
+  ];
+  gateway.accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    senderId: "ou-b", text: "第二次请求", createTime: 300
+  }));
+  await delay(30);
+
+  assert.match(prompts[0], /第一次请求前的背景/);
+  assert.match(prompts[0], /<current_request>\n第一次请求/);
+  assert.doesNotMatch(prompts[1], /第一次请求前的背景/);
+  assert.match(prompts[1], /两次请求之间的新消息/);
+  assert.match(prompts[1], /<current_request>\n第二次请求/);
+  store.close();
+});
+
+test("shared group context cursor survives a Gateway restart", async () => {
+  const store = new GatewayStore(":memory:");
+  const firstPrompts: string[] = [];
+  const history = [
+    { messageId: "old", senderId: "ou-a", senderType: "user" as const, source: "chat" as const, text: "旧背景不应重复", createTime: 100 },
+    { messageId: "new", senderId: "ou-b", senderType: "user" as const, source: "chat" as const, text: "重启后的新增消息", createTime: 250 }
+  ];
+  const createGateway = (prompts: string[]) => new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async (_sessionId, input) => { prompts.push(input); return { terminal: "idle" as const, messages: ["完成"] }; }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    loadRecentHistory: async () => history
+  });
+
+  createGateway(firstPrompts).accept(message({
+    eventId: "event-a", messageId: "message-a", conversationType: "group", mentionedBot: true,
+    text: "第一次请求", createTime: 200
+  }));
+  await delay(30);
+
+  const restartedPrompts: string[] = [];
+  createGateway(restartedPrompts).accept(message({
+    eventId: "event-b", messageId: "message-b", conversationType: "group", mentionedBot: true,
+    text: "重启后请求", createTime: 300
+  }));
+  await delay(30);
+
+  assert.doesNotMatch(restartedPrompts[0], /旧背景不应重复/);
+  assert.match(restartedPrompts[0], /重启后的新增消息/);
+  store.close();
+});
+
+test("successful group execution records the final reply for later context fallback", async () => {
+  const store = new GatewayStore(":memory:");
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-one",
+    run: async () => ({ terminal: "idle" as const, messages: ["最终业务回复"] })
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "读取这个文档" }));
+  await delay(30);
+
+  assert.equal(store.listAuditLogs()[0].responseSummary, "最终业务回复");
+  store.close();
+});
+
+test("group token_missing suppresses the Agent error and retries in a new authorized Session", async () => {
+  const store = new GatewayStore(":memory:");
+  const replies: string[] = [];
+  let creates = 0;
+  let runs = 0;
+  let authorizationCalls = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => `session-${++creates}`,
+    run: async () => ++runs === 1 ? {
+      terminal: "idle" as const, messages: ["没有用户凭证"],
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+    } : { terminal: "idle" as const, messages: ["今天没有日程"] }
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true,
+    ensureAuthorization: async (_message, request) => { authorizationCalls++; assert.equal(request.domain, "calendar"); return true; }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "看看今天的安排" }));
+  await delay(80);
+
+  assert.equal(authorizationCalls, 1);
+  assert.equal(creates, 2);
+  assert.equal(runs, 2);
+  assert.deepEqual(replies, ["今天没有日程"]);
+  assert.deepEqual(store.listAuditLogs().map(item => item.action), ["message", "authorization_required"]);
+  store.close();
+});
+
+test("shared group mode never starts user OAuth when the Agent requests UAT", async () => {
+  const store = new GatewayStore(":memory:");
+  const replies: string[] = [];
+  let authorizationCalls = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-group",
+    run: async () => ({
+      terminal: "idle" as const, messages: ["缺少用户凭证"],
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+    })
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    ensureAuthorization: async () => { authorizationCalls++; return true; }
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "查询我的私人日程" }));
+  await delay(40);
+
+  assert.equal(authorizationCalls, 0);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /群聊场景仅使用 Bot 身份/);
+  store.close();
+});
+
+test("repeated token_missing stops after one automatic authorization retry", async () => {
+  const store = new GatewayStore(":memory:");
+  const replies: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session",
+    run: async () => ({
+      terminal: "idle" as const, messages: ["没有用户凭证"],
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+    })
+  }, collectText(replies), {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, perMessageSessions: true, ensureAuthorization: async () => true
+  });
+
+  gateway.accept(message({ conversationType: "group", mentionedBot: true }));
+  await delay(80);
+
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /授权后仍未获得用户凭证/);
   store.close();
 });
 
@@ -35,7 +495,7 @@ test("result requires both a successful terminal and a business message", () => 
   }), "文档已创建：https://example.com/docx/1");
 });
 
-test("gateway acknowledges quickly, deduplicates, and reuses a session", async () => {
+test("gateway avoids processing text for fast requests, deduplicates, and reuses a session", async () => {
   const store = new GatewayStore(":memory:");
   let creates = 0;
   let runs = 0;
@@ -47,11 +507,12 @@ test("gateway acknowledges quickly, deduplicates, and reuses a session", async (
   const gateway = new Gateway(store, ark, collectText(replies), { agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000 });
   assert.equal(gateway.accept(message()), true);
   assert.equal(gateway.accept(message()), false);
+  assert.equal(gateway.accept(message({ eventId: "duplicate-event", messageId: "message-1" })), false);
   gateway.accept(message({ eventId: "event-2", messageId: "message-2", text: "再问" }));
   await delay(30);
   assert.equal(creates, 1);
   assert.equal(runs, 2);
-  assert.deepEqual(replies, ["已收到，正在处理。首次启动可能需要几分钟。", "回复", "回复"]);
+  assert.deepEqual(replies, ["回复", "回复"]);
   store.close();
 });
 
@@ -62,11 +523,12 @@ test("gateway creates a session bound to the user Vault", async () => {
   let sessionVaultIds: string[] | undefined;
   let sessionEnv: Record<string, string> | undefined;
   const gateway = new Gateway(store, {
-    createSession: async (agentId, environmentId, vaultIds, env) => {
-      sessionAgentId = agentId;
-      sessionEnvironmentId = environmentId;
-      sessionVaultIds = vaultIds;
-      sessionEnv = env;
+    createSession: async request => {
+      const environment = request.environment as { id?: string; config?: { env?: Record<string, string> } };
+      sessionAgentId = String(request.agent);
+      sessionEnvironmentId = environment.id || String(request.environment_id || "");
+      sessionVaultIds = request.vault_ids;
+      sessionEnv = environment.config?.env;
       return "session-1";
     },
     run: async () => ({ terminal: "idle" as const, messages: ["完成"] })
@@ -76,7 +538,12 @@ test("gateway creates a session bound to the user Vault", async () => {
   assert.equal(sessionAgentId, "agent-user-owned");
   assert.equal(sessionEnvironmentId, "env-user-owned");
   assert.deepEqual(sessionVaultIds, ["vlt-1"]);
-  assert.deepEqual(sessionEnv, { FEISHU_USER_OPEN_ID: "ou-current-user" });
+  assert.deepEqual(sessionEnv, {
+    FEISHU_USER_OPEN_ID: "ou-current-user",
+    FEISHU_CONVERSATION_TYPE: "direct",
+    LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
+    LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
+  });
   store.close();
 });
 
@@ -88,9 +555,9 @@ test("gateway compacts the old session before resuming in a user-authorized sess
   let resumedInput = "";
   let sessionVaultIds: string[] = [];
   const gateway = new Gateway(store, {
-    createSession: async (_agentId, _environmentId, vaultIds) => {
+    createSession: async request => {
       operations.push("create:session-new");
-      sessionVaultIds = vaultIds;
+      sessionVaultIds = request.vault_ids || [];
       return "session-new";
     },
     run: async (sessionId, input) => {
@@ -117,15 +584,24 @@ test("gateway compacts the old session before resuming in a user-authorized sess
   assert.match(resumedInput, /旧 Session 的文件系统、挂载文件和临时路径未迁移/);
   assert.match(resumedInput, /帮我找大家有空的时间/);
   assert.equal(store.getSession(key), "session-new");
+  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
+  assert.equal(handoffLog?.status, "succeeded");
+  assert.match(handoffLog?.summary || "", /agent_summary/);
   store.close();
 });
 
-test("gateway still rotates and resumes when old-session compaction fails", async () => {
+test("gateway falls back to local audit context when old-session compaction fails", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-test", tenantKey: "tenant-1", openId: "user-1",
+    chatId: "chat-1", messageId: "message-before", sessionId: "session-old", action: "message", status: "succeeded",
+    summary: "用户要安排项目复盘", responseSummary: "已确认参会人是张三和李四", messageCreateTime: 1_699_999_999_000
+  });
   let resumedInput = "";
   const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
     createSession: async () => "session-new",
     run: async (sessionId, input) => {
       if (sessionId === "session-old") throw new Error("compact timeout");
@@ -137,11 +613,46 @@ test("gateway still rotates and resumes when old-session compaction fails", asyn
     platformAccess: true
   });
 
-  gateway.resumeWithHandoff(message({ text: "继续创建日程" }));
+  gateway.accept(message({ text: "继续创建日程" }));
   await delay(40);
 
-  assert.equal(resumedInput, "继续创建日程");
+  assert.match(resumedInput, /source: gateway_audit/);
+  assert.match(resumedInput, /用户要安排项目复盘/);
+  assert.match(resumedInput, /已确认参会人是张三和李四/);
+  assert.match(resumedInput, /继续创建日程/);
   assert.equal(store.getSession(key), "session-new");
+  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
+  assert.equal(handoffLog?.status, "succeeded");
+  assert.match(handoffLog?.summary || "", /gateway_audit/);
+  store.close();
+});
+
+test("automatic rotation keeps the old Session when no handoff context can be recovered", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = toConversationKey(message());
+  store.saveSession(key, "session-old", "agent-1");
+  const operations: string[] = [];
+  let creates = 0;
+  const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
+    createSession: async () => { creates++; return "session-new"; },
+    run: async (sessionId, input) => {
+      operations.push(`${sessionId}:${input.includes("即将接替本 Session") ? "handoff" : input}`);
+      if (input.includes("即将接替本 Session")) throw new Error("compact timeout");
+      return { terminal: "idle" as const, messages: ["继续使用旧会话"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000
+  });
+
+  gateway.accept(message({ text: "继续当前任务" }));
+  await delay(40);
+
+  assert.equal(creates, 0);
+  assert.deepEqual(operations, ["session-old:handoff", "session-old:继续当前任务"]);
+  assert.equal(store.getSession(key), "session-old");
+  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
+  assert.equal(handoffLog?.status, "failed");
   store.close();
 });
 
@@ -206,7 +717,7 @@ test("gateway reuses a session below the rotation threshold", async () => {
   store.close();
 });
 
-test("reused slow sessions receive one delayed processing reply", async () => {
+test("slow sessions receive one delayed processing reply without a startup message", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
   let runs = 0;
@@ -223,7 +734,7 @@ test("reused slow sessions receive one delayed processing reply", async () => {
   gateway.accept(message({ eventId: "event-2", messageId: "message-2" }));
   await delay(40);
   assert.deepEqual(replies, [
-    "已收到，正在处理。首次启动可能需要几分钟。", "回复",
+    "回复",
     "已收到，正在处理，请稍候。", "回复"
   ]);
   store.close();
@@ -350,17 +861,19 @@ test("/new resets the session without refreshing an expired credential", async (
   store.close();
 });
 
-test("gateway downloads, uploads and mounts a Feishu file before running the Agent", async () => {
+test("gateway uploads a Feishu file and mounts it while creating a new Session", async () => {
   const store = new GatewayStore(":memory:");
   const operations: string[] = [];
   let prompt = "";
   const gateway = new Gateway(store, {
-    createSession: async () => { operations.push("session"); return "session-1"; },
+    createSession: async request => {
+      operations.push(`session:${JSON.stringify(request.resources || [])}`);
+      return "session-1";
+    },
     uploadFile: async (name, mimeType, bytes) => {
       operations.push(`upload:${name}:${mimeType}:${bytes.byteLength}`);
       return { id: "file-1", name };
     },
-    addSessionFile: async (_sessionId, _fileId, mountPath) => { operations.push(`mount:${mountPath}`); },
     run: async (_sessionId, text) => { prompt = text; operations.push("run"); return { terminal: "idle" as const, messages: ["文件摘要"] }; }
   }, async () => undefined, {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
@@ -368,8 +881,102 @@ test("gateway downloads, uploads and mounts a Feishu file before running the Age
   });
   gateway.accept(message({ text: "", resources: [{ id: "file-key", name: "季度计划.pdf", type: "file" }] }));
   await delay(30);
-  assert.deepEqual(operations, ["session", "upload:季度计划.pdf:application/pdf:2", "mount:/mnt/data/季度计划.pdf", "run"]);
+  assert.deepEqual(operations, [
+    "upload:季度计划.pdf:application/pdf:2",
+    'session:[{"type":"file","file_id":"file-1","mount_path":"/mnt/data/季度计划.pdf"}]',
+    "run"
+  ]);
   assert.match(prompt, /文件已挂载到：\n- \/mnt\/session\/uploads\/mnt\/data\/季度计划\.pdf/);
+  store.close();
+});
+
+test("gateway lets a Session builder preserve native options and adds initial attachment resources", async () => {
+  const store = new GatewayStore(":memory:");
+  const operations: string[] = [];
+  let createRequest: Record<string, unknown> = {};
+  const gateway = new Gateway(store, {
+    buildSessionCreateRequest: async defaults => ({
+      agent: defaults.agentId,
+      environment_id: defaults.environmentId,
+      vault_ids: defaults.vaultIds
+    }),
+    createSession: async request => {
+      createRequest = request;
+      operations.push("session");
+      return "session-1";
+    },
+    uploadFile: async (name, _mimeType, _bytes) => {
+      operations.push(`upload:${name}`);
+      return { id: "file-1", name };
+    },
+    run: async () => {
+      operations.push("run");
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
+    downloadAttachment: async () => ({ bytes: new Uint8Array([1, 2]), mimeType: "application/pdf" }),
+    buildSessionRequest: async (_message, draft) => ({
+      ...draft,
+      agent: { id: "agent-1", type: "agent", version: 3 },
+      title: "开发者标题",
+      tags: [{ key: "source", value: "lark" }],
+      resources: [
+        { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
+        { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context/", mount_path: "/mnt/data/context" },
+        ...(draft.resources || [])
+      ],
+      future_session_field: "kept"
+    })
+  });
+
+  gateway.accept(message({ text: "总结附件", resources: [{ id: "file-key", name: "报告.pdf", type: "file" }] }));
+  await delay(40);
+
+  assert.deepEqual(operations, ["upload:报告.pdf", "session", "run"]);
+  assert.deepEqual(createRequest.agent, { id: "agent-1", type: "agent", version: 3 });
+  assert.equal(createRequest.title, "开发者标题");
+  assert.equal(createRequest.future_session_field, "kept");
+  assert.deepEqual(createRequest.resources, [
+    { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
+    { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context/", mount_path: "/mnt/data/context" },
+    { type: "file", file_id: "file-1", mount_path: "/mnt/data/报告.pdf" }
+  ]);
+  store.close();
+});
+
+test("gateway appends a generic resource when an existing Session receives a file", async () => {
+  const store = new GatewayStore(":memory:");
+  const incoming = message({ text: "继续分析", resources: [{ id: "file-key", name: "补充.pdf", type: "file" }] });
+  store.saveSession(toConversationKey(incoming), "session-existing", "agent-1");
+  const operations: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => { throw new Error("不应创建新 Session"); },
+    uploadFile: async name => {
+      operations.push(`upload:${name}`);
+      return { id: "file-2", name };
+    },
+    addSessionResource: async (sessionId, resource) => {
+      operations.push(`append:${sessionId}:${JSON.stringify(resource)}`);
+    },
+    run: async sessionId => {
+      operations.push(`run:${sessionId}`);
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000,
+    sessionRotation: false,
+    downloadAttachment: async () => ({ bytes: new Uint8Array([1]), mimeType: "application/pdf" })
+  });
+
+  gateway.accept(incoming);
+  await delay(40);
+
+  assert.deepEqual(operations, [
+    "upload:补充.pdf",
+    'append:session-existing:{"type":"file","file_id":"file-2","mount_path":"/mnt/data/补充.pdf"}',
+    "run:session-existing"
+  ]);
   store.close();
 });
 
