@@ -247,6 +247,29 @@ export class GatewayStore {
     }));
   }
 
+  listSessionAudit(sessionId: string, limit = 12): AuditLog[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM audit_logs
+        WHERE session_id = ? AND status = 'succeeded' AND action IN ('message', 'file_message')
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?
+      ) ORDER BY created_at ASC
+    `).all(sessionId, limit) as Record<string, unknown>[];
+    return rows.map(row => ({
+      id: String(row.id), tenantKey: String(row.tenant_key), openId: String(row.open_id), chatId: String(row.chat_id),
+      channelType: String(row.channel_type || "lark"), installationId: String(row.installation_id || "legacy"),
+      messageId: String(row.message_id), sessionId: row.session_id ? String(row.session_id) : undefined,
+      action: String(row.action), status: row.status as AuditLog["status"],
+      durationMs: row.duration_ms === null ? undefined : Number(row.duration_ms),
+      requestId: row.request_id ? String(row.request_id) : undefined,
+      summary: row.summary ? String(row.summary) : undefined,
+      responseSummary: row.response_summary ? String(row.response_summary) : undefined,
+      messageCreateTime: row.message_create_time === null ? undefined : Number(row.message_create_time),
+      createdAt: String(row.created_at)
+    }));
+  }
+
   listConversationAudit(input: {
     channelType: string; installationId: string; tenantKey: string; chatId: string; beforeCreateTime?: number; limit?: number;
   }): AuditLog[] {

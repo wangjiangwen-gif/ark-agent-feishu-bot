@@ -142,3 +142,29 @@ test("conversation audit keeps request and response summaries for history fallba
   assert.equal(logs[0].messageCreateTime, 100);
   store.close();
 });
+
+test("session audit fallback is scoped to one Managed Agents Session", () => {
+  const store = new GatewayStore(":memory:");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-1", sessionId: "session-old", action: "message", status: "succeeded",
+    summary: "项目代号是北极星", responseSummary: "已记住项目代号", messageCreateTime: 100
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-2", sessionId: "session-other", action: "message", status: "succeeded",
+    summary: "不应串入", responseSummary: "其他会话", messageCreateTime: 200
+  });
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user-1",
+    chatId: "chat", messageId: "message-3", sessionId: "session-old", action: "authorization_required", status: "succeeded",
+    summary: "不应作为对话上下文"
+  });
+
+  const logs = store.listSessionAudit("session-old", 10);
+
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].summary, "项目代号是北极星");
+  assert.equal(logs[0].responseSummary, "已记住项目代号");
+  store.close();
+});

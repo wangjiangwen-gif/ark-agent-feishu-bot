@@ -580,15 +580,24 @@ test("gateway compacts the old session before resuming in a user-authorized sess
   assert.match(resumedInput, /旧 Session 的文件系统、挂载文件和临时路径未迁移/);
   assert.match(resumedInput, /帮我找大家有空的时间/);
   assert.equal(store.getSession(key), "session-new");
+  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
+  assert.equal(handoffLog?.status, "succeeded");
+  assert.match(handoffLog?.summary || "", /agent_summary/);
   store.close();
 });
 
-test("gateway still rotates and resumes when old-session compaction fails", async () => {
+test("gateway falls back to local audit context when old-session compaction fails", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
+  store.addAuditLog({
+    channelType: "lark", installationId: "cli-test", tenantKey: "tenant-1", openId: "user-1",
+    chatId: "chat-1", messageId: "message-before", sessionId: "session-old", action: "message", status: "succeeded",
+    summary: "用户要安排项目复盘", responseSummary: "已确认参会人是张三和李四", messageCreateTime: 1_699_999_999_000
+  });
   let resumedInput = "";
   const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
     createSession: async () => "session-new",
     run: async (sessionId, input) => {
       if (sessionId === "session-old") throw new Error("compact timeout");
@@ -600,11 +609,46 @@ test("gateway still rotates and resumes when old-session compaction fails", asyn
     platformAccess: true
   });
 
-  gateway.resumeWithHandoff(message({ text: "继续创建日程" }));
+  gateway.accept(message({ text: "继续创建日程" }));
   await delay(40);
 
-  assert.equal(resumedInput, "继续创建日程");
+  assert.match(resumedInput, /source: gateway_audit/);
+  assert.match(resumedInput, /用户要安排项目复盘/);
+  assert.match(resumedInput, /已确认参会人是张三和李四/);
+  assert.match(resumedInput, /继续创建日程/);
   assert.equal(store.getSession(key), "session-new");
+  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
+  assert.equal(handoffLog?.status, "succeeded");
+  assert.match(handoffLog?.summary || "", /gateway_audit/);
+  store.close();
+});
+
+test("automatic rotation keeps the old Session when no handoff context can be recovered", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = toConversationKey(message());
+  store.saveSession(key, "session-old", "agent-1");
+  const operations: string[] = [];
+  let creates = 0;
+  const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
+    createSession: async () => { creates++; return "session-new"; },
+    run: async (sessionId, input) => {
+      operations.push(`${sessionId}:${input.includes("即将接替本 Session") ? "handoff" : input}`);
+      if (input.includes("即将接替本 Session")) throw new Error("compact timeout");
+      return { terminal: "idle" as const, messages: ["继续使用旧会话"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000
+  });
+
+  gateway.accept(message({ text: "继续当前任务" }));
+  await delay(40);
+
+  assert.equal(creates, 0);
+  assert.deepEqual(operations, ["session-old:handoff", "session-old:继续当前任务"]);
+  assert.equal(store.getSession(key), "session-old");
+  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
+  assert.equal(handoffLog?.status, "failed");
   store.close();
 });
 
