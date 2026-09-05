@@ -39,6 +39,7 @@ export class KeyedQueue {
 export class Gateway {
   private queue = new KeyedQueue();
   private sessionStatsCheckedAt = new Map<string, number>();
+  private sessionCompactedAtEventCount = new Map<string, number>();
   private authorizationRetries = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
@@ -93,8 +94,12 @@ export class Gateway {
       try {
         await this.withReaction(message, async hasReaction => {
           const isolatedSession = this.usesIsolatedSession(message);
+          const sourceSessionId = isolatedSession ? undefined : this.store.getSession(key);
           const handoff = isolatedSession ? undefined : await this.createSessionHandoff(key, message);
-          if (!isolatedSession) this.store.resetSession(key);
+          if (!isolatedSession) {
+            this.store.resetSession(key);
+            if (sourceSessionId) this.clearSessionStats(sourceSessionId);
+          }
           await this.process(message, key, handoff, hasReaction);
         });
       } catch (error) {
@@ -206,13 +211,30 @@ export class Gateway {
         await this.replyText(message, "当前模式每条消息都会创建独立 Agent Session，无需手动开启新会话。");
         return;
       }
+      const sourceSessionId = this.store.getSession(key);
       this.store.resetSession(key);
+      if (sourceSessionId) this.clearSessionStats(sourceSessionId);
       await this.replyText(message, "已开启新会话，下一条消息会创建新的 Agent Session。");
       if (this.options.platformAccess) this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
         messageId: message.messageId, action: "reset_session", status: "succeeded", messageCreateTime: message.createTime
       });
+      return;
+    }
+    if (message.text.trim() === "/compact") {
+      if (this.usesIsolatedSession(message)) {
+        await this.replyText(message, "当前模式每条消息都会创建独立 Agent Session，无需手动压缩。");
+        return;
+      }
+      const sessionId = this.store.getSession(key);
+      if (!sessionId) {
+        await this.replyText(message, "当前还没有可压缩的 Agent Session。");
+        return;
+      }
+      const compacted = await this.compactSession(message, sessionId);
+      if (!compacted) throw new Error("Agent Session 上下文压缩失败，请稍后重试");
+      await this.replyText(message, "当前 Agent Session 已完成上下文压缩。");
       return;
     }
     let recentHistoryPromise: Promise<ChannelHistoryMessage[]> | undefined;
@@ -276,15 +298,9 @@ export class Gateway {
         input = sections.join("\n\n");
       }
 
-      if (sessionId && await this.shouldRotateSession(sessionId)) {
-        handoff ||= await this.createSessionHandoff(key, message);
-        if (handoff) {
-          this.store.resetSession(key);
-          this.sessionStatsCheckedAt.delete(sessionId);
-          sessionId = undefined;
-        } else {
-          console.warn(`Session ${sessionId} 无法安全生成交接上下文，将继续复用旧 Session`);
-        }
+      if (sessionId) {
+        const eventCount = await this.shouldCompactSession(sessionId);
+        if (eventCount !== undefined) await this.compactSession(message, sessionId, eventCount);
       }
       if (!sessionId) {
         // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
@@ -393,24 +409,68 @@ export class Gateway {
     return [message.channelType, message.installationId, message.messageId].join(":");
   }
 
-  private async shouldRotateSession(sessionId: string): Promise<boolean> {
-    if (this.options.sessionRotation === false || !this.ark.getSessionStats) return false;
+  private async shouldCompactSession(sessionId: string): Promise<number | undefined> {
+    const policy = this.options.sessionCompaction ?? this.options.sessionRotation;
+    if (policy === false || !this.ark.getSessionStats) return undefined;
     const now = Date.now();
     const lastCheckedAt = this.sessionStatsCheckedAt.get(sessionId) || 0;
-    if (now - lastCheckedAt < (this.options.sessionStatsCheckIntervalMs ?? 60_000)) return false;
+    if (now - lastCheckedAt < (this.options.sessionStatsCheckIntervalMs ?? 60_000)) return undefined;
     this.sessionStatsCheckedAt.set(sessionId, now);
-    const limits = this.options.sessionRotation || {};
+    const limits = policy || {};
     try {
       const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2_000));
       const maxEvents = limits.maxEvents ?? 120;
       const maxInputTokens = limits.maxInputTokens ?? 20_000;
-      const rotate = stats.eventCount >= maxEvents || (stats.latestInputTokens ?? 0) >= maxInputTokens;
-      if (rotate) console.info(`Session ${sessionId} 达到上下文阈值，将压缩并轮换`);
-      return rotate;
+      const compactedAt = this.sessionCompactedAtEventCount.get(sessionId) || 0;
+      const shouldCompact = stats.eventCount - compactedAt >= maxEvents
+        || (stats.latestInputTokens ?? 0) >= maxInputTokens;
+      if (shouldCompact) {
+        console.info(`Session ${sessionId} 达到上下文阈值，将在当前 Session 内执行 /compact`);
+        return stats.eventCount;
+      }
+      return undefined;
     } catch (error) {
       console.warn("检查 Session 上下文大小失败，将继续复用当前 Session：", error instanceof Error ? error.message : error);
+      return undefined;
+    }
+  }
+
+  private clearSessionStats(sessionId: string): void {
+    this.sessionStatsCheckedAt.delete(sessionId);
+    this.sessionCompactedAtEventCount.delete(sessionId);
+  }
+
+  private async compactSession(message: IncomingMessage, sessionId: string, eventCount?: number): Promise<boolean> {
+    const startedAt = Date.now();
+    try {
+      const timeoutMs = Math.min(this.options.handoffTimeoutMs ?? 120_000, this.options.timeoutMs);
+      const result = await this.ark.run(sessionId, "/compact", timeoutMs);
+      if (result.terminal !== "idle") throw new Error(`Session 终态为 ${result.terminal}`);
+      if (eventCount !== undefined) this.sessionCompactedAtEventCount.set(sessionId, eventCount);
+      this.sessionStatsCheckedAt.set(sessionId, Date.now());
+      this.recordSessionCompact(message, sessionId, "succeeded", Date.now() - startedAt);
+      return true;
+    } catch (error) {
+      this.recordSessionCompact(message, sessionId, "failed", Date.now() - startedAt);
+      console.warn(`Session ${sessionId} 原地压缩失败，将保留当前 Session：`, error instanceof Error ? error.message : error);
       return false;
     }
+  }
+
+  private recordSessionCompact(
+    message: IncomingMessage,
+    sessionId: string,
+    status: "succeeded" | "failed",
+    durationMs: number
+  ): void {
+    this.store.addAuditLog({
+      channelType: message.channelType, installationId: message.installationId,
+      tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
+      messageId: `${message.messageId}:compact`, sessionId,
+      action: "session_compact", status, durationMs,
+      summary: "mode=in_place; command=/compact",
+      messageCreateTime: message.createTime
+    });
   }
 
   private replyText(message: IncomingMessage, text: string): Promise<void> {
@@ -509,6 +569,8 @@ export type GatewayOptions = {
   timeoutMs: number;
   progressDelayMs?: number;
   handoffTimeoutMs?: number;
+  sessionCompaction?: false | { maxEvents?: number; maxInputTokens?: number };
+  /** @deprecated Use sessionCompaction. Kept for compatibility with versions before 0.2.7. */
   sessionRotation?: false | { maxEvents?: number; maxInputTokens?: number };
   sessionStatsCheckIntervalMs?: number;
   sessionStatsTimeoutMs?: number;

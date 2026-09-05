@@ -111,7 +111,7 @@ npx --yes arkagent@latest login
 
 也可以在与 Bot 的单聊中直接发送 PDF、Office 文档、Markdown、TXT 或图片。Markdown/TXT 会按 UTF-8 提取原文并直接放入本次消息（上限 256 KB）；其他文件会上传到方舟 Files，并以只读方式挂载到当前 Managed Agents Session。未附带文字指令时默认总结文件。二进制文件上限为 20 MB，实际可解析格式仍以方舟 Files API 支持范围为准。
 
-`/new` 会清除当前飞书会话到方舟 Session 的映射；下一条消息将创建新 Session。
+`/compact` 会调用 Managed Agents 内置能力，在当前 Session 内压缩上下文，Session ID、挂载资源和会话映射保持不变。Gateway 也会在上下文达到阈值时自动执行同样的原地压缩。`/new` 会清除当前飞书会话到方舟 Session 的映射；下一条消息将创建新 Session。
 
 ## 数字员工模式
 
@@ -272,7 +272,7 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 
 - 单聊中的文本、文件和图片消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
-- 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session，`/new` 显式重置；数字员工仅在群聊中为每条 @ 消息创建独立 Session，多用户请求并行执行。
+- 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session；`/compact` 在原 Session 内压缩上下文，`/new` 显式重置。只有 OAuth/Vault 变化等必须更换凭证快照的场景才创建新 Session 并交接必要上下文。数字员工仅在群聊中为每条 @ 消息创建独立 Session，多用户请求并行执行。
 - 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
 - Gateway 优先使用 `Get` 表情反馈处理中状态；仅当表情添加失败且请求超过 2.5 秒仍未完成时，才发送一次“正在处理，请稍候。”兜底提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。

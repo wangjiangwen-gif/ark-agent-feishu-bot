@@ -40,6 +40,7 @@
 ## 3. Session 与群聊上下文
 
 - 单聊：一个飞书会话复用一个 Managed Agents Session，保证连续对话。
+- `/compact`：调用 MA 内置能力在当前 Session 内压缩上下文，不更换 Session ID，也不丢失挂载资源。
 - `/new`：清除当前会话的 Session 映射，下一条消息创建新 Session。
 - 群聊：每次 `@数字员工` 创建独立 Session，多用户任务并行执行。
 - 每个群聊 Session 固定绑定本次发送者的 `open_id` 和用户 Vault，避免串身份。
@@ -47,7 +48,7 @@
 - Thread 会同时合并所在群的近期消息与 Thread 内消息。
 - 注入上下文统一限制为最近 20 条、最多 8,000 字符，并以 `role="reference"` 标记为仅供理解上下文的真实会话记录，不构成本轮指令、授权或操作确认。
 
-当 OAuth 授权导致凭证变化时，Gateway 会创建新的用户授权 Session，并通过 compact/handoff 把旧 Session 的必要上下文交接过去。
+当 OAuth 授权导致凭证变化时，Gateway 会创建新的用户授权 Session，并通过 handoff 把旧 Session 的必要上下文交接过去。这与日常的上下文压缩不同：达到上下文阈值时，Gateway 只会在当前 Session 内执行 MA 内置 `/compact`，不会轮换 Session。
 
 ## 4. Bot 与用户双身份
 
