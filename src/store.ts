@@ -57,6 +57,7 @@ export class GatewayStore {
         session_id TEXT NOT NULL,
         agent_id TEXT NOT NULL,
         agent_version TEXT,
+        vault_ids TEXT,
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS processed_events (
@@ -108,6 +109,7 @@ export class GatewayStore {
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
     this.ensureColumn("audit_logs", "response_summary", "TEXT");
     this.ensureColumn("audit_logs", "message_create_time", "INTEGER");
+    this.ensureColumn("conversations", "vault_ids", "TEXT");
     if (path !== ":memory:") try { chmodSync(path, 0o600); } catch { /* directory permissions remain the outer boundary */ }
   }
 
@@ -132,16 +134,28 @@ export class GatewayStore {
     return undefined;
   }
 
-  saveSession(key: ConversationKey, sessionId: string, agentId: string, agentVersion?: string): void {
+  getSessionVaultIds(key: ConversationKey): string[] | undefined {
+    const row = this.db.prepare("SELECT vault_ids FROM conversations WHERE conversation_key = ?").get(this.conversationKey(key)) as { vault_ids: string | null } | undefined;
+    if (!row?.vault_ids) return undefined;
+    try {
+      const value = JSON.parse(row.vault_ids) as unknown;
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  saveSession(key: ConversationKey, sessionId: string, agentId: string, agentVersion?: string, vaultIds?: string[]): void {
     this.db.prepare(`
-      INSERT INTO conversations (conversation_key, session_id, agent_id, agent_version, updated_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO conversations (conversation_key, session_id, agent_id, agent_version, vault_ids, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(conversation_key) DO UPDATE SET
         session_id = excluded.session_id,
         agent_id = excluded.agent_id,
         agent_version = excluded.agent_version,
+        vault_ids = excluded.vault_ids,
         updated_at = excluded.updated_at
-    `).run(this.conversationKey(key), sessionId, agentId, agentVersion || null, new Date().toISOString());
+    `).run(this.conversationKey(key), sessionId, agentId, agentVersion || null, vaultIds ? JSON.stringify(vaultIds) : null, new Date().toISOString());
   }
 
   getConversationContextCursor(key: ConversationKey, sessionId: string): number | undefined {

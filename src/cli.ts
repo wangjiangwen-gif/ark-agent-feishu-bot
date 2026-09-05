@@ -89,8 +89,7 @@ async function runEmployee(): Promise<void> {
     ark,
     new FeishuOAuth(config.feishuAppId, config.feishuAppSecret),
     sendAuthorizationCard,
-    message => gateway.resume(message),
-    message => gateway.resumeWithHandoff(message)
+    (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId)
   );
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,

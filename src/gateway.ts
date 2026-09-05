@@ -88,6 +88,19 @@ export class Gateway {
     });
   }
 
+  resumeAfterAuthorization(message: IncomingMessage, userVaultId: string): void {
+    const key = this.conversationKey(message);
+    const sessionId = this.store.getSession(key);
+    if (!sessionId || this.store.getSessionVaultIds(key)?.includes(userVaultId)) {
+      this.resume(message);
+      return;
+    }
+    // 升级前创建的 Session 没有记录已挂载的 Vault，且 MA 不支持给运行中的
+    // Session 追加 Vault。仅这类遗留会话执行一次交接；新版会话均原地恢复。
+    console.info(`Session ${sessionId} 缺少用户 Vault 挂载记录，将执行一次兼容性交接`);
+    this.resumeWithHandoff(message);
+  }
+
   resumeWithHandoff(message: IncomingMessage): void {
     const key = this.conversationKey(message);
     this.schedule(message, key, async () => {
@@ -308,14 +321,15 @@ export class Gateway {
         const extraVaultIds = message.conversationType === "group" && this.options.sharedGroupSessions
           ? []
           : await this.options.getUserVaultIds?.(message) || [];
+        const vaultIds = [...new Set([this.options.vaultId, ...extraVaultIds])];
         const request = await this.buildSessionCreateRequest(
           message,
-          [this.options.vaultId, ...extraVaultIds],
+          vaultIds,
           initialResources
         );
         sessionId = await this.ark.createSession(request);
         createdSession = true;
-        if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId);
+        if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId, undefined, vaultIds);
       } else if (initialResources.length) {
         for (const resource of initialResources) await this.addSessionResource(sessionId, resource);
       }
@@ -401,8 +415,7 @@ export class Gateway {
     });
     const ready = await this.options.ensureAuthorization(message, request);
     if (!ready) return;
-    if (this.usesIsolatedSession(message)) this.resume(message);
-    else this.resumeWithHandoff(message);
+    this.resume(message);
   }
 
   private authorizationRetryKey(message: IncomingMessage): string {

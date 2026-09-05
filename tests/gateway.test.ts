@@ -590,6 +590,63 @@ test("gateway hands off the old session before resuming in a user-authorized ses
   store.close();
 });
 
+test("authorization resumes a Session in place when its user Vault was mounted at creation", async () => {
+  const store = new GatewayStore(":memory:");
+  const incoming = message({ text: "查询今天日程" });
+  const key = toConversationKey(incoming);
+  store.saveSession(key, "session-current", "agent-1", undefined, ["vlt-bot", "vlt-user"]);
+  const runs: string[] = [];
+  let creates = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => { creates++; return "session-new"; },
+    run: async sessionId => {
+      runs.push(sessionId);
+      return { terminal: "idle" as const, messages: ["今天没有日程"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true
+  });
+
+  gateway.resumeAfterAuthorization(incoming, "vlt-user");
+  await delay(30);
+
+  assert.deepEqual(runs, ["session-current"]);
+  assert.equal(creates, 0);
+  assert.equal(store.getSession(key), "session-current");
+  assert.equal(store.listAuditLogs().some(log => log.action === "session_handoff"), false);
+  store.close();
+});
+
+test("authorization performs one compatibility handoff for a legacy Session without Vault metadata", async () => {
+  const store = new GatewayStore(":memory:");
+  const incoming = message({ text: "查询今天日程" });
+  const key = toConversationKey(incoming);
+  store.saveSession(key, "session-legacy", "agent-1");
+  const runs: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-upgraded",
+    run: async (sessionId, input) => {
+      runs.push(sessionId);
+      return sessionId === "session-legacy"
+        ? { terminal: "idle" as const, messages: ["用户要查询今天日程"] }
+        : { terminal: "idle" as const, messages: [input] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, getUserVaultIds: async () => ["vlt-user"]
+  });
+
+  gateway.resumeAfterAuthorization(incoming, "vlt-user");
+  await delay(40);
+
+  assert.deepEqual(runs, ["session-legacy", "session-upgraded"]);
+  assert.equal(store.getSession(key), "session-upgraded");
+  assert.deepEqual(store.getSessionVaultIds(key), ["vlt-bot", "vlt-user"]);
+  assert.equal(store.listAuditLogs().some(log => log.action === "session_handoff"), true);
+  store.close();
+});
+
 test("gateway falls back to local audit context when OAuth handoff summarization fails", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
