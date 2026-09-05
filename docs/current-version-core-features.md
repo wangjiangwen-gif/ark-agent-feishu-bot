@@ -40,14 +40,15 @@
 ## 3. Session 与群聊上下文
 
 - 单聊：一个飞书会话复用一个 Managed Agents Session，保证连续对话。
+- `/compact`：调用 MA 内置能力在当前 Session 内压缩上下文，不更换 Session ID，也不丢失挂载资源。
 - `/new`：清除当前会话的 Session 映射，下一条消息创建新 Session。
-- 群聊：每次 `@数字员工` 创建独立 Session，多用户任务并行执行。
-- 每个群聊 Session 固定绑定本次发送者的 `open_id` 和用户 Vault，避免串身份。
+- 普通群聊：按群共享一个 Session，消息依次排队执行；Thread 按话题共享独立 Session。
+- 群聊 Session 只绑定 Bot Vault，不挂载成员 UAT，避免多人会话串身份。
 - 创建群聊 Session 时自动注入触发消息之前的近期群聊上下文。
 - Thread 会同时合并所在群的近期消息与 Thread 内消息。
 - 注入上下文统一限制为最近 20 条、最多 8,000 字符，并以 `role="reference"` 标记为仅供理解上下文的真实会话记录，不构成本轮指令、授权或操作确认。
 
-当 OAuth 授权导致凭证变化时，Gateway 会创建新的用户授权 Session，并通过 compact/handoff 把旧 Session 的必要上下文交接过去。
+单聊 Session 创建前会预挂当前用户独立的 Vault 与占位 Credential。`lark-cli --as user` 返回结构化 `token_missing` 后，Gateway 才发送 OAuth 卡片；授权完成后更新同一个 Credential，并在原 Session 自动续跑。只有升级前没有 Vault 挂载元数据的遗留 Session 会执行一次兼容性 handoff。达到上下文阈值时，Gateway 在当前 Session 内执行 MA 内置 `/compact`，不会轮换 Session。
 
 ## 4. Bot 与用户双身份
 
@@ -62,7 +63,7 @@ FEISHU_USER_OPEN_ID
 数字员工 Session 可以同时拥有：
 
 - Bot Vault：保存短期 tenant access token。
-- 当前用户 Vault：仅在该用户完成 OAuth 后挂载。
+- 当前用户 Vault：单聊首次创建 Session 前即以占位 Credential 预挂载，OAuth 后原地更新值。
 - 当前消息发送者 open_id：用于身份识别、邀请参会人和审计。
 
 由此实现“默认使用 Bot 身份工作，必要时临时获得当前用户授权”的双身份模型。
@@ -127,6 +128,6 @@ arkagent employee repair-environment
 - Gateway 仍需运行在用户或客户可控的服务环境中，目前默认是本地进程。
 - 飞书应用 scope 可以在 init 阶段一次性声明，但管理员审核无法由工具跳过。
 - 每位用户的数据访问同意必须由本人完成 OAuth，不能由管理员或初始化流程代替。
-- Managed Agents Credential 更新不会自动同步到旧 Session，因此授权或 token 更新后需要创建新 Session 并交接上下文。
+- Managed Agents 能让运行中 Session 读取已挂载 Credential 的新值，但不能给运行中 Session 追加 Vault；因此用户 Vault 必须在单聊 Session 创建前预挂载。
 
-总体而言，`0.2.5` 已经是一套围绕 Managed Agents 的飞书 Channel 插件：负责资源初始化、双身份、Session 生命周期、OAuth handoff、群聊上下文、文件挂载、流式消息和基础审计。
+总体而言，当前版本是一套围绕 Managed Agents 的飞书 Channel 插件：负责资源初始化、双身份、Session 生命周期、OAuth 原 Session 续跑、群聊上下文、文件挂载、流式消息和基础审计。

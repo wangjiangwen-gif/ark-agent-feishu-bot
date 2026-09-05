@@ -547,7 +547,7 @@ test("gateway creates a session bound to the user Vault", async () => {
   store.close();
 });
 
-test("gateway compacts the old session before resuming in a user-authorized session", async () => {
+test("gateway hands off the old session before resuming in a user-authorized session", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
@@ -590,7 +590,64 @@ test("gateway compacts the old session before resuming in a user-authorized sess
   store.close();
 });
 
-test("gateway falls back to local audit context when old-session compaction fails", async () => {
+test("authorization resumes a Session in place when its user Vault was mounted at creation", async () => {
+  const store = new GatewayStore(":memory:");
+  const incoming = message({ text: "查询今天日程" });
+  const key = toConversationKey(incoming);
+  store.saveSession(key, "session-current", "agent-1", undefined, ["vlt-bot", "vlt-user"]);
+  const runs: string[] = [];
+  let creates = 0;
+  const gateway = new Gateway(store, {
+    createSession: async () => { creates++; return "session-new"; },
+    run: async sessionId => {
+      runs.push(sessionId);
+      return { terminal: "idle" as const, messages: ["今天没有日程"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true
+  });
+
+  gateway.resumeAfterAuthorization(incoming, "vlt-user");
+  await delay(30);
+
+  assert.deepEqual(runs, ["session-current"]);
+  assert.equal(creates, 0);
+  assert.equal(store.getSession(key), "session-current");
+  assert.equal(store.listAuditLogs().some(log => log.action === "session_handoff"), false);
+  store.close();
+});
+
+test("authorization performs one compatibility handoff for a legacy Session without Vault metadata", async () => {
+  const store = new GatewayStore(":memory:");
+  const incoming = message({ text: "查询今天日程" });
+  const key = toConversationKey(incoming);
+  store.saveSession(key, "session-legacy", "agent-1");
+  const runs: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-upgraded",
+    run: async (sessionId, input) => {
+      runs.push(sessionId);
+      return sessionId === "session-legacy"
+        ? { terminal: "idle" as const, messages: ["用户要查询今天日程"] }
+        : { terminal: "idle" as const, messages: [input] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, getUserVaultIds: async () => ["vlt-user"]
+  });
+
+  gateway.resumeAfterAuthorization(incoming, "vlt-user");
+  await delay(40);
+
+  assert.deepEqual(runs, ["session-legacy", "session-upgraded"]);
+  assert.equal(store.getSession(key), "session-upgraded");
+  assert.deepEqual(store.getSessionVaultIds(key), ["vlt-bot", "vlt-user"]);
+  assert.equal(store.listAuditLogs().some(log => log.action === "session_handoff"), true);
+  store.close();
+});
+
+test("gateway falls back to local audit context when OAuth handoff summarization fails", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
@@ -601,7 +658,6 @@ test("gateway falls back to local audit context when old-session compaction fail
   });
   let resumedInput = "";
   const gateway = new Gateway(store, {
-    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
     createSession: async () => "session-new",
     run: async (sessionId, input) => {
       if (sessionId === "session-old") throw new Error("compact timeout");
@@ -613,7 +669,7 @@ test("gateway falls back to local audit context when old-session compaction fail
     platformAccess: true
   });
 
-  gateway.accept(message({ text: "继续创建日程" }));
+  gateway.resumeWithHandoff(message({ text: "继续创建日程" }));
   await delay(40);
 
   assert.match(resumedInput, /source: gateway_audit/);
@@ -627,7 +683,7 @@ test("gateway falls back to local audit context when old-session compaction fail
   store.close();
 });
 
-test("automatic rotation keeps the old Session when no handoff context can be recovered", async () => {
+test("automatic compaction keeps using the same Session when compact fails", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
@@ -637,8 +693,8 @@ test("automatic rotation keeps the old Session when no handoff context can be re
     getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
     createSession: async () => { creates++; return "session-new"; },
     run: async (sessionId, input) => {
-      operations.push(`${sessionId}:${input.includes("即将接替本 Session") ? "handoff" : input}`);
-      if (input.includes("即将接替本 Session")) throw new Error("compact timeout");
+      operations.push(`${sessionId}:${input}`);
+      if (input === "/compact") throw new Error("compact timeout");
       return { terminal: "idle" as const, messages: ["继续使用旧会话"] };
     }
   }, async () => undefined, {
@@ -649,32 +705,30 @@ test("automatic rotation keeps the old Session when no handoff context can be re
   await delay(40);
 
   assert.equal(creates, 0);
-  assert.deepEqual(operations, ["session-old:handoff", "session-old:继续当前任务"]);
+  assert.deepEqual(operations, ["session-old:/compact", "session-old:继续当前任务"]);
   assert.equal(store.getSession(key), "session-old");
-  const handoffLog = store.listAuditLogs().find(log => log.action === "session_handoff");
-  assert.equal(handoffLog?.status, "failed");
+  const compactLog = store.listAuditLogs().find(log => log.action === "session_compact");
+  assert.equal(compactLog?.status, "failed");
   store.close();
 });
 
-test("gateway automatically compacts and rotates an oversized session", async () => {
+test("gateway automatically compacts an oversized Session in place", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
   const operations: string[] = [];
-  let newInput = "";
+  let creates = 0;
   const gateway = new Gateway(store, {
     getSessionStats: async sessionId => {
       operations.push(`stats:${sessionId}`);
       return { eventCount: 196, latestInputTokens: 27_611 };
     },
     createSession: async () => {
-      operations.push("create:session-new");
+      creates++;
       return "session-new";
     },
     run: async (sessionId, input) => {
-      operations.push(`run:${sessionId}`);
-      if (sessionId === "session-old") return { terminal: "idle" as const, messages: ["用户目标：继续完成办公任务。"] };
-      newInput = input;
+      operations.push(`run:${sessionId}:${input}`);
       return { terminal: "idle" as const, messages: ["完成"] };
     }
   }, async () => undefined, {
@@ -684,14 +738,15 @@ test("gateway automatically compacts and rotates an oversized session", async ()
   gateway.accept(message({ text: "继续" }));
   await delay(40);
 
-  assert.deepEqual(operations, ["stats:session-old", "run:session-old", "create:session-new", "run:session-new"]);
-  assert.match(newInput, /用户目标：继续完成办公任务/);
-  assert.match(newInput, /<current_user_request>\n继续/);
-  assert.equal(store.getSession(key), "session-new");
+  assert.deepEqual(operations, ["stats:session-old", "run:session-old:/compact", "run:session-old:继续"]);
+  assert.equal(creates, 0);
+  assert.equal(store.getSession(key), "session-old");
+  const compactLog = store.listAuditLogs().find(log => log.action === "session_compact");
+  assert.equal(compactLog?.status, "succeeded");
   store.close();
 });
 
-test("gateway reuses a session below the rotation threshold", async () => {
+test("gateway reuses a Session below the compaction threshold", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-current", "agent-1");
@@ -713,6 +768,58 @@ test("gateway reuses a session below the rotation threshold", async () => {
 
   assert.equal(creates, 0);
   assert.equal(runSession, "session-current");
+  assert.equal(store.getSession(key), "session-current");
+  store.close();
+});
+
+test("gateway does not compact the same event range repeatedly", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = toConversationKey(message());
+  store.saveSession(key, "session-current", "agent-1");
+  const inputs: string[] = [];
+  const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 196, latestInputTokens: 1_000 }),
+    createSession: async () => "session-new",
+    run: async (_sessionId, input) => {
+      inputs.push(input);
+      return { terminal: "idle" as const, messages: ["完成"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1",
+    timeoutMs: 5_000, sessionStatsCheckIntervalMs: 0
+  });
+
+  gateway.accept(message({ messageId: "message-compact-1", text: "任务一" }));
+  await delay(30);
+  gateway.accept(message({ messageId: "message-compact-2", text: "任务二" }));
+  await delay(30);
+
+  assert.deepEqual(inputs, ["/compact", "任务一", "任务二"]);
+  assert.equal(store.getSession(key), "session-current");
+  store.close();
+});
+
+test("manual compact runs the Managed Agents command in the current Session", async () => {
+  const store = new GatewayStore(":memory:");
+  const key = toConversationKey(message());
+  store.saveSession(key, "session-current", "agent-1");
+  const operations: string[] = [];
+  const replies: string[] = [];
+  const gateway = new Gateway(store, {
+    createSession: async () => "session-new",
+    run: async (sessionId, input) => {
+      operations.push(`${sessionId}:${input}`);
+      return { terminal: "idle" as const, messages: [] };
+    }
+  }, async (_message, outbound) => { if (outbound.type === "text") replies.push(outbound.text); }, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-1", authorizedUserId: "user-1", timeoutMs: 5_000
+  });
+
+  gateway.accept(message({ text: "/compact" }));
+  await delay(30);
+
+  assert.deepEqual(operations, ["session-current:/compact"]);
+  assert.deepEqual(replies, ["当前 Agent Session 已完成上下文压缩。"]);
   assert.equal(store.getSession(key), "session-current");
   store.close();
 });

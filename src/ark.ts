@@ -589,10 +589,14 @@ export function eventUserAuthorizationRequired(
   if (event.type !== "agent.tool_result") return undefined;
   const text = eventText(event).trim();
   if (!/^exit_code:\s*3\b/m.test(text)) return undefined;
-  const marker = text.match(/--- stderr ---\s*\n([\s\S]+)$/);
+  const marker = text.match(/--- (?:stderr|output \(stdout \+ stderr\)) ---\s*\n([\s\S]+)$/);
   if (!marker) return undefined;
+  const normalized = marker[1].split("\n").map(line => line.replace(/^\s*\d+\t/, "")).join("\n").trim();
+  const jsonStart = normalized.indexOf("{");
+  const jsonEnd = normalized.lastIndexOf("}");
+  if (jsonStart < 0 || jsonEnd < jsonStart) return undefined;
   let payload: Record<string, unknown>;
-  try { payload = JSON.parse(marker[1].trim()) as Record<string, unknown>; }
+  try { payload = JSON.parse(normalized.slice(jsonStart, jsonEnd + 1)) as Record<string, unknown>; }
   catch { return undefined; }
   const error = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : undefined;
   if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication" || error.subtype !== "token_missing") return undefined;

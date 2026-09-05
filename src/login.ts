@@ -20,7 +20,7 @@ export async function runLoginFlow(options: {
   // 先更新运行时 Credential，再原子更新本地可刷新的 OAuth 状态。
   await options.ark.updateEnvironmentCredential(options.vaultId, options.credentialId, tokens.accessToken);
   await persistOAuthState(options.configPath, tokens, userOpenId);
-  // Credential 只在创建 Session 时注入；登录后必须废弃旧映射，避免复用旧 token 的 Session。
+  // login 允许切换授权用户；即使 Credential 值可热更新，也要隔离新旧用户的会话上下文。
   const invalidatedSessions = await options.invalidateSessions();
   return { userOpenId, expiresAt: tokens.expiresAt, invalidatedSessions };
 }

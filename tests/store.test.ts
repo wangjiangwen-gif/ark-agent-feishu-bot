@@ -8,10 +8,11 @@ import { GatewayStore } from "../src/store.ts";
 
 const key = { channelType: "lark", installationId: "cli-one", tenantId: "tenant", conversationId: "chat", threadId: "", senderId: "user" };
 
-test("store saves, reuses and resets a conversation session", () => {
+test("store saves, reuses and resets a conversation session with its mounted Vaults", () => {
   const store = new GatewayStore(":memory:");
-  store.saveSession(key, "session-1", "agent-1", "3");
+  store.saveSession(key, "session-1", "agent-1", "3", ["vlt-bot", "vlt-user"]);
   assert.equal(store.getSession(key), "session-1");
+  assert.deepEqual(store.getSessionVaultIds(key), ["vlt-bot", "vlt-user"]);
   store.resetSession(key);
   assert.equal(store.getSession(key), undefined);
   store.close();
@@ -44,9 +45,10 @@ test("opening a v0.2 database migrates legacy sessions and audit columns", () =>
   store.resetSession(key);
   assert.equal(store.getSession(key), undefined);
   const reopen = new DatabaseSync(path);
-  reopen.prepare("INSERT INTO conversations VALUES (?, ?, ?, ?, ?)").run("tenant:chat:-:user", "legacy-session", "agent-1", null, "2026-01-01T00:00:00.000Z");
+  reopen.prepare("INSERT INTO conversations (conversation_key, session_id, agent_id, agent_version, updated_at) VALUES (?, ?, ?, ?, ?)").run("tenant:chat:-:user", "legacy-session", "agent-1", null, "2026-01-01T00:00:00.000Z");
   reopen.close();
   assert.equal(store.getSession(key), "legacy-session");
+  assert.equal(store.getSessionVaultIds(key), undefined);
   const log = store.addAuditLog({ channelType: "lark", installationId: "cli-one", tenantKey: "tenant", openId: "user", chatId: "chat", messageId: "om-1", action: "message", status: "succeeded" });
   assert.equal(log.installationId, "cli-one");
   assert.equal(store.listAuditLogs()[0].channelType, "lark");

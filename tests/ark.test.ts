@@ -44,6 +44,28 @@ test("lark-cli user token_missing is parsed from a successful MA tool_result env
   assert.equal((toolUse.input.command.match(/lark-cli\s+([\w-]+)/) || [])[1], "calendar");
 });
 
+test("lark-cli token_missing is parsed from numbered combined tool output", () => {
+  const toolResult = {
+    type: "agent.tool_result", tool_use_id: "call-numbered", is_error: false,
+    content: [{ type: "text", text: `exit_code: 3
+--- output (stdout + stderr) ---
+     1\t{
+     2\t  "ok": false,
+     3\t  "identity": "user",
+     4\t  "error": {
+     5\t    "type": "authentication",
+     6\t    "subtype": "token_missing",
+     7\t    "message": "no access token available for user"
+     8\t  }
+     9\t}
+` }]
+  };
+
+  assert.deepEqual(eventUserAuthorizationRequired(toolResult, new Map([["call-numbered", "calendar"]])), {
+    identity: "user", errorType: "authentication", subtype: "token_missing", domain: "calendar"
+  });
+});
+
 test("resultFromEvents preserves user authorization requirements despite MA is_error false", () => {
   const processedAt = new Date(Date.now() + 1_000).toISOString();
   const result = resultFromEvents([
