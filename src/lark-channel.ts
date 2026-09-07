@@ -394,6 +394,7 @@ function normalizeHistoryItem(item: LarkHistoryItem, source: "chat" | "thread"):
   const messageId = String(item.message_id || "");
   const text = historyItemText(item);
   if (!messageId || !text) return undefined;
+  const resources = historyItemResources(item);
   return {
     messageId,
     senderId: String(item.sender?.id || "unknown"),
@@ -401,8 +402,26 @@ function normalizeHistoryItem(item: LarkHistoryItem, source: "chat" | "thread"):
     senderType: String(item.sender?.sender_type || "unknown"),
     source,
     text,
+    ...(resources.length ? { resources } : {}),
     createTime: Number(item.create_time || 0)
   };
+}
+
+function historyItemResources(item: LarkHistoryItem): ChannelResource[] {
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(item.body?.content || "{}") as Record<string, unknown>; }
+  catch { return []; }
+  if (item.msg_type === "file" && typeof value.file_key === "string" && value.file_key) {
+    return [{
+      id: value.file_key,
+      name: typeof value.file_name === "string" && value.file_name ? value.file_name : value.file_key,
+      type: "file"
+    }];
+  }
+  if (item.msg_type === "image" && typeof value.image_key === "string" && value.image_key) {
+    return [{ id: value.image_key, name: `${value.image_key}.jpg`, type: "image" }];
+  }
+  return [];
 }
 
 function historyItemText(item: LarkHistoryItem): string {

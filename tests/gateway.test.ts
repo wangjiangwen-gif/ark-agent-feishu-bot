@@ -358,6 +358,57 @@ test("shared group Session injects a full snapshot once and only new group messa
   store.close();
 });
 
+test("next group mention automatically mounts an attachment from an earlier unmentioned message", async () => {
+  const store = new GatewayStore(":memory:");
+  const operations: string[] = [];
+  let prompt = "";
+  const gateway = new Gateway(store, {
+    createSession: async () => { operations.push("create"); return "session-group"; },
+    uploadFile: async (name, mimeType, bytes) => {
+      operations.push(`upload:${name}:${mimeType}:${bytes.byteLength}`);
+      return { id: "ark-file-1", name };
+    },
+    addSessionResource: async (sessionId, resource) => {
+      operations.push(`mount:${sessionId}:${JSON.stringify(resource)}`);
+    },
+    run: async (_sessionId, input) => {
+      prompt = input;
+      operations.push("run");
+      return { terminal: "idle" as const, messages: ["已总结"] };
+    }
+  }, async () => undefined, {
+    agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
+    platformAccess: true, sharedGroupSessions: true,
+    loadRecentHistory: async () => [{
+      messageId: "om-unmentioned-file", senderId: "ou-a", senderName: "张三", senderType: "user",
+      source: "chat", text: "[文件：会议材料.pdf]", createTime: 1_699_999_999_000,
+      resources: [{ id: "file-v3-old", name: "会议材料.pdf", type: "file" }]
+    }],
+    downloadAttachment: async (attachment, sourceMessage) => {
+      operations.push(`download:${sourceMessage.messageId}:${attachment.id}`);
+      return { bytes: new Uint8Array([1, 2, 3]), mimeType: "application/pdf" };
+    }
+  });
+
+  gateway.accept(message({
+    eventId: "evt-trigger", messageId: "om-trigger", conversationType: "group", mentionedBot: true,
+    senderId: "ou-b", text: "请总结刚才上传的文件", createTime: 1_700_000_000_000
+  }));
+  await delay(50);
+
+  assert.deepEqual(operations, [
+    "create",
+    "download:om-unmentioned-file:file-v3-old",
+    "upload:会议材料.pdf:application/pdf:3",
+    'mount:session-group:{"type":"file","file_id":"ark-file-1","mount_path":"/mnt/data/会议材料.pdf"}',
+    "run"
+  ]);
+  assert.match(prompt, /会议材料\.pdf/);
+  assert.match(prompt, /\/mnt\/session\/uploads\/mnt\/data\/会议材料\.pdf/);
+  assert.match(prompt, /<current_request>\n请总结刚才上传的文件/);
+  store.close();
+});
+
 test("shared group context cursor survives a Gateway restart", async () => {
   const store = new GatewayStore(":memory:");
   const firstPrompts: string[] = [];
