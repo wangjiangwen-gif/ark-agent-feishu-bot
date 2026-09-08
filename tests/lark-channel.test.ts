@@ -72,6 +72,67 @@ test("Channel adapter loads chat history before the trigger and excludes the tri
   } }]);
 });
 
+test("Channel adapter preserves downloadable resources from historical file messages", async () => {
+  const port = historyPort(async () => ({ code: 0, data: { items: [{
+    message_id: "om-file", msg_type: "file", create_time: "1699999999000",
+    sender: { id: "ou-1", sender_type: "user", sender_name: "张三" },
+    body: { content: JSON.stringify({ file_key: "file-v3-old", file_name: "会议材料.pdf" }) }
+  }, {
+    message_id: "om-image", msg_type: "image", create_time: "1699999998000",
+    sender: { id: "ou-2", sender_type: "user", sender_name: "李四" },
+    body: { content: JSON.stringify({ image_key: "img-v3-old" }) }
+  }] } }));
+  const adapter = new LarkChannelAdapter({ appId: "cli-one", appSecret: "secret", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized({
+    messageId: "om-trigger", chatType: "group", createTime: 1_700_000_000_000, mentionedBot: true
+  }), "cli-one");
+
+  const history = await adapter.loadRecentHistory(inbound);
+
+  assert.deepEqual(history.map(item => ({ messageId: item.messageId, text: item.text, resources: item.resources })), [{
+    messageId: "om-image", text: "[图片]",
+    resources: [{ id: "img-v3-old", name: "img-v3-old.jpg", type: "image" }]
+  }, {
+    messageId: "om-file", text: "[文件：会议材料.pdf]",
+    resources: [{ id: "file-v3-old", name: "会议材料.pdf", type: "file" }]
+  }]);
+});
+
+test("rich post history preserves image-only content, nested files and message revisions", async () => {
+  const port = historyPort(async () => ({ data: { items: [{
+    message_id: "post", msg_type: "post", create_time: "100", update_time: "150",
+    sender: { id: "user", sender_type: "user" },
+    body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: "img", image_key: "img" }, { tag: "file", file_key: "file", file_name: "附件.pdf" }]] } }) }
+  }] } }));
+  const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "secret", channel: port });
+  const history = await adapter.loadRecentHistory(normalizeLarkChannelMessage(normalized({ messageId: "trigger", chatType: "group", createTime: 200 }), "cli"));
+  assert.equal(history.length, 1);
+  assert.equal(history[0].updateTime, 150);
+  assert.deepEqual(history[0].resources?.map(item => item.id), ["img", "file"]);
+  assert.ok(history[0].text);
+});
+
+test("bounded history reports truncation and retains recalled-message tombstones", async () => {
+  const port = historyPort(async () => ({ data: { items: Array.from({ length: 25 }, (_, i) => ({
+    ...historyItem(`om-${i}`, "user", "原消息", 100 + i), deleted: i === 24, update_time: "199"
+  })) } }));
+  const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "secret", channel: port });
+  const history = await adapter.loadRecentHistory(normalizeLarkChannelMessage(normalized({ messageId: "trigger", chatType: "group", createTime: 200 }), "cli"));
+  assert.equal(history.length, 20);
+  assert.match((history as typeof history & { notices?: string[] }).notices?.join("") || "", /仅加载近期/);
+  assert.equal(history.at(-1)?.deleted, true);
+  assert.match(history.at(-1)?.text || "", /撤回/);
+});
+
+test("outgoing message ids are recorded for context de-duplication", async () => {
+  const sent: string[] = [];
+  const port = historyPort(async () => ({ data: { items: [] } }));
+  port.send = async () => ({ messageId: "sent-1", chunkIds: ["sent-2"] });
+  const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "secret", channel: port, onSent: (_message, id) => sent.push(id) });
+  await adapter.reply(normalizeLarkChannelMessage(normalized(), "cli"), { type: "text", text: "hello" });
+  assert.deepEqual(sent, ["sent-1", "sent-2"]);
+});
+
 test("Channel adapter merges chat and thread history before the trigger", async () => {
   const calls: unknown[] = [];
   const port = historyPort(async payload => {

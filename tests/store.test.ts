@@ -66,6 +66,47 @@ test("store claims the same channel event only once", () => {
   store.close();
 });
 
+test("safe failures and expired pre-dispatch leases can retry but submitted work cannot", () => {
+  const store = new GatewayStore(":memory:");
+  const now = Date.now();
+  store.claimEvent("lark", "cli", "retry", now);
+  store.completeEvent("lark", "cli", "retry", "failed");
+  assert.equal(store.claimEvent("lark", "cli", "retry", now + 3_000), true);
+  assert.equal(store.claimEvent("lark", "cli", "retry", now + 4_000), false);
+  store.claimEvent("lark", "cli", "crashed", now);
+  assert.equal(store.claimEvent("lark", "cli", "crashed", now + 16 * 60_000), true);
+  store.claimEvent("lark", "cli", "sent", now);
+  store.touchEvent({ channelType: "lark", installationId: "cli", messageId: "sent" } as any, true);
+  store.completeEvent("lark", "cli", "sent", "failed");
+  assert.equal(store.claimEvent("lark", "cli", "sent", now + 60 * 60_000), false);
+  store.close();
+});
+
+test("configured Agent mismatch never silently reuses another Agent Session", () => {
+  const store = new GatewayStore(":memory:");
+  store.saveSession(key, "original-session", "agent-a");
+  store.assertSessionAgent(key, "agent-a");
+  assert.throws(() => store.assertSessionAgent(key, "agent-b"), /Agent.*不一致/);
+  assert.equal(store.getSession(key), "original-session");
+  store.close();
+});
+
+test("legacy in-flight and failed events remain non-retryable after migration", t => {
+  const directory = mkdtempSync(join(tmpdir(), "arkagent-legacy-events-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "gateway.db");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE processed_events (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, updated_at TEXT NOT NULL);
+    INSERT INTO processed_events VALUES ('lark:cli:running', 'processing', '2026-01-01T00:00:00.000Z');
+    INSERT INTO processed_events VALUES ('lark:cli:failed', 'failed', '2026-01-01T00:00:00.000Z');`);
+  legacy.close();
+  const store = new GatewayStore(path);
+  t.after(() => store.close());
+  assert.equal(store.claimEvent("lark", "cli", "running"), false);
+  assert.equal(store.claimEvent("lark", "cli", "failed"), false);
+  assert.equal(store.claimEvent("lark", "cli", "new"), true);
+});
+
 test("store resets every session without clearing event deduplication", () => {
   const store = new GatewayStore(":memory:");
   const anotherKey = { ...key, conversationId: "chat-2" };

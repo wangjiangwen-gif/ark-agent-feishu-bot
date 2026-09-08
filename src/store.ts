@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
+
+export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
 export type ConversationKey = {
   channelType: string;
@@ -104,12 +107,38 @@ export class GatewayStore {
       );
       CREATE INDEX IF NOT EXISTS idx_employee_users_last_used ON employee_users (last_used_at DESC);
       CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs (created_at DESC);
+      CREATE TABLE IF NOT EXISTS channel_history (
+        scope TEXT NOT NULL, message_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+        create_time INTEGER NOT NULL, payload TEXT NOT NULL, saved_at INTEGER NOT NULL,
+        PRIMARY KEY (scope, message_id)
+      );
+      CREATE TABLE IF NOT EXISTS context_receipts (
+        session_id TEXT NOT NULL, message_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        PRIMARY KEY (session_id, message_id)
+      );
+      CREATE TABLE IF NOT EXISTS outgoing_messages (
+        scope TEXT NOT NULL, message_id TEXT NOT NULL, trigger_id TEXT NOT NULL,
+        PRIMARY KEY (scope, message_id)
+      );
+      CREATE TABLE IF NOT EXISTS attachments (
+        attachment_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS attachment_mounts (
+        session_id TEXT NOT NULL, attachment_key TEXT NOT NULL,
+        PRIMARY KEY (session_id, attachment_key)
+      );
+      CREATE TABLE IF NOT EXISTS inline_restore_pending (session_id TEXT PRIMARY KEY);
     `);
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
     this.ensureColumn("audit_logs", "response_summary", "TEXT");
     this.ensureColumn("audit_logs", "message_create_time", "INTEGER");
     this.ensureColumn("conversations", "vault_ids", "TEXT");
+    const hadDispatchMetadata = (this.db.prepare("PRAGMA table_info(processed_events)").all() as { name: string }[]).some(column => column.name === "dispatched");
+    this.ensureColumn("processed_events", "dispatched", "INTEGER NOT NULL DEFAULT 0");
+    // 旧版没有执行边界记录，不能把旧失败误判为尚未提交的安全重试。
+    if (!hadDispatchMetadata) this.db.prepare("UPDATE processed_events SET dispatched = 1 WHERE status IN ('processing', 'failed')").run();
+    this.ensureColumn("processed_events", "attempts", "INTEGER NOT NULL DEFAULT 1");
     if (path !== ":memory:") try { chmodSync(path, 0o600); } catch { /* directory permissions remain the outer boundary */ }
   }
 
@@ -143,6 +172,11 @@ export class GatewayStore {
     } catch {
       return undefined;
     }
+  }
+
+  assertSessionAgent(key: ConversationKey, agentId: string): void {
+    const row = this.db.prepare("SELECT agent_id FROM conversations WHERE conversation_key = ?").get(this.conversationKey(key)) as { agent_id: string } | undefined;
+    if (row && row.agent_id !== agentId) throw new Error("当前会话绑定的 Agent 与配置不一致。请先恢复原 Agent 配置；如确定切换，请发送 /new（新会话不会继承旧沙箱文件）。");
   }
 
   saveSession(key: ConversationKey, sessionId: string, agentId: string, agentVersion?: string, vaultIds?: string[]): void {
@@ -201,17 +235,96 @@ export class GatewayStore {
     return [channelType, installationId, eventId].map(escapeKeyPart).join(":");
   }
 
-  claimEvent(channelType: string, installationId: string, eventId: string): boolean {
+  claimEvent(channelType: string, installationId: string, eventId: string, now = Date.now()): boolean {
     if (channelType === "lark") {
       const legacy = this.db.prepare("SELECT 1 FROM processed_events WHERE event_id = ?").get(eventId);
       if (legacy) return false;
     }
-    const result = this.db.prepare("INSERT OR IGNORE INTO processed_events (event_id, status, updated_at) VALUES (?, 'processing', ?)").run(this.eventKey(channelType, installationId, eventId), new Date().toISOString());
+    const result = this.db.prepare(`INSERT INTO processed_events (event_id, status, updated_at) VALUES (?, 'processing', ?)
+      ON CONFLICT(event_id) DO UPDATE SET status = 'processing', updated_at = excluded.updated_at, attempts = attempts + 1
+      WHERE dispatched = 0 AND attempts < 3 AND
+        ((status = 'failed' AND updated_at <= ?) OR (status = 'processing' AND updated_at <= ?))
+    `).run(this.eventKey(channelType, installationId, eventId), new Date(now).toISOString(), new Date(now - 2_000).toISOString(), new Date(now - 15 * 60_000).toISOString());
     return Number(result.changes) === 1;
   }
 
   completeEvent(channelType: string, installationId: string, eventId: string, status: "completed" | "failed"): void {
-    this.db.prepare("UPDATE processed_events SET status = ?, updated_at = ? WHERE event_id = ?").run(status, new Date().toISOString(), this.eventKey(channelType, installationId, eventId));
+    this.db.prepare("UPDATE processed_events SET status = CASE WHEN ? = 'failed' AND dispatched = 1 THEN 'uncertain' ELSE ? END, updated_at = ? WHERE event_id = ?").run(status, status, new Date().toISOString(), this.eventKey(channelType, installationId, eventId));
+  }
+
+  touchEvent(message: ChannelMessage, dispatched = false): void {
+    this.db.prepare("UPDATE processed_events SET updated_at = ?, dispatched = MAX(dispatched, ?) WHERE event_id = ? AND status = 'processing'")
+      .run(new Date().toISOString(), dispatched ? 1 : 0, this.eventKey(message.channelType, message.installationId, message.messageId));
+  }
+
+  private historyScope(message: ChannelMessage): string {
+    return JSON.stringify([message.channelType, message.installationId, message.tenantId, message.conversationId]);
+  }
+
+  cacheHistory(message: ChannelMessage, items: ChannelHistoryMessage[]): void {
+    const scope = this.historyScope(message);
+    const insert = this.db.prepare(`INSERT INTO channel_history VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(scope, message_id) DO UPDATE SET payload = excluded.payload, saved_at = excluded.saved_at
+      WHERE COALESCE(json_extract(excluded.payload, '$.updateTime'), excluded.create_time) >= COALESCE(json_extract(channel_history.payload, '$.updateTime'), channel_history.create_time)`);
+    for (const item of items) insert.run(scope, item.messageId, item.threadId || (item.source === "thread" ? message.threadId : ""), item.createTime, JSON.stringify(item), Date.now());
+    this.db.prepare("DELETE FROM channel_history WHERE scope = ? AND message_id NOT IN (SELECT message_id FROM channel_history WHERE scope = ? ORDER BY create_time DESC LIMIT 2000)").run(scope, scope);
+  }
+
+  cachedHistory(message: ChannelMessage): ChannelHistoryMessage[] {
+    const rows = this.db.prepare(`SELECT payload FROM channel_history WHERE scope = ? AND create_time <= ? AND message_id != ?
+      AND (thread_id = '' OR thread_id = ?) ORDER BY create_time DESC LIMIT 100`)
+      .all(this.historyScope(message), message.createTime, message.messageId, message.threadId) as { payload: string }[];
+    return rows.map(row => JSON.parse(row.payload) as ChannelHistoryMessage).reverse();
+  }
+
+  contextFingerprint(sessionId: string, messageId: string): string | undefined {
+    return (this.db.prepare("SELECT fingerprint FROM context_receipts WHERE session_id = ? AND message_id = ?").get(sessionId, messageId) as { fingerprint: string } | undefined)?.fingerprint;
+  }
+
+  saveContextFingerprint(sessionId: string, messageId: string, fingerprint: string): void {
+    this.db.prepare("INSERT INTO context_receipts VALUES (?, ?, ?) ON CONFLICT(session_id, message_id) DO UPDATE SET fingerprint = excluded.fingerprint").run(sessionId, messageId, fingerprint);
+  }
+
+  recordOutgoing(message: ChannelMessage, messageId: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO outgoing_messages VALUES (?, ?, ?)").run(this.historyScope(message), messageId, message.messageId);
+  }
+
+  isOwnSessionReply(message: ChannelMessage, sessionId: string, messageId: string): boolean {
+    if (messageId.endsWith(":gateway-response")) return Boolean(this.db.prepare("SELECT 1 FROM audit_logs WHERE message_id = ? AND session_id = ? AND installation_id = ? LIMIT 1")
+      .get(messageId.slice(0, -":gateway-response".length), sessionId, message.installationId));
+    return Boolean(this.db.prepare(`SELECT 1 FROM outgoing_messages o JOIN audit_logs a ON a.message_id = o.trigger_id
+      WHERE o.scope = ? AND o.message_id = ? AND a.session_id = ? AND a.installation_id = ? LIMIT 1`)
+      .get(this.historyScope(message), messageId, sessionId, message.installationId));
+  }
+
+  getAttachment(key: string): StoredAttachment | undefined {
+    const row = this.db.prepare("SELECT payload FROM attachments WHERE attachment_key = ?").get(key) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as StoredAttachment : undefined;
+  }
+
+  saveAttachment(key: string, value: StoredAttachment): void {
+    this.db.prepare("INSERT OR REPLACE INTO attachments VALUES (?, ?, ?)").run(key, JSON.stringify(value), new Date().toISOString());
+  }
+
+  isAttachmentMounted(sessionId: string, key: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM attachment_mounts WHERE session_id = ? AND attachment_key = ?").get(sessionId, key));
+  }
+
+  markAttachmentMounted(sessionId: string, key: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO attachment_mounts VALUES (?, ?)").run(sessionId, key);
+  }
+
+  requestInlineRestore(sessionId: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO inline_restore_pending VALUES (?)").run(sessionId);
+  }
+
+  pendingInlineSources(sessionId: string): StoredAttachment[] {
+    if (!this.db.prepare("SELECT 1 FROM inline_restore_pending WHERE session_id = ?").get(sessionId)) return [];
+    const rows = this.db.prepare("SELECT a.payload FROM attachments a JOIN attachment_mounts m ON a.attachment_key = m.attachment_key WHERE m.session_id = ? ORDER BY a.created_at DESC").all(sessionId) as { payload: string }[];
+    return rows.map(row => JSON.parse(row.payload) as StoredAttachment).filter(item => item.inlineText !== undefined);
+  }
+
+  completeInlineRestore(sessionId: string): void {
+    this.db.prepare("DELETE FROM inline_restore_pending WHERE session_id = ?").run(sessionId);
   }
 
   observeEmployeeUser(tenantKey: string, openId: string): EmployeeUser {

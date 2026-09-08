@@ -109,9 +109,11 @@ npx --yes arkagent@latest login
 创建一篇标题为“办公助手测试”的飞书文档，正文写“lark-cli 已可用”，完成后把链接发给我。
 ```
 
-也可以在与 Bot 的单聊中直接发送 PDF、Office 文档、Markdown、TXT 或图片。Markdown/TXT 会按 UTF-8 提取原文并直接放入本次消息（上限 256 KB）；其他文件会上传到方舟 Files，并以只读方式挂载到当前 Managed Agents Session。未附带文字指令时默认总结文件。二进制文件上限为 20 MB，实际可解析格式仍以方舟 Files API 支持范围为准。
+也可以在与 Bot 的单聊中直接发送 PDF、Office 文档、Markdown、TXT 或图片。Markdown/TXT 会按 UTF-8 提取原文并直接放入本次消息（单轮合计上限 256 KB）；其他文件会上传到方舟 Files，并以只读方式挂载到当前 Managed Agents Session。同名文件使用独立子目录，不会互相遮盖。未附带文字指令时默认总结文件。二进制文件单个上限为 20 MB，单轮附件总量上限为 40 MB，实际可解析格式仍以方舟 Files API 支持范围为准。某个附件失败时，其他可用附件与文字请求仍继续处理，并在回复中明确告知失败文件。
 
 `/compact` 会调用 Managed Agents 内置能力，在当前 Session 内压缩上下文，Session ID、挂载资源和会话映射保持不变。Gateway 也会在上下文达到阈值时自动执行同样的原地压缩。`/new` 会清除当前飞书会话到方舟 Session 的映射；下一条消息将创建新 Session。
+
+Gateway 会保存已接收的 Markdown/TXT 原文，原地压缩后在下一轮恢复近期原文（仍受单轮 256 KB 限制，超出时明确提示）。重启 Gateway 会复用数据库中的 Session 与附件记录，不会重复上传已记录的文件。**新 Session 的文件与沙箱状态迁移尚未实现**：`/new` 后不要假设旧文件仍可直接访问。沙箱长期休眠、回收后的持久性也不能由本地 Gateway 保证。
 
 ## 数字员工模式
 
@@ -167,7 +169,9 @@ Bot 的 App Secret 保存在本地安全配置，用于 WebSocket 鉴权和刷�
 
 数字员工会显式申请 `im:message.p2p_msg:readonly` 与 `im:message.group_at_msg:readonly`，分别用于接收用户私聊和群聊中明确 @Bot 的消息；还会申请 `im:message.group_msg`，供 Gateway 和 Session 内的 Bot 读取群聊或话题近期历史。该权限属于敏感群消息权限，可能需要管理员审核并重新发布应用。Gateway 收到请求后先在用户消息上添加 `Get` 表情，使用同一条流式消息逐步更新 Agent 回复，任务成功或失败后都会移除该表情。应用可用范围、原生申请和审批由飞书控制面统一管理，arkagent 不复制这套能力。
 
-数字员工普通群聊按 `chat_id` 共享一个 Managed Agents Session，消息排队执行；Thread 按 `thread_id` 使用独立的共享 Session。群聊只挂载 Bot Vault，不申请或挂载任何成员 UAT，避免多人会话串身份。首次创建 Session 时会注入触发消息之前的近期上下文，之后只增量注入游标之后的新消息：普通群读取群消息；Thread 同时读取所在群近期消息与当前话题消息，再去重、排序。上下文限制为最近 20 条、最多 8,000 字符，并以 `role="reference"` 标记为真实会话记录，仅供理解背景，不构成本轮指令、授权或操作确认。需要更早记录时，Agent 可使用 Bot 身份调用 `lark-cli im +chat-messages-list` 或 `lark-cli im +threads-messages-list`。单聊按飞书会话复用一个 Session，按顺序处理，并支持 `/new` 显式重置。
+数字员工普通群聊按 `chat_id` 共享一个 Managed Agents Session，消息排队执行；Thread 按 `thread_id` 使用独立的共享 Session。群聊只挂载 Bot Vault，不申请或挂载任何成员 UAT，避免多人会话串身份。首次创建 Session 时会注入触发消息之前的近期上下文，之后增量注入新消息，并同步本次历史窗口内已编辑、已撤回的消息；同一个 Session 的 Bot 回复不会再作为历史重复注入。普通群读取群消息；Thread 同时读取所在群近期消息与当前话题消息，再去重、排序。上下文限制为最近 20 条、最多 8,000 字符，并以 `role="reference"` 标记为真实会话记录，仅供理解背景，不构成本轮指令、授权或操作确认。需要更早记录时，Agent 可使用 Bot 身份调用 `lark-cli im +chat-messages-list` 或 `lark-cli im +threads-messages-list`。单聊按飞书会话复用一个 Session，按顺序处理，并支持 `/new` 显式重置。
+
+Gateway 会缓存平台实际推送的群消息（每群最多 2,000 条），未 `@Bot` 的消息不会触发执行，但会参与下次 `@Bot` 的近期上下文。历史接口不可用时使用本地缓存与审计记录，并告知 Agent 可能缺失的范围；这不能补回平台未推送、离线期间遗漏的消息。近期文件、图片及富文本中的附件可在下次 `@Bot` 时补挂载，每轮最多处理 8 个历史附件，失败后保留上传记录以便后续重试。超过条数、字符数或附件预算时会明确标记不完整。
 
 WebUI 首页是数字员工列表；点击员工后进入详情，通过「身份」「行为日志」「访问过的用户」查看该员工。身份页展示当前 Agent 已拥有的飞书 Bot 身份、认证方式、能力和授权范围；只展示方舟 Vault Credential 的脱敏引用，不会返回 App Secret 或 token。身份模型预留了 provider 和 identity type，后续可继续接入飞书用户身份及其他服务身份。「访问过的用户」只表示已经实际使用过 Bot 的用户，完整使用权限仍由飞书应用可用范围管理。
 
@@ -278,7 +282,9 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 - Gateway 优先使用 `Get` 表情反馈处理中状态；仅当表情添加失败且请求超过 2.5 秒仍未完成时，才发送一次“正在处理，请稍候。”兜底提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
-- Markdown/TXT 原文直接内联到本次 Session 消息；其他单聊文件上传到方舟 Files，再只读挂载到 `/mnt/data/`。文件本体不写入 Gateway 数据库。
+- Markdown/TXT 原文内联到 Session 消息，并保存于权限为 `0600` 的本地数据库以支持压缩后恢复。其他文件上传到方舟 Files；Gateway 保存 File ID 和挂载记录，不保存二进制正文。实际沙箱路径为 `/mnt/session/uploads/mnt/data/<附件标识>/<文件名>`。
+- 修改配置中的 Agent ID 后，Gateway 不会悄悄沿用绑定旧 Agent 的 Session，也不会自动迁移；会提示恢复配置或显式 `/new`。
+- 相同事件重复投递会去重；未提交到 Agent 的失败请求最多允许 3 次安全领取。已提交但结果不明的请求不会自动重跑，避免重复执行业务操作。该机制不是自动任务重放服务。
 - 群聊中明确 `@Bot` 的文本、文件和图片可进入 Agent；音视频和交互卡片暂不作为任务输入处理。
 
 ## 二次开发：完整 Session Create 请求

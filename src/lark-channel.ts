@@ -16,6 +16,8 @@ type LarkHistoryItem = {
   message_id?: string;
   msg_type?: string;
   create_time?: string;
+  update_time?: string;
+  thread_id?: string;
   deleted?: boolean;
   sender?: { id?: string; sender_type?: string; sender_name?: string };
   body?: { content?: string };
@@ -67,10 +69,12 @@ export class LarkChannelAdapter implements ChannelAdapter {
   private readonly maxFileBytes: number;
   private readonly streaming: Required<StreamingOptions>;
   private readonly streamingDownloader?: ReturnType<typeof createFeishuResourceDownloader>;
+  private readonly onSent?: (message: ChannelMessage, id: string) => void;
 
-  constructor(options: { appId: string; appSecret: string; maxFileBytes?: number; channel?: LarkChannelPort; streaming?: StreamingOptions }) {
+  constructor(options: { appId: string; appSecret: string; maxFileBytes?: number; channel?: LarkChannelPort; streaming?: StreamingOptions; onSent?: (message: ChannelMessage, id: string) => void }) {
     this.installationId = options.appId;
     this.maxFileBytes = options.maxFileBytes ?? MAX_FEISHU_FILE_BYTES;
+    this.onSent = options.onSent;
     this.streaming = {
       intervalMs: positiveInteger(options.streaming?.intervalMs, DEFAULT_STREAMING_OPTIONS.intervalMs),
       minChunkChars: positiveInteger(options.streaming?.minChunkChars, DEFAULT_STREAMING_OPTIONS.minChunkChars),
@@ -88,9 +92,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
       handshakeTimeoutMs: 30_000,
       httpTimeoutMs: 30_000,
       keepalive: { enabled: true },
-      policy: { dmMode: "open", requireMention: true, respondToMentionAll: false },
-      // Gateway 已经提供持久去重；数字员工模式下每条消息都使用独立 Session 并发执行。
-      // 关闭 SDK chatQueue，避免同一群聊内的请求被接入层再次串行化。
+      // 未 @ 消息只进入 Gateway 本地上下文缓存；执行条件和排队仍由 Gateway 控制。
+      policy: { dmMode: "open", requireMention: false, respondToMentionAll: false },
       safety: { chatQueue: { enabled: false }, staleMessageWindowMs: 5 * 60_000 }
     });
     // Channel SDK 的 downloadResource 返回完整 Buffer。真实 SDK 同时公开 rawClient，
@@ -112,7 +115,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
 
   async reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void> {
     const input = toLarkSendInput(outbound);
-    await this.channel.send(message.conversationId, input, replyOptions(message));
+    const sent = await this.channel.send(message.conversationId, input, replyOptions(message));
+    for (const id of [sent.messageId, ...(sent.chunkIds || [])]) if (id) this.onSent?.(message, id);
   }
 
   async send(conversationId: string, outbound: ChannelOutbound): Promise<void> {
@@ -128,12 +132,13 @@ export class LarkChannelAdapter implements ChannelAdapter {
       await this.streamNativeCardKit(message, producer, cardkit as Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>);
       return;
     }
-    await this.channel.stream(message.conversationId, {
+    const sent = await this.channel.stream(message.conversationId, {
       markdown: async controller => progressivelyWriteMarkdown({
         append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
         setContent: controller.setContent.bind(controller)
       }, producer, this.streaming)
     }, replyOptions(message));
+    if (sent.messageId) this.onSent?.(message, sent.messageId);
   }
 
   private async streamNativeCardKit(
@@ -143,7 +148,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
   ): Promise<void> {
     const elementId = "arkagent_stream_md";
     const { cardId } = await this.channel.createCard(buildNativeStreamingCard(elementId, this.streaming));
-    await this.channel.send(message.conversationId, { cardId }, replyOptions(message));
+    const sent = await this.channel.send(message.conversationId, { cardId }, replyOptions(message));
+    if (sent.messageId) this.onSent?.(message, sent.messageId);
     let sequence = 0;
     let content = "";
     let lastChunkChars = 0;
@@ -201,10 +207,11 @@ export class LarkChannelAdapter implements ChannelAdapter {
     return loadLarkRecentHistory(client, message);
   }
 
-  async download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }> {
-    if (this.streamingDownloader) return this.streamingDownloader(resource, message);
+  async download(resource: ChannelResource, message: ChannelMessage, remainingBytes = this.maxFileBytes): Promise<{ bytes: Uint8Array; mimeType: string }> {
+    if (this.streamingDownloader) return this.streamingDownloader(resource, message, remainingBytes);
     const bytes = await this.channel.downloadResource(message.messageId, resource.id, resource.type);
-    if (bytes.byteLength > this.maxFileBytes) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(this.maxFileBytes)} 限制`);
+    const limit = Math.min(this.maxFileBytes, remainingBytes);
+    if (bytes.byteLength > limit) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(limit)} 限制`);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
 }
@@ -312,6 +319,7 @@ export function normalizeLarkChannelMessage(message: NormalizedMessage, installa
     parentMessageId: message.replyToMessageId || "",
     createTime: Number(message.createTime || Date.now()),
     senderId: message.senderId,
+    ...(message.senderType ? { senderType: message.senderType } : {}),
     text: message.content.trim(),
     resources: message.resources
       .filter(resource => resource.type === "file" || resource.type === "image")
@@ -348,12 +356,17 @@ export async function loadLarkRecentHistory(
     const source = sources[index];
     for (const item of items) if (item.message_id) unique.set(item.message_id, { item, source });
   }
-  const normalized = [...unique.values()]
+  const allNormalized = [...unique.values()]
     .map(({ item, source }) => normalizeHistoryItem(item, source))
     .filter((item): item is ChannelHistoryMessage => Boolean(item))
-    .sort((left, right) => left.createTime - right.createTime)
-    .slice(-maxMessages);
-  return trimHistoryToChars(normalized, maxChars);
+    .sort((left, right) => left.createTime - right.createTime);
+  const normalized = allNormalized.slice(-maxMessages);
+  const trimmed = trimHistoryToChars(normalized, maxChars) as ChannelHistoryMessage[] & { notices?: string[] };
+  const notices: string[] = [];
+  if (settled.some(result => result.status === "rejected")) notices.push("部分群聊或话题历史读取失败，当前上下文可能不完整。");
+  if (allNormalized.length >= maxMessages || JSON.stringify(trimmed) !== JSON.stringify(normalized)) notices.push(`仅加载近期 ${maxMessages} 条、最多 ${maxChars} 字的会话片段；更早消息需主动查询。`);
+  if (notices.length) trimmed.notices = notices;
+  return trimmed;
 }
 
 async function loadHistoryContainer(
@@ -373,7 +386,7 @@ async function loadHistoryContainer(
       page_size: 50,
       with_sender_name: true
     };
-    if (source === "chat") params.end_time = String(Math.floor(message.createTime / 1000));
+    if (source === "chat") params.end_time = String(Math.ceil(message.createTime / 1000));
     if (pageToken) params.page_token = pageToken;
     const response = await list({ params });
     if (response.code && response.code !== 0) throw new Error(`读取飞书会话历史失败：${response.msg || `code ${response.code}`}`);
@@ -387,12 +400,13 @@ async function loadHistoryContainer(
 
 function isEligibleHistoryItem(item: LarkHistoryItem, trigger: ChannelMessage): boolean {
   const createTime = Number(item.create_time || 0);
-  return Boolean(item.message_id && !item.deleted && item.message_id !== trigger.messageId && createTime > 0 && createTime <= trigger.createTime);
+  return Boolean(item.message_id && item.message_id !== trigger.messageId && createTime > 0 && createTime <= trigger.createTime);
 }
 
 function normalizeHistoryItem(item: LarkHistoryItem, source: "chat" | "thread"): ChannelHistoryMessage | undefined {
   const messageId = String(item.message_id || "");
-  const text = historyItemText(item);
+  const resources = item.deleted ? [] : historyItemResources(item);
+  const text = item.deleted ? "[该消息已撤回，原内容不应继续作为有效依据]" : historyItemText(item) || (resources.length ? "[富文本附件]" : "");
   if (!messageId || !text) return undefined;
   return {
     messageId,
@@ -401,8 +415,41 @@ function normalizeHistoryItem(item: LarkHistoryItem, source: "chat" | "thread"):
     senderType: String(item.sender?.sender_type || "unknown"),
     source,
     text,
-    createTime: Number(item.create_time || 0)
+    ...(resources.length ? { resources } : {}),
+    createTime: Number(item.create_time || 0),
+    ...(item.update_time ? { updateTime: Number(item.update_time) } : {}),
+    ...(item.thread_id ? { threadId: item.thread_id } : {}),
+    ...(item.deleted ? { deleted: true } : {})
   };
+}
+
+function historyItemResources(item: LarkHistoryItem): ChannelResource[] {
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(item.body?.content || "{}") as Record<string, unknown>; }
+  catch { return []; }
+  if (item.msg_type === "file" && typeof value.file_key === "string" && value.file_key) {
+    return [{
+      id: value.file_key,
+      name: typeof value.file_name === "string" && value.file_name ? value.file_name : value.file_key,
+      type: "file"
+    }];
+  }
+  if (item.msg_type === "image" && typeof value.image_key === "string" && value.image_key) {
+    return [{ id: value.image_key, name: `${value.image_key}.jpg`, type: "image" }];
+  }
+  if (item.msg_type === "post") {
+    const resources = new Map<string, ChannelResource>();
+    const visit = (node: unknown): void => {
+      if (!node || typeof node !== "object") return;
+      const record = node as Record<string, unknown>;
+      if (typeof record.image_key === "string" && record.image_key) resources.set(record.image_key, { id: record.image_key, name: `${record.image_key}.jpg`, type: "image" });
+      if (typeof record.file_key === "string" && record.file_key) resources.set(record.file_key, { id: record.file_key, name: String(record.file_name || record.file_key), type: "file" });
+      for (const child of Object.values(record)) if (typeof child === "object") visit(child);
+    };
+    visit(value);
+    return [...resources.values()];
+  }
+  return [];
 }
 
 function historyItemText(item: LarkHistoryItem): string {
