@@ -23,6 +23,8 @@ type ArkClientOptions = {
   eventPollIntervalMs?: number;
 };
 
+type RunBoundary = { startedAt: number; input: string; previousIds: Set<string>; anchored: boolean; page?: string };
+
 export type AgentConfig = {
   name: string;
   description: string;
@@ -324,9 +326,10 @@ export class ArkClient {
     });
   }
 
-  async sendMessage(sessionId: string, text: string): Promise<void> {
+  async sendMessage(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
     await this.request(`/sessions/${encodeURIComponent(sessionId)}/events`, {
       method: "POST",
+      signal,
       body: JSON.stringify({ events: [{ type: "user.message", content: [{ type: "text", text }] }] })
     });
   }
@@ -340,7 +343,7 @@ export class ArkClient {
         : undefined;
       const inputTokens = usage?.input_tokens;
       if (typeof inputTokens === "number" && Number.isFinite(inputTokens)) {
-        latestInputTokens = Math.max(latestInputTokens ?? 0, inputTokens);
+        latestInputTokens = inputTokens;
       }
     }
     return { eventCount: events.length, latestInputTokens };
@@ -356,7 +359,10 @@ export class ArkClient {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
+    let boundary: RunBoundary | undefined;
     try {
+      const previous = await this.readSessionEvents(sessionId, controller.signal);
+      boundary = { startedAt, input: text, previousIds: new Set(previous.events.flatMap(event => event.id ? [event.id] : [])), anchored: false, page: previous.lastPage };
       // 先发起 SSE 请求，但不等待服务端返回响应头。部分环境建立事件流约需
       // 15 秒；若在这里 await，会让 user.message 也被无谓阻塞。
       const eventStream = this.openEventStream(sessionId, controller.signal, Boolean(onDelta));
@@ -364,29 +370,30 @@ export class ArkClient {
         eventStream.then(() => undefined, () => undefined),
         waitFor(this.options.sseHeadStartMs, controller.signal)
       ]);
-      await this.sendMessage(sessionId, text);
+      await this.sendMessage(sessionId, text, controller.signal);
       const result = await Promise.any([
-        this.consumeEventStream(eventStream, onProgress, onDelta),
-        this.pollRunResult(sessionId, startedAt, controller.signal)
+        this.consumeEventStream(eventStream, boundary, onProgress, onDelta),
+        this.pollRunResult(sessionId, boundary, controller.signal)
       ]);
       controller.abort();
       return result;
     } catch (error) {
       if (!controller.signal.aborted) throw error;
-      const recovered = await this.recoverTimedOutRun(sessionId, startedAt);
+      const recovered = boundary ? await this.recoverTimedOutRun(sessionId, boundary) : undefined;
       if (recovered) return recovered;
       throw new Error("Session 运行超时");
     } finally {
+      controller.abort();
       clearTimeout(timer);
     }
   }
 
-  private async recoverTimedOutRun(sessionId: string, startedAt: number): Promise<RunResult | undefined> {
+  private async recoverTimedOutRun(sessionId: string, boundary: RunBoundary): Promise<RunResult | undefined> {
     // 超时边界常与最终 idle 只差几秒；短暂回查事件历史，避免已经完成的回复丢失。
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await new Promise(resolve => setTimeout(resolve, 5_000));
-      const events = await this.listSessionEvents(sessionId);
-      const result = resultFromEvents(events, startedAt);
+      const { events } = await this.readSessionEvents(sessionId, undefined, boundary.page);
+      const result = resultForBoundary(events, boundary);
       if (result) return result;
     }
     return undefined;
@@ -398,6 +405,7 @@ export class ArkClient {
 
   private async consumeEventStream(
     streamPromise: Promise<AsyncGenerator<ArkEvent>>,
+    boundary: RunBoundary,
     onProgress?: (progress: string) => Promise<void>,
     onDelta?: (snapshot: string) => Promise<void>
   ): Promise<RunResult> {
@@ -408,6 +416,7 @@ export class ArkClient {
     let authorizationRequired: UserAuthorizationRequired | undefined;
     let lastSnapshot = "";
     for await (const event of await streamPromise) {
+      if (!belongsToRun(event, boundary)) continue;
       if (event.id && seen.has(event.id)) continue;
       if (event.id) seen.add(event.id);
       rememberLarkCliToolDomain(event, toolDomains);
@@ -449,9 +458,10 @@ export class ArkClient {
     throw new Error("事件流结束，但未观察到 Session 终态");
   }
 
-  private async pollRunResult(sessionId: string, startedAt: number, signal: AbortSignal): Promise<RunResult> {
+  private async pollRunResult(sessionId: string, boundary: RunBoundary, signal: AbortSignal): Promise<RunResult> {
     while (!signal.aborted) {
-      const result = resultFromEvents(await this.listSessionEvents(sessionId, signal), startedAt);
+      const { events } = await this.readSessionEvents(sessionId, signal, boundary.page);
+      const result = resultForBoundary(events, { ...boundary });
       if (result) return result;
       await waitFor(this.options.eventPollIntervalMs, signal);
     }
@@ -459,11 +469,25 @@ export class ArkClient {
   }
 
   private async listSessionEvents(sessionId: string, signal?: AbortSignal): Promise<ArkEvent[]> {
-    const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/events?limit=200`, { signal });
-    const payload = await response.json() as Record<string, unknown>;
-    if (Array.isArray(payload.data)) return payload.data as ArkEvent[];
-    const data = payload.data && typeof payload.data === "object" ? payload.data as Record<string, unknown> : undefined;
-    return Array.isArray(data?.items) ? data.items as ArkEvent[] : [];
+    return (await this.readSessionEvents(sessionId, signal)).events;
+  }
+
+  private async readSessionEvents(sessionId: string, signal?: AbortSignal, startPage?: string): Promise<{ events: ArkEvent[]; lastPage?: string }> {
+    const events: ArkEvent[] = [];
+    let page = startPage;
+    const pages = new Set<string>();
+    for (let count = 0; count < 100; count++) {
+      const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/events?limit=200${page ? `&page=${encodeURIComponent(page)}` : ""}`, { signal });
+      const payload = await response.json() as Record<string, unknown>;
+      const data = payload.data as { items?: ArkEvent[]; next_page?: string } | undefined;
+      events.push(...(Array.isArray(payload.data) ? payload.data as ArkEvent[] : data?.items || []));
+      const nextPage = payload.next_page || data?.next_page;
+      if (typeof nextPage !== "string" || !nextPage) return { events, lastPage: page };
+      if (pages.has(nextPage)) throw new Error("Session 事件分页游标重复，不能确认完整运行结果");
+      pages.add(nextPage);
+      page = nextPage;
+    }
+    throw new Error("Session 事件历史超过安全翻页上限，不能确认完整运行结果");
   }
 
   private async openEventStream(sessionId: string, signal: AbortSignal, includeMessageDeltas = false): Promise<AsyncGenerator<ArkEvent>> {
@@ -564,6 +588,26 @@ export function resultFromEvents(events: ArkEvent[], startedAt: number): RunResu
     const timestamp = typeof event.processed_at === "string" ? Date.parse(event.processed_at) : NaN;
     return Number.isFinite(timestamp) && timestamp >= startedAt;
   });
+  return terminalResult(current);
+}
+
+function belongsToRun(event: ArkEvent, boundary: RunBoundary): boolean {
+  const preview = event.type === "event_start" ? event.event as ArkEvent | undefined : undefined;
+  const id = preview?.id || (typeof event.event_id === "string" ? event.event_id : undefined) || event.id;
+  if (id && boundary.previousIds.has(id)) return false;
+  if (event.type === "user.message" && eventText(event) === boundary.input) boundary.anchored = true;
+  const stamp = Date.parse(String(event.processed_at || preview?.processed_at || ""));
+  // 用户事件建立本轮边界后不再依赖本机时钟；无边界的旧事件不能触发终态。
+  return boundary.anchored || (Number.isFinite(stamp) ? stamp >= boundary.startedAt : boundary.previousIds.size === 0);
+}
+
+function resultForBoundary(events: ArkEvent[], boundary: RunBoundary): RunResult | undefined {
+  const current = events.filter(event => belongsToRun(event, boundary));
+  return terminalResult(current);
+}
+
+function terminalResult(current: ArkEvent[]): RunResult | undefined {
+  current = [...new Map(current.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
   const failed = current.some(event => event.type === "session.error" || event.type === "session.status_failed");
   const idle = current.some(event => event.type === "session.status_idle");
   if (!failed && !idle) return undefined;

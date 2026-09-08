@@ -145,19 +145,20 @@ export type FeishuResourceClient = {
 };
 
 export function createFeishuResourceDownloader(client: FeishuResourceClient, maxBytes = MAX_FEISHU_FILE_BYTES) {
-  return async (attachment: IncomingMessage["resources"][number], message: IncomingMessage): Promise<{ bytes: Uint8Array; mimeType: string }> => {
+  return async (attachment: IncomingMessage["resources"][number], message: IncomingMessage, remainingBytes = maxBytes): Promise<{ bytes: Uint8Array; mimeType: string }> => {
+    const limit = Math.min(maxBytes, remainingBytes);
     const response = await client.im.messageResource.get({
       params: { type: attachment.type },
       path: { message_id: message.messageId, file_key: attachment.id }
     });
     const declaredSize = Number(headerValue(response.headers, "content-length") || 0);
-    if (declaredSize > maxBytes) throw new Error(`文件 ${attachment.name} 超过 ${formatBytes(maxBytes)} 限制`);
+    if (declaredSize > limit) throw new Error(`文件 ${attachment.name} 超过本轮剩余 ${formatBytes(limit)} 限制`);
     const chunks: Uint8Array[] = [];
     let size = 0;
     for await (const chunk of response.getReadableStream()) {
       const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
       size += bytes.byteLength;
-      if (size > maxBytes) throw new Error(`文件 ${attachment.name} 超过 ${formatBytes(maxBytes)} 限制`);
+      if (size > limit) throw new Error(`文件 ${attachment.name} 超过本轮剩余 ${formatBytes(limit)} 限制`);
       chunks.push(bytes);
     }
     const combined = new Uint8Array(size);
@@ -180,5 +181,5 @@ function inferMimeType(name: string, type: "file" | "image"): string {
 }
 
 function formatBytes(bytes: number): string {
-  return `${Math.floor(bytes / 1024 / 1024)} MB`;
+  return bytes < 1024 * 1024 ? `${Math.floor(bytes / 1024)} KB` : `${Math.floor(bytes / 1024 / 1024)} MB`;
 }

@@ -60,7 +60,7 @@ async function runEmployee(): Promise<void> {
   const config = loadEmployeeConfig();
   const store = new GatewayStore(config.databasePath);
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
-  const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret);
+  const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
   let botTokenExpiresAt = 0;
   let botTokenRefreshing: Promise<void> | undefined;
   let botTokenCredential = (await ark.listCredentials(config.arkVaultId)).find(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN");
@@ -93,7 +93,7 @@ async function runEmployee(): Promise<void> {
   );
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
-    timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message) => channel.download(resource, message),
+    timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     ensureAuthorization: (message, request) => auth.ensure(message, request),
     getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
@@ -161,13 +161,13 @@ async function run(): Promise<void> {
     })().finally(() => { refreshing = undefined; });
     await refreshing;
   };
-  const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret);
+  const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
   const gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     agentId: config.arkAgentId,
     environmentId: config.arkEnvironmentId,
     vaultId: config.arkVaultId,
     authorizedUserId: config.feishuUserOpenId,
-    downloadAttachment: (resource, message) => channel.download(resource, message),
+    downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply,
     addReaction: channel.addReaction,
     removeReaction: channel.removeReaction,
@@ -192,14 +192,14 @@ type FeishuRuntime = {
   addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
   loadRecentHistory?: (message: ChannelMessage) => Promise<ChannelHistoryMessage[]>;
-  download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
+  download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
 
-async function createFeishuRuntime(appId: string, appSecret: string): Promise<FeishuRuntime> {
+async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (message: ChannelMessage, id: string) => void): Promise<FeishuRuntime> {
   const transport = process.env.ARKAGENT_FEISHU_TRANSPORT === "legacy" ? "legacy" : "channel";
   if (transport === "channel") {
     const { LarkChannelAdapter } = await import("./lark-channel.ts");
-    const adapter: ChannelAdapter = new LarkChannelAdapter({ appId, appSecret });
+    const adapter: ChannelAdapter = new LarkChannelAdapter({ appId, appSecret, onSent });
     console.log("飞书接入层：Channel SDK（设置 ARKAGENT_FEISHU_TRANSPORT=legacy 可临时回退）");
     return {
       transport,
@@ -210,7 +210,7 @@ async function createFeishuRuntime(appId: string, appSecret: string): Promise<Fe
       addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
       removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
       loadRecentHistory: message => adapter.loadRecentHistory?.(message) || Promise.resolve([]),
-      download: (resource, message) => adapter.download(resource, message)
+      download: (resource, message, maxBytes) => adapter.download(resource, message, maxBytes)
     };
   }
   const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, { loadLarkRecentHistory }, Lark] = await Promise.all([
@@ -228,6 +228,7 @@ async function createFeishuRuntime(appId: string, appSecret: string): Promise<Fe
       const content = outbound.type === "card" ? JSON.stringify(outbound.card) : JSON.stringify({ text: outbound.type === "markdown" ? outbound.markdown : outbound.text });
       const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: message.conversationId, msg_type: msgType, content } });
       assertLarkResponse(response, outbound.type === "card" ? "发送授权卡片" : "发送文本消息");
+      if (response.data?.message_id) onSent?.(message, response.data.message_id);
     },
     loadRecentHistory: message => loadLarkRecentHistory(client, message),
     download

@@ -17,6 +17,8 @@ const collectText = (target: string[]) => async (_message: IncomingMessage, outb
   if (outbound.type === "text") target.push(outbound.text);
 };
 
+const withoutAttachmentNamespace = (value: string) => value.replace(/\/mnt\/data\/[a-f0-9]{24}\//g, "/mnt/data/");
+
 test("group messages require an explicit bot mention", () => {
   assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: false })), false);
   assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: true })), true);
@@ -396,7 +398,7 @@ test("next group mention automatically mounts an attachment from an earlier unme
   }));
   await delay(50);
 
-  assert.deepEqual(operations, [
+  assert.deepEqual(operations.map(withoutAttachmentNamespace), [
     "create",
     "download:om-unmentioned-file:file-v3-old",
     "upload:会议材料.pdf:application/pdf:3",
@@ -404,7 +406,7 @@ test("next group mention automatically mounts an attachment from an earlier unme
     "run"
   ]);
   assert.match(prompt, /会议材料\.pdf/);
-  assert.match(prompt, /\/mnt\/session\/uploads\/mnt\/data\/会议材料\.pdf/);
+  assert.match(prompt, /\/mnt\/session\/uploads\/mnt\/data\/[a-f0-9]{24}\/会议材料\.pdf/);
   assert.match(prompt, /<current_request>\n请总结刚才上传的文件/);
   store.close();
 });
@@ -1039,12 +1041,12 @@ test("gateway uploads a Feishu file and mounts it while creating a new Session",
   });
   gateway.accept(message({ text: "", resources: [{ id: "file-key", name: "季度计划.pdf", type: "file" }] }));
   await delay(30);
-  assert.deepEqual(operations, [
+  assert.deepEqual(operations.map(withoutAttachmentNamespace), [
     "upload:季度计划.pdf:application/pdf:2",
     'session:[{"type":"file","file_id":"file-1","mount_path":"/mnt/data/季度计划.pdf"}]',
     "run"
   ]);
-  assert.match(prompt, /文件已挂载到：\n- \/mnt\/session\/uploads\/mnt\/data\/季度计划\.pdf/);
+  assert.match(prompt, /文件已挂载到：\n- \/mnt\/session\/uploads\/mnt\/data\/[a-f0-9]{24}\/季度计划\.pdf/);
   store.close();
 });
 
@@ -1095,7 +1097,7 @@ test("gateway lets a Session builder preserve native options and adds initial at
   assert.deepEqual(createRequest.agent, { id: "agent-1", type: "agent", version: 3 });
   assert.equal(createRequest.title, "开发者标题");
   assert.equal(createRequest.future_session_field, "kept");
-  assert.deepEqual(createRequest.resources, [
+  assert.deepEqual(JSON.parse(withoutAttachmentNamespace(JSON.stringify(createRequest.resources))), [
     { type: "memory_store", memory_store_id: "mem-1", access: "read_write" },
     { type: "tos", tos_bucket: "bucket-1", tos_key: "seed/context/", mount_path: "/mnt/data/context" },
     { type: "file", file_id: "file-1", mount_path: "/mnt/data/报告.pdf" }
@@ -1130,7 +1132,7 @@ test("gateway appends a generic resource when an existing Session receives a fil
   gateway.accept(incoming);
   await delay(40);
 
-  assert.deepEqual(operations, [
+  assert.deepEqual(operations.map(withoutAttachmentNamespace), [
     "upload:补充.pdf",
     'append:session-existing:{"type":"file","file_id":"file-2","mount_path":"/mnt/data/补充.pdf"}',
     "run:session-existing"

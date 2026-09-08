@@ -249,7 +249,7 @@ test("run establishes SSE before sending the user message", async () => {
     return new Response("{}", { status: 200 });
   });
   const result = await client.run("session-1", "你好", 5_000);
-  assert.deepEqual(calls.slice(0, 2), ["/sessions/session-1/events/stream", "/sessions/session-1/events"]);
+  assert.ok(calls.indexOf("/sessions/session-1/events/stream") < calls.indexOf("/sessions/session-1/events"));
   assert.deepEqual(result, { terminal: "idle", messages: ["完成"] });
 });
 
@@ -278,8 +278,7 @@ test("run posts immediately when SSE response headers are delayed and completes 
   const result = await client.run("session-1", "你好", 5_000);
 
   assert.ok(Date.now() - startedAt < 100);
-  assert.equal(calls[0], "GET /sessions/session-1/events/stream");
-  assert.equal(calls[1], "POST /sessions/session-1/events");
+  assert.ok(calls.indexOf("GET /sessions/session-1/events/stream") < calls.indexOf("POST /sessions/session-1/events"));
   assert.deepEqual(result, { terminal: "idle", messages: ["轮询完成"] });
 });
 
@@ -335,4 +334,58 @@ test("Ark uploads a file and mounts it in a Session", async () => {
   assert.deepEqual(JSON.parse(String(calls[1].body)), {
     type: "file", file_id: "file-1", mount_path: "/mnt/data/report.pdf"
   });
+});
+
+test("run ignores replayed terminal events on both streaming and non-streaming paths", async () => {
+  for (const streaming of [false, true]) {
+    const old = [
+      { id: "old-reply", type: "agent.message", content: [{ type: "text", text: "旧回复" }] },
+      { id: "old-idle", type: "session.status_idle" }
+    ];
+    const snapshots: string[] = [];
+    let posted = false;
+    const client = new ArkClient("key", "https://test", async (url, init) => {
+      if (init?.method === "POST") { posted = true; return Response.json({}); }
+      if (String(url).includes("/stream")) return new Response([
+        { id: "replay-wrapper", type: "event_start", event: { id: "old-reply", type: "agent.message" } },
+        { id: "replay-delta", type: "event_delta", event_id: "old-reply", delta: { type: "content_delta", index: 0, content: { type: "text", text: "旧回复" } } },
+        ...old,
+        { id: "current-user", type: "user.message", content: [{ type: "text", text: "新问题" }] },
+        { id: "current-reply", type: "agent.message", content: [{ type: "text", text: "新回复" }] },
+        { id: "current-idle", type: "session.status_idle" }
+      ].map(event => `data: ${JSON.stringify(event)}\n\n`).join(""));
+      return Response.json({ data: posted ? [] : old });
+    });
+    const result = await client.run("session", "新问题", 2_000, undefined,
+      streaming ? async value => { snapshots.push(value); } : undefined);
+    assert.deepEqual(result.messages, ["新回复"]);
+    assert.ok(!snapshots.includes("旧回复"));
+  }
+});
+
+test("poll recovery uses event identity even when the local clock is ahead", async () => {
+  const stamp = "2026-01-01T00:00:00Z";
+  const old = [{ id: "old", type: "session.status_idle", processed_at: stamp }];
+  let posted = false;
+  const client = new ArkClient("key", "https://test", async (url, init) => {
+    if (init?.method === "POST") { posted = true; return Response.json({}); }
+    if (String(url).includes("/stream")) return new Response("", { status: 200 });
+    return Response.json({ data: posted ? [...old,
+      { id: "user", type: "user.message", processed_at: stamp, content: [{ type: "text", text: "/compact" }] },
+      { id: "idle", type: "session.status_idle", processed_at: stamp }
+    ] : old });
+  });
+  assert.deepEqual(await client.run("session", "/compact", 2_000), { terminal: "idle", messages: [] });
+});
+
+test("event history follows native next_page and detects the newest token usage", async () => {
+  const pages: string[] = [];
+  const client = new ArkClient("key", "https://test", async url => {
+    pages.push(String(url));
+    return String(url).includes("page=second")
+      ? Response.json({ data: [{ id: "new", model_usage: { input_tokens: 1000 } }] })
+      : Response.json({ data: [{ id: "old", model_usage: { input_tokens: 30000 } }], next_page: "second" });
+  });
+  assert.deepEqual(await client.getSessionStats("s"), { eventCount: 2, latestInputTokens: 1000 });
+  assert.equal(pages.length, 2);
 });

@@ -20,6 +20,7 @@ export type ChannelMessage = {
   parentMessageId: string;
   createTime: number;
   senderId: string;
+  senderType?: string;
   text: string;
   resources: ChannelResource[];
   mentionedBot: boolean;
@@ -34,6 +35,10 @@ export type ChannelHistoryMessage = {
   text: string;
   resources?: ChannelResource[];
   createTime: number;
+  updateTime?: number;
+  threadId?: string;
+  deleted?: boolean;
+  attachmentPending?: boolean;
 };
 
 export type ChannelOutbound =
@@ -62,5 +67,5 @@ export interface ChannelAdapter {
   addReaction?(message: ChannelMessage, emojiType: string): Promise<string>;
   removeReaction?(message: ChannelMessage, reactionId: string): Promise<void>;
   loadRecentHistory?(message: ChannelMessage): Promise<ChannelHistoryMessage[]>;
-  download(resource: ChannelResource, message: ChannelMessage): Promise<{ bytes: Uint8Array; mimeType: string }>;
+  download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;
 }
