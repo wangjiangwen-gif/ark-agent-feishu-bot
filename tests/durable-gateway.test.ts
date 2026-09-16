@@ -46,7 +46,8 @@ test("durable Gateway persists acceptance before execution and keeps shared grou
 
 test("durable Gateway preserves independent Thread and direct scopes and ignores unmentioned messages", async () => {
   const store = new GatewayStore(":memory:"); store.acquireRuntimeLock(); const gate = deferred(), runs: string[] = [];
-  const gateway = new Gateway(store, { createSession: async request => JSON.stringify(request.environment), run: async (_id, input) => {
+  let sessions = 0;
+  const gateway = new Gateway(store, { createSession: async () => `session-${++sessions}`, run: async (_id, input) => {
     runs.push(text(input)); if (text(input) === "group") await gate.promise; return done();
   } }, async () => {}, options);
   try {

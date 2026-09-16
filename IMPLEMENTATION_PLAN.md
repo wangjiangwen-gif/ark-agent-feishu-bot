@@ -36,6 +36,34 @@
 
 原PDF问题仍开放：稳定版既有Session的真实错误是`Timeout while processing file_url`且重试耗尽；本轮合成大小PDF都正常，不能宣称客户文件/原上下文已复现或根因已修复。手动原生压缩、真实飞书卡片收尾与Stage 1–5其余未完成项继续保留。目标已恢复active；本轮没有发布npm/GitHub，没有改变开发机npm0.2.9部署。
 
+## 本轮增量：准备完成后的安全恢复（2026-09-16）
+
+### Stage D: 准备完成检查点
+**Goal**: 加密保存已经准备好的最终输入、Session 绑定、上下文回执和提示，不把创建 Session 等同于已派发模型。
+**Success Criteria**: 准备检查点不可被替换；CAS 领取、完整绑定及同 scope FIFO；OAuth 续跑和命令不能误用。
+**Tests**: 加密重开、篡改/旧 owner/旧 revision、不同配置、已派发、授权代次、输入大小边界。
+**Status**: Complete
+
+### Stage E: 原任务恢复与失败通知
+**Goal**: 进程在输入准备完成后退出，重启核查 Session 空闲后复用完全相同的输入执行；确认送达的失败卡片不重复发文本。
+**Success Criteria**: 不再下载/上传/挂载/创建 Session，不重复开发者创建 hook；派发意图落库后的未知结果仍不重发；其他 scope 可继续。
+**Tests**: 真实子进程退出、TXT/Markdown/引用原文、FIFO、并发核查、运行中/配置变化、失败卡片更新不确定时兜底。
+**Status**: Complete
+
+### Stage F: 回归与边界登记
+**Goal**: 全量本地测试、构建、自审与证据记录；开发机保持稳定版。
+**Success Criteria**: 不把本增量当作完整准备事务恢复；Session 创建结果未知、ready 前中断、真实飞书/MA验收及 Stage 1–5 仍独立跟踪。
+**Tests**: 全量自动化、语法检查、build、diff 检查。
+**Status**: Complete
+
+实现与验证：最终输入、Session绑定、上下文回执和提示加密保存；准备Session与派发Session分开，原始派发记录落库后绝不重发。恢复先核查空闲，再按scope队列领取，恢复输入SHA-256一致；挂载/下载/创建资源不重做。每轮凭证维护继续执行；查询和凭证维护期间新增授权暂停或绑定变化时停止。核查与领取不等待整轮模型执行，避免跨群串行。控制台增加需要显式确认的`resume_prepared`动作，原`reconcile`不启动业务。流式失败正文和关闭均确认后不再重复发相同失败文本；未确认或SDK回退仍保留兜底，失败不记业务成功。
+
+本地新增149项，最终完整947/947通过、零失败/取消/跳过（8880.310792ms）；语法check、build、diff检查通过。真实子进程故障注入覆盖ready前/ready后/dispatch后退出、已有Session、历史TXT/引用Markdown/当前PDF保留、同scope FIFO及跨scope并行、事务回滚、Token维护、查询超时和授权暂停竞态。独立审查实际发现并修复了遗漏凭证维护、恢复跨scope串行、新增授权暂停被绕过，以及OAuth续跑重复失败提示。旧测试曾用整段Environment JSON冒充Session ID，已改为独立合法ID，未放宽生产校验。本地测试的MA/飞书外部接口仍是模拟，不冒充完整真实验收。
+
+真实MA探针：子进程创建隔离Session `sesn-20260916153457-f2lpp`，完成输入持久化后以77退出，尚未投递任何消息。首次恢复失败暴露新Session无历史状态事件，`getSessionStats`无法证明idle；保守停止，0次MA.run/消息POST。只读查询当前资源确认idle后，改用严格的`inspectSessionReadiness`（精确GET、Session/Agent匹配、最多5秒/4MiB、不返回敏感配置），新增48项协议测试及6项Gateway拒绝场景。复用同一Session和原SQLite显式恢复成功：4671ms、1次当前状态核查、1次MA.run/消息POST、1次模拟回复，输入持久化/请求/事件三处SHA一致，随机回显正确；0次重新创建/上传/配置构建/群历史读取，完整历史1条user.message、0压缩命令/事件、0工具调用/运行错误。原失败证据保留，未通过反复建Session掩盖问题。证据见`docs/test-results/prepared-recovery-2026-09-16.json`，探针可使用`--live`或针对明确未派发记录的`--resume`运行。
+
+验收边界：真实MA探针不连接飞书、不挂生产Vault，不实际刷新凭证、不含文件；文件准备恢复使用真实本机子进程+模拟外部API验收。当前状态查询是快照，不能保证外部控制台同时改Session或发消息时原子compare-and-dispatch。ready前中断/创建结果未知、部分成功写入续办、upgrade网关闭环、真实飞书与完整性能/资源组合仍按Stage 1–5继续；没有部署或发布，CLI实验队列保持默认关闭。
+
 ## Stage 1: 对话上下文与身份
 **Goal**: 显式引用、每轮发言者、群聊静态身份修正、预算与跨会话隔离。
 **Success Criteria**: C01-C06；无引用正常消息无额外远程请求；引用读取有界。

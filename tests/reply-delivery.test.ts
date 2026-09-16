@@ -105,7 +105,7 @@ test("checkpoint failure before card creation prevents the external write", asyn
 
 test("producer failure may close streaming but never emits completed receipt", async () => {
   const { adapter } = port(); const events: ReplyDeliveryEvent[] = [];
-  await assert.rejects(adapter.streamReply(message, async update => { await update("partial"); throw new Error("producer failure"); }, async event => { events.push(event); }), /producer/);
+  await assert.rejects(adapter.streamReply(message, async update => { await update("partial"); throw new Error("producer failure"); }, async event => { events.push(event); }), /执行失败/);
   assert.equal(events.some(event => event.type === "completed"), false);
 });
 

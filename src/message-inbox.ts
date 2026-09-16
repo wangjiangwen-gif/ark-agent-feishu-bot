@@ -7,10 +7,15 @@ import type { RunInspection, RunResult } from "./ark.ts";
 
 export type InboxState = "queued" | "preparing" | "dispatched" | "awaiting_authorization" | "completed" | "failed" | "uncertain";
 export type InboxBinding = { scope: string; agentId: string; configFingerprint: string };
+export type InboxPreparation = {
+  sessionId: string; input: string; fingerprint: string; notices: string[];
+  contextReceipts: Array<{ id: string; fingerprint: string }>; preparedAt: number;
+};
 export type InboxTask = {
   id: string; sequence: number; revision: number; state: InboxState; owner: string;
   message: ChannelMessage; binding: InboxBinding; sessionId?: string; requestFingerprint?: string;
   interruptedAt?: "preparing" | "dispatched";
+  preparation?: InboxPreparation;
   replyConfirmed?: true;
   replyResultFingerprint?: string;
   dispatchId?: string;
@@ -23,7 +28,7 @@ export type InboxTask = {
 type Row = Record<string, unknown>;
 const states = new Set<InboxState>(["queued", "preparing", "dispatched", "awaiting_authorization", "completed", "failed", "uncertain"]);
 
-// 接收日志与业务执行分离。只有queued可重新领取，preparing已可能产生外部副作用。
+// 接收日志与业务执行分离。只有queued或完整准备且未派发的检查点可领取，其他preparing不得重跑。
 export class MessageInbox {
   private db: DatabaseSync;
   private credentials: CredentialStateStore;
@@ -88,16 +93,57 @@ export class MessageInbox {
     });
   }
 
+  prepare(id: string, value: Omit<InboxPreparation, "fingerprint" | "preparedAt">): InboxTask {
+    const task = this.owned(id);
+    if (task.state !== "preparing" || hasDispatchEvidence(task) || task.message.text.trim().startsWith("/")) {
+      throw new Error("当前任务状态或派发证据不允许保存准备检查点");
+    }
+    if (!hasExactKeys(value, ["sessionId", "input", "notices", "contextReceipts"]) || typeof value.input !== "string") {
+      throw new Error("准备检查点结构无效");
+    }
+    const preparation: InboxPreparation = { sessionId: value.sessionId, input: value.input,
+      fingerprint: createHash("sha256").update(value.input).digest("hex"), notices: value.notices,
+      contextReceipts: value.contextReceipts, preparedAt: task.preparation?.preparedAt ?? Date.now() };
+    validatePreparation(preparation);
+    if (task.preparation) {
+      if (JSON.stringify(task.preparation) !== JSON.stringify(preparation)) throw new Error("已保存的准备检查点不能被替换");
+      return task;
+    }
+    return this.save(task, { ...task, preparation: structuredClone(preparation) });
+  }
+
+  claimPreparation(expected: InboxTask, expectedBinding: InboxBinding): InboxTask {
+    const owner = this.runtimeOwner();
+    return this.transaction(() => {
+      const task = this.expectedUncertain(expected);
+      if (expected.state !== "uncertain" || expected.interruptedAt !== "preparing" || task.interruptedAt !== "preparing"
+        || !task.preparation || hasDispatchEvidence(task) || task.message.text.trim().startsWith("/")
+        || JSON.stringify(task.preparation) !== JSON.stringify(expected.preparation)) throw new Error("任务缺少可领取的完整准备检查点");
+      validatePreparation(task.preparation);
+      if (!expectedBinding || task.binding.scope !== expectedBinding.scope || task.binding.agentId !== expectedBinding.agentId
+        || task.binding.configFingerprint !== expectedBinding.configFingerprint) throw new Error("准备任务配置绑定已变化");
+      const blocker = this.db.prepare(`SELECT 1 FROM gateway_message_inbox WHERE channel_type=? AND installation_id=? AND scope=?
+        AND id<>? AND (state IN ('preparing', 'dispatched', 'uncertain', 'awaiting_authorization') OR (state='queued' AND sequence<?)) LIMIT 1`)
+        .get(task.message.channelType, task.message.installationId, task.binding.scope, task.id, task.sequence);
+      if (blocker) throw new Error("此会话前序任务尚未完成，不能领取准备检查点");
+      // prepared Session只属于准备证据，不提前把接收日志标成已经派发模型。
+      return this.save(task, { ...task, state: "preparing", owner, interruptedAt: undefined });
+    });
+  }
+
   transitionAuthorization(id: string, state: "preparing" | "failed"): InboxTask {
     const owner = this.runtimeOwner(), task = this.get(id);
     if (!task || task.state !== "awaiting_authorization") throw new Error("任务不在授权等待状态");
-    return this.save(task, { ...task, owner, state });
+    return this.save(task, { ...task, owner, state, preparation: undefined });
   }
 
   dispatched(id: string, sessionId: string, requestFingerprint: string): InboxTask {
     const task = this.owned(id);
     if (task.state !== "preparing" || !sessionId || !requestFingerprint) throw new Error("任务状态不允许记录派发");
-    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, replyInspection: undefined, inspection: undefined });
+    if (task.preparation && (task.preparation.sessionId !== sessionId || task.preparation.fingerprint !== requestFingerprint)) {
+      throw new Error("派发的Session或输入指纹与准备检查点不一致");
+    }
+    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, preparation: undefined, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, replyInspection: undefined, inspection: undefined });
   }
 
   planReply(id: string, result: RunResult, text: string, dispatchId?: string): InboxTask {
@@ -221,6 +267,7 @@ export class MessageInbox {
     // 准备阶段也可能创建过Session或上传文件；不能因尚未调用模型就假定无副作用。
     const uncertain = outcome === "failed";
     return this.save(task, { ...task, state: uncertain ? "uncertain" : outcome,
+      ...(!uncertain ? { preparation: undefined } : {}),
       ...(uncertain ? { interruptedAt: task.state as "preparing" | "dispatched" } : {}) });
   }
 
@@ -285,7 +332,7 @@ export class MessageInbox {
 
   private encode(task: InboxTask): string {
     const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint,
-      dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection, resolution: task.resolution };
+      preparation: task.preparation, dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection, resolution: task.resolution };
     return this.credentials.sealAuthorization(JSON.stringify(payload), this.context({ ...task,
       eventKey: this.eventKey(task.message), channelType: task.message.channelType, installationId: task.message.installationId }));
   }
@@ -300,12 +347,20 @@ export class MessageInbox {
     const cleartext = this.credentials.openAuthorization(String(row.secret), this.context({ ...metadata,
       eventKey: String(row.event_key), channelType: String(row.channel_type), installationId: String(row.installation_id) }));
     let message: ChannelMessage;
-    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection" | "resolution"> = {};
+    let checkpoint: Pick<InboxTask, "preparation" | "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection" | "resolution"> = {};
     try {
       const payload = JSON.parse(cleartext);
       // 旧密文仅包含ChannelMessage，首次状态更新时升级；不补造旧回复的送达证明。
       if (payload.version === 2 && payload.message) {
         message = payload.message;
+        if (payload.preparation !== undefined) {
+          validatePreparation(payload.preparation);
+          if (!((metadata.state === "preparing" && metadata.interruptedAt === undefined)
+              || (metadata.state === "uncertain" && metadata.interruptedAt === "preparing"))
+            || hasDispatchEvidence({ ...payload, ...metadata }) || typeof message.text !== "string" || message.text.trim().startsWith("/")) {
+            throw new Error("invalid preparation state");
+          }
+        }
         if (payload.replyConfirmed !== undefined && payload.replyConfirmed !== true) throw new Error("invalid receipt");
         if (payload.replyConfirmed && !/^[a-f0-9]{64}$/.test(payload.replyResultFingerprint)) throw new Error("invalid receipt fingerprint");
         if (payload.delivery) validateReplyDelivery(payload.delivery);
@@ -330,7 +385,8 @@ export class MessageInbox {
             || payload.inspection?.checkedAt !== value.runCheckedAt || payload.inspection?.observation?.status !== "ended"
             || payload.inspection.observation.result?.authorizationRequired) throw new Error("invalid resolution");
         }
-        checkpoint = { ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}),
+        checkpoint = { ...(payload.preparation ? { preparation: payload.preparation } : {}),
+          ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}),
           ...(payload.dispatchId ? { dispatchId: payload.dispatchId } : {}), ...(payload.replyIntent ? { replyIntent: payload.replyIntent } : {}),
           ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.replyInspection ? { replyInspection: payload.replyInspection } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}),
           ...(payload.resolution ? { resolution: payload.resolution } : {}) };
@@ -356,5 +412,35 @@ export class MessageInbox {
     this.db.exec("SAVEPOINT message_inbox");
     try { const result = operation(); this.db.exec("RELEASE message_inbox"); return result; }
     catch (error) { this.db.exec("ROLLBACK TO message_inbox; RELEASE message_inbox"); throw error; }
+  }
+}
+
+function hasDispatchEvidence(task: Partial<InboxTask>): boolean {
+  return [task.sessionId, task.requestFingerprint, task.dispatchId, task.replyConfirmed, task.replyResultFingerprint,
+    task.replyIntent, task.delivery, task.replyInspection, task.inspection, task.resolution].some(value => value !== undefined);
+}
+
+function hasExactKeys(value: unknown, keys: string[]): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key)));
+}
+
+function boundedIdentifier(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && Boolean(value) && !/\s|[\u0000-\u001f\u007f]/.test(value) && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function validatePreparation(value: unknown): asserts value is InboxPreparation {
+  if (!hasExactKeys(value, ["sessionId", "input", "fingerprint", "notices", "contextReceipts", "preparedAt"])
+    || !boundedIdentifier(value.sessionId, 256) || typeof value.input !== "string" || Buffer.byteLength(value.input, "utf8") > 2 * 1024 * 1024
+    || typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.fingerprint)
+    || createHash("sha256").update(value.input).digest("hex") !== value.fingerprint
+    || !Number.isSafeInteger(value.preparedAt) || Number(value.preparedAt) <= 0 || Number(value.preparedAt) > Date.now()
+    || !Array.isArray(value.notices) || value.notices.length > 128
+    || Array.from(value.notices).some(notice => typeof notice !== "string" || Buffer.byteLength(notice, "utf8") > 4096)
+    || !Array.isArray(value.contextReceipts) || value.contextReceipts.length > 128
+    || Array.from(value.contextReceipts).some(receipt => !hasExactKeys(receipt, ["id", "fingerprint"])
+      || !boundedIdentifier(receipt.id, 512) || !boundedIdentifier(receipt.fingerprint, 256))
+    || new Set(value.contextReceipts.map(receipt => receipt.id)).size !== value.contextReceipts.length) {
+    throw new Error("准备检查点结构无效或超过大小上限");
   }
 }

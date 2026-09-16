@@ -43,6 +43,12 @@ export type SessionStats = {
   latestCompaction?: { eventId: string; eventCount: number; tokenSampleId?: string; businessEventId?: string };
 };
 
+export type SessionReadiness = {
+  sessionId: string;
+  status: "idle" | "running" | "upgrading" | "failed" | "unknown";
+  agentId?: string;
+};
+
 export type CompactionObservation = {
   result: "succeeded" | "failed" | "unknown";
   terminal?: "idle" | "failed";
@@ -258,6 +264,49 @@ export class ArkClient {
       vaultIds: Array.isArray(data.vault_ids) ? data.vault_ids.filter((id): id is string => typeof id === "string") : [],
       systemFingerprint: typeof agent?.system === "string" ? createHash("sha256").update(agent.system).digest("hex") : undefined
     };
+  }
+
+  // 新Session可能尚无历史事件；准备恢复必须直接核查资源状态，不能把缺少事件当作idle。
+  async inspectSessionReadiness(sessionId: string, signal?: AbortSignal): Promise<SessionReadiness> {
+    const unknown: SessionReadiness = { sessionId, status: "unknown" };
+    if (!validUpgradeSessionId(sessionId) || signal?.aborted) return unknown;
+    const controller = new AbortController();
+    const timeoutMs = Number.isSafeInteger(this.options.inspectionTimeoutMs) && this.options.inspectionTimeoutMs > 0
+      ? Math.min(5_000, this.options.inspectionTimeoutMs) : 5_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let abort!: () => void;
+    const interrupted = new Promise<SessionReadiness>(resolve => {
+      abort = () => resolve(unknown);
+      combined.addEventListener("abort", abort, { once: true });
+    });
+    const inspect = async (): Promise<SessionReadiness> => {
+      try {
+        combined.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}`, {
+          method: "GET", headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` },
+          redirect: "error", signal: combined
+        });
+        if (!response.ok || combined.aborted) { void response.body?.cancel().catch(() => {}); return unknown; }
+        const body = await boundedHistoryBody(response, 4 * 1024 * 1024, combined);
+        combined.throwIfAborted();
+        const payload: unknown = JSON.parse(body);
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return unknown;
+        const data = payload as Record<string, unknown>;
+        if (Object.hasOwn(data, "error") || data.id !== sessionId || data.type !== "session"
+          || typeof data.status !== "string" || !["idle", "running", "upgrading", "failed", "unknown"].includes(data.status)) return unknown;
+        const agentId = typeof data.agent === "string" ? data.agent
+          : data.agent && typeof data.agent === "object" && !Array.isArray(data.agent) ? (data.agent as Record<string, unknown>).id : undefined;
+        if (!validUpgradeSessionId(agentId) || (this.apiKey && agentId.includes(this.apiKey))) return unknown;
+        return { sessionId, status: data.status as SessionReadiness["status"], agentId };
+      } catch { return unknown; }
+    };
+    try {
+      // 总时限同时覆盖响应头和正文，也约束忽略AbortSignal的适配器；迟到响应只清理正文。
+      return await Promise.race([inspect(), interrupted]);
+    } finally {
+      clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort();
+    }
   }
 
   async updateAgent(agentId: string, version: string, config: AgentConfig): Promise<{ id: string; version?: string }> {

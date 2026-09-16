@@ -328,6 +328,14 @@ export class GatewayStore {
     });
   }
 
+  claimPreparedMessage(expected: InboxTask, binding: InboxBinding): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.claimPreparation(expected, binding);
+      this.updateMessageEvent(task, "processing", false, "uncertain");
+      return task;
+    });
+  }
+
   finishMessage(id: string, outcome: "completed" | "failed" | "awaiting_authorization"): InboxTask {
     return this.messageTransaction(() => {
       const task = this.inbox.finish(id, outcome);

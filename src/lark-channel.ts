@@ -1,7 +1,8 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource, ReplyDeliveryObserver } from "./channel.ts";
-import { replyContentFingerprint } from "./reply-delivery.ts";
+import { replyContentFingerprint, validReplyMessageIds } from "./reply-delivery.ts";
 import { streamFailureText } from "./ark-errors.ts";
+import { withDeliveredFailureNotice } from "./failure-notice.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
 import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
 import { inspectLarkReply } from "./lark-reply-inspection.ts";
@@ -202,6 +203,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
 
     let streamError: unknown;
     let streamFailed = false;
+    let failureNoticeWritten = false;
+    let finalized = false;
     try {
       await progressivelyWriteMarkdown({
         append: async chunk => {
@@ -214,7 +217,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
           lastChunkChars = Array.from(value).length;
           await push();
         }
-      }, producer, this.streaming);
+      }, producer, this.streaming, () => { failureNoticeWritten = true; });
     } catch (error) { streamFailed = true; streamError = error; }
     try {
       if (lastChunkChars) {
@@ -237,11 +240,17 @@ export class LarkChannelAdapter implements ChannelAdapter {
       });
       assertCardKitSuccess(response, "settings");
       await observer?.({ type: "finalized", sequence });
+      finalized = true;
     } catch (error) {
       if (!streamFailed) throw error;
       console.warn("流式卡片关闭未确认，保留原始执行失败");
     }
-    if (streamFailed) throw streamError;
+    if (streamFailed) {
+      // 只有已知消息、失败正文及关闭回执均确认后，才允许上层省略重复失败文本。
+      // 这不是业务成功回执；SDK回退只更新本地缓冲，不能使用同一证明。
+      throw failureNoticeWritten && finalized && validReplyMessageIds([sent.messageId])
+        ? withDeliveredFailureNotice(streamError) : streamError;
+    }
     // producer、正文更新或关闭流式任一失败，均不能到达最终送达确认。
     await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(content || STREAMING_PLACEHOLDER) });
   }
@@ -332,7 +341,8 @@ function summarizeCard(content: string): string {
 async function progressivelyWriteMarkdown(
   writer: { append?: (value: string) => Promise<void>; setContent: (value: string) => Promise<void> },
   producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
-  options: Required<StreamingOptions>
+  options: Required<StreamingOptions>,
+  onFailureNoticeWritten?: () => void
 ): Promise<void> {
   let target = "";
   let rendered = "";
@@ -371,7 +381,10 @@ async function progressivelyWriteMarkdown(
   await writerTask;
   if (producerFailed) {
     // 使用同一卡片替换占位/过程正文；更新失败不重发新卡片，也不吞掉原始失败。
-    try { await writer.setContent(streamFailureText(producerError)); }
+    try {
+      await writer.setContent(streamFailureText(producerError));
+      onFailureNoticeWritten?.();
+    }
     catch { console.warn("流式失败状态更新未确认，保留原始失败供网关处理"); }
     throw producerError;
   }

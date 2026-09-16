@@ -70,9 +70,11 @@ export async function startEmployeeWeb(options: {
           try { body = await readControlBody(request); }
           catch { return json(response, 400, { error: "任务操作参数无效或超过限制" }); }
           if (typeof body.id !== "string" || !/^[a-f0-9-]{36}$/.test(body.id) || !Number.isSafeInteger(body.revision) || Number(body.revision) < 1
-            || !["reconcile", "discard"].includes(String(body.action)) || (body.action === "discard" && body.confirmDiscard !== body.id)) return json(response, 400, { error: "需要有效任务版本和显式放弃确认" });
-          try { await options.recovery.controlRecoveryTask("lark", options.config.feishuAppId, body.id, Number(body.revision), body.action as "reconcile" | "discard"); }
-          catch { return json(response, 409, { error: "任务未能处理：请刷新检查状态。运行未结束、仍需授权、版本或绑定变化时不能放弃；结果未知请保留原任务。" }); }
+            || !["reconcile", "discard", "resume_prepared"].includes(String(body.action))
+            || (body.action === "discard" && body.confirmDiscard !== body.id)
+            || (body.action === "resume_prepared" && body.confirm !== true)) return json(response, 400, { error: "需要有效任务版本；继续已准备任务或放弃任务须显式确认" });
+          try { await options.recovery.controlRecoveryTask("lark", options.config.feishuAppId, body.id, Number(body.revision), body.action as "reconcile" | "discard" | "resume_prepared"); }
+          catch { return json(response, 409, { error: "任务未能处理：请刷新检查状态。准备不完整、Session忙碌、仍需授权、版本或绑定变化时不能继续执行；原运行未结束时不能放弃。结果未知请保留原任务。" }); }
           return json(response, 200, { ok: true });
         }
         return json(response, 405, { error: "method_not_allowed" });
@@ -145,7 +147,7 @@ const WEB_HTML = `<!doctype html>
 <section id="detail-view" class="view"><button id="back" class="back">← 返回数字员工列表</button><div class="detail-head"><div><h2 id="detail-name" class="detail-title"></h2><div id="detail-meta" class="meta"></div></div><span class="status">● 在线</span></div>
 <nav class="tabs"><button class="active" data-tab="identities">身份</button><button data-tab="audit">行为日志</button><button data-tab="users">访问过的用户</button></nav>
 <section id="identities" class="panel active"><div id="identities-list" class="grid"></div></section>
-<section id="audit" class="panel"><div class="toolbar"><h3>待处理任务</h3><div><button id="recovery-refresh" type="button">刷新</button> <button id="recovery-next" type="button" hidden>下一页</button></div></div><div class="note">重新核查不会重跑任务。放弃仅结束网关记录，要求原MA运行已经结束；不会撤销已创建的文档、日程等操作，也不代表回复已送达。管理操作使用当前控制台凭证。</div><div id="recovery-status" class="muted" role="status"></div><div class="table-wrap"><table><thead><tr><th>消息 / 会话</th><th>任务状态</th><th>MA核查 / 回复</th><th>操作</th></tr></thead><tbody id="recovery-body"></tbody></table></div><h3>行为日志</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>状态</th><th>耗时</th><th>Session</th></tr></thead><tbody id="audit-body"></tbody></table></div>
+<section id="audit" class="panel"><div class="toolbar"><h3>待处理任务</h3><div><button id="recovery-refresh" type="button">刷新</button> <button id="recovery-next" type="button" hidden>下一页</button></div></div><div class="note">重新核查不会重跑任务。“继续已准备任务”会在确认后继续执行保存的原输入，不会重建Session、不会重传附件，可能产生原任务要求的外部操作。放弃仅结束网关记录，要求原MA运行已经结束；不会撤销已创建的文档、日程等操作，也不代表回复已送达。管理操作使用当前控制台凭证。</div><div id="recovery-status" class="muted" role="status"></div><div class="table-wrap"><table><thead><tr><th>消息 / 会话</th><th>任务状态</th><th>MA核查 / 回复</th><th>操作</th></tr></thead><tbody id="recovery-body"></tbody></table></div><h3>行为日志</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>状态</th><th>耗时</th><th>Session</th></tr></thead><tbody id="audit-body"></tbody></table></div>
 <h3>附件处理记录</h3>
 <div class="note">当前飞书应用的历史记录，可能包含切换 Agent 前的记录。这里只显示本地准备阶段证据，不代表模型已理解文件，也不会触发下载、重传或任务续跑。未记录结束不等于仍在处理；阶段报错也不证明远端没有写入。旧版没有记录的附件不会自动补造记录。</div>
 <form id="attachment-filter" class="toolbar" style="flex-wrap:wrap"><label>源消息 ID <input id="attachment-message" maxlength="256" placeholder="文件所在消息，可留空"></label><label>Session ID <input id="attachment-session" maxlength="256" placeholder="仅匹配已记录该会话的阶段"></label><button type="submit">查询 / 刷新</button><button id="attachment-next" type="button" hidden>更早记录</button></form>
@@ -158,7 +160,37 @@ const token=new URLSearchParams(location.hash.slice(1)).get('token')||'';const h
 async function api(path){const r=await fetch(path,{headers});if(!r.ok)throw new Error((await r.json()).error||r.statusText);return r.json()}
 function showError(e){const n=document.querySelector('#error');n.textContent=e.message||String(e);n.style.display='block'}
 let recoveryNext=0;
-async function loadRecovery(after=0){const base=employeeBase(),page=await api(base+'/recovery?after='+after);if(base!==employeeBase())return;const body=document.querySelector('#recovery-body');recoveryNext=page.next||0;document.querySelector('#recovery-next').hidden=!recoveryNext;document.querySelector('#recovery-status').textContent=page.enabled?'按到达顺序展示，每页最多100条；核查状态是最近一次记录，不代表实时状态。':'持久化队列尚未启用，当前不提供任务恢复管理。';body.replaceChildren(...page.items.map(x=>{const tr=document.createElement('tr');[x.messageId+' / '+(x.sessionId||'尚无Session'),x.state+(x.bindingMatches?'':'（绑定已变化）'),x.runStatus+' / '+(x.replyConfirmed?'已确认回复':x.deliveryPhase||'未确认回复')].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});const actions=document.createElement('td');if(x.state==='uncertain'&&x.bindingMatches){for(const action of ['reconcile','discard']){const button=document.createElement('button');button.type='button';button.textContent=action==='reconcile'?'重新核查':'放弃任务';button.onclick=async()=>{if(action==='discard'&&!window.confirm('确认放弃此任务？系统会先核查MA是否已结束。不会撤销已有外部操作，不会重新执行或补发回复，后续排队消息可能开始执行。'))return;actions.querySelectorAll('button').forEach(b=>b.disabled=true);try{const r=await fetch(base+'/recovery',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({id:x.id,revision:x.revision,action,...(action==='discard'?{confirmDiscard:x.id}:{})})});if(!r.ok)throw new Error((await r.json()).error);if(base===employeeBase()){await loadRecovery();await loadAudit()}}catch(e){showError(e);if(base===employeeBase())await loadRecovery().catch(showError)}};actions.append(button)}}else actions.textContent='—';tr.append(actions);return tr}));if(!page.items.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=4;td.className='empty';td.textContent='本页暂无待处理任务';tr.append(td);body.append(tr)}}
+async function loadRecovery(after=0){
+  const base=employeeBase(),page=await api(base+'/recovery?after='+after);if(base!==employeeBase())return;
+  const body=document.querySelector('#recovery-body');recoveryNext=page.next||0;
+  document.querySelector('#recovery-next').hidden=!recoveryNext;
+  document.querySelector('#recovery-status').textContent=page.enabled?'按到达顺序展示，每页最多100条；核查状态是最近一次记录，不代表实时状态。':'持久化队列尚未启用，当前不提供任务恢复管理。';
+  body.replaceChildren(...page.items.map(x=>{
+    const tr=document.createElement('tr');
+    [x.messageId+' / '+(x.sessionId||'尚无Session'),x.state+(x.bindingMatches?'':'（绑定已变化）'),x.runStatus+' / '+(x.replyConfirmed?'已确认回复':x.deliveryPhase||'未确认回复')].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});
+    const actions=document.createElement('td');
+    if(x.state==='uncertain'&&x.bindingMatches){
+      const available=x.preparationReady===true?['resume_prepared']:['reconcile','discard'];
+      for(const action of available){
+        const button=document.createElement('button');button.type='button';
+        button.textContent=action==='resume_prepared'?'继续已准备任务':action==='reconcile'?'重新核查':'放弃任务';
+        button.onclick=async()=>{
+          if(action==='discard'&&!window.confirm('确认放弃此任务？系统会先核查MA是否已结束。不会撤销已有外部操作，不会重新执行或补发回复，后续排队消息可能开始执行。'))return;
+          if(action==='resume_prepared'&&!window.confirm('确认继续执行原已准备任务？将使用保存的原输入和原Session，不会重建Session、不会重传附件。执行可能产生原任务要求的文档、日程等外部操作。'))return;
+          actions.querySelectorAll('button').forEach(b=>b.disabled=true);
+          try{
+            const r=await fetch(base+'/recovery',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({id:x.id,revision:x.revision,action,...(action==='discard'?{confirmDiscard:x.id}:action==='resume_prepared'?{confirm:true}:{})})});
+            if(!r.ok)throw new Error((await r.json()).error);
+            if(base===employeeBase()){await loadRecovery();await loadAudit()}
+          }catch(e){showError(e);if(base===employeeBase())await loadRecovery().catch(showError)}
+        };
+        actions.append(button);
+      }
+    }else actions.textContent='—';
+    tr.append(actions);return tr;
+  }));
+  if(!page.items.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=4;td.className='empty';td.textContent='本页暂无待处理任务';tr.append(td);body.append(tr)}
+}
 document.querySelector('#recovery-refresh').onclick=()=>loadRecovery().catch(showError);document.querySelector('#recovery-next').onclick=()=>loadRecovery(recoveryNext).catch(showError);
 function employeeBase(){return '/api/employees/'+encodeURIComponent(currentEmployee)}
 let attachmentNext=0,attachmentRequest=0;
