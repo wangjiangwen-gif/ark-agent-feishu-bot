@@ -13,6 +13,7 @@ import type { RunInspection, RunResult } from "./ark.ts";
 import { MessageInbox, type InboxBinding, type InboxTask } from "./message-inbox.ts";
 import { ReactionStateStore } from "./reaction-state.ts";
 import { AttachmentTraceStore } from "./attachment-trace.ts";
+import { parseStoredFileObservation, sanitizeFileObservation, type RunFileObservation } from "./run-file-observation.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number; sha256?: string };
 
@@ -48,6 +49,7 @@ export type AuditLog = {
   requestId?: string;
   summary?: string;
   responseSummary?: string;
+  fileObservation?: RunFileObservation;
   messageCreateTime?: number;
   createdAt: string;
 };
@@ -173,6 +175,7 @@ export class GatewayStore {
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
     this.ensureColumn("audit_logs", "response_summary", "TEXT");
+    this.ensureColumn("audit_logs", "file_observation", "TEXT");
     this.ensureColumn("audit_logs", "message_create_time", "INTEGER");
     this.ensureColumn("conversations", "vault_ids", "TEXT");
     const hadDispatchMetadata = (this.db.prepare("PRAGMA table_info(processed_events)").all() as { name: string }[]).some(column => column.name === "dispatched");
@@ -552,11 +555,13 @@ export class GatewayStore {
   }
 
   addAuditLog(input: Omit<AuditLog, "id" | "createdAt" | "channelType" | "installationId"> & Partial<Pick<AuditLog, "channelType" | "installationId">>): AuditLog {
-    const log: AuditLog = { channelType: "lark", installationId: "legacy", ...input, id: randomUUID(), createdAt: new Date().toISOString() };
+    const log: AuditLog = { channelType: "lark", installationId: "legacy", ...input,
+      ...(input.fileObservation ? { fileObservation: sanitizeFileObservation(input.fileObservation) } : {}), id: randomUUID(), createdAt: new Date().toISOString() };
     this.db.prepare(`INSERT INTO audit_logs
-      (id, channel_type, installation_id, tenant_key, open_id, chat_id, message_id, session_id, action, status, duration_ms, request_id, summary, response_summary, message_create_time, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(log.id, log.channelType, log.installationId, log.tenantKey, log.openId, log.chatId, log.messageId, log.sessionId || null, log.action, log.status, log.durationMs ?? null, log.requestId || null, log.summary || null, log.responseSummary || null, log.messageCreateTime ?? null, log.createdAt);
+      (id, channel_type, installation_id, tenant_key, open_id, chat_id, message_id, session_id, action, status, duration_ms, request_id, summary, response_summary, message_create_time, created_at, file_observation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(log.id, log.channelType, log.installationId, log.tenantKey, log.openId, log.chatId, log.messageId, log.sessionId || null, log.action, log.status, log.durationMs ?? null, log.requestId || null, log.summary || null, log.responseSummary || null, log.messageCreateTime ?? null, log.createdAt,
+      log.fileObservation ? JSON.stringify(log.fileObservation) : null);
     return log;
   }
 
@@ -571,6 +576,7 @@ export class GatewayStore {
       requestId: row.request_id ? String(row.request_id) : undefined,
       summary: row.summary ? String(row.summary) : undefined,
       responseSummary: row.response_summary ? String(row.response_summary) : undefined,
+      ...(row.file_observation ? { fileObservation: parseStoredFileObservation(String(row.file_observation)) } : {}),
       messageCreateTime: row.message_create_time === null ? undefined : Number(row.message_create_time),
       createdAt: String(row.created_at)
     }));

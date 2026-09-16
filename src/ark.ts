@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { ArkHttpError, ArkNetworkError, safeErrorCode, safeRequestId } from "./ark-errors.ts";
 export { ArkHttpError } from "./ark-errors.ts";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
+import { RunFileObserver, type RunFileObservation } from "./run-file-observation.ts";
 import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
 import { inspectUploadedFile, validUploadName, type FileUploadQuery, type FileUploadInspection } from "./upload-inspection.ts";
 
@@ -12,6 +13,7 @@ export type RunResult = {
   messages: string[];
   authorizationRequired?: UserAuthorizationRequired;
   evidence?: RunEvidence;
+  fileObservation?: RunFileObservation;
 };
 
 export type RunInspection =
@@ -568,6 +570,7 @@ export class ArkClient {
     onDelta?: (snapshot: string) => Promise<void>
   ): Promise<RunResult> {
     const messages: string[] = [];
+    const files = new RunFileObserver();
     const seen = new Set<string>();
     const previews = new Map<string, Map<number, string>>();
     const toolDomains = new Map<string, string>();
@@ -575,6 +578,7 @@ export class ArkClient {
     let lastSnapshot = "";
     for await (const event of await streamPromise) {
       if (!belongsToRun(event, boundary)) continue;
+      files.observe(event);
       if (event.id && seen.has(event.id)) continue;
       if (event.id) seen.add(event.id);
       rememberLarkCliToolDomain(event, toolDomains);
@@ -610,8 +614,11 @@ export class ArkClient {
       }
       const progress = eventProgress(event);
       if (progress) await onProgress?.(progress);
-      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
-      if (event.type === "session.status_idle") return { terminal: "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+      if (["session.error", "session.status_failed", "session.status_idle"].includes(String(event.type))) {
+        const fileObservation = files.snapshot();
+        return { terminal: event.type === "session.status_idle" ? "idle" : "failed", messages,
+          ...(fileObservation ? { fileObservation } : {}), ...(authorizationRequired ? { authorizationRequired } : {}) };
+      }
     }
     throw new Error("事件流结束，但未观察到 Session 终态");
   }
@@ -875,12 +882,16 @@ function terminalResult(current: ArkEvent[]): RunResult | undefined {
   for (const event of current) rememberLarkCliToolDomain(event, toolDomains);
   const authorizationRequired = current.map(event => eventUserAuthorizationRequired(event, toolDomains)).find(Boolean);
   const terminal = failed ? "failed" : "idle";
+  const files = new RunFileObserver();
+  for (const event of raw) files.observe(event);
+  const fileObservation = files.snapshot();
+  const observed = fileObservation ? { fileObservation } : {};
   if (authorizationRequired) {
     const collector = new RunEvidenceCollector();
     for (const event of raw) collector.observe(event, Boolean(eventUserAuthorizationRequired(event, toolDomains)));
-    return { terminal, messages, authorizationRequired, evidence: collector.snapshot(terminal) };
+    return { terminal, messages, ...observed, authorizationRequired, evidence: collector.snapshot(terminal) };
   }
-  return { terminal, messages };
+  return { terminal, messages, ...observed };
 }
 
 function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, string>): void {

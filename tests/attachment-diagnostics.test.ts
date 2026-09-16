@@ -9,6 +9,7 @@ import { GatewayStore } from "../src/store.ts";
 import { startEmployeeWeb } from "../src/web.ts";
 import type { ChannelMessage } from "../src/channel.ts";
 import type { EmployeeConfig } from "../src/config.ts";
+import { RunFileObserver } from "../src/run-file-observation.ts";
 
 const message: ChannelMessage = { channelType: "lark", installationId: "app", tenantId: "tenant", senderId: "user", conversationId: "chat",
   conversationType: "group", threadId: "thread", rootMessageId: "root", parentMessageId: "parent", messageId: "source", eventId: "event",
@@ -199,6 +200,44 @@ test("attachment HTTP diagnostics and actual UI script expose safe request ident
     const status = select("#attachment-body").children[0].children[3].textContent;
     assert.match(status, /不代表远端未写入/);
     assert.match(status, /permission.*403.*AccessDenied.*request ID: request-123/);
+  });
+});
+
+test("audit HTTP and actual UI distinguish document-returned from business success", async () => {
+  await withWeb(async (store, base) => {
+    const files = new RunFileObserver();
+    files.observe({ id: "call", type: "agent.tool_use", name: "read", input: { file_path: "/PRIVATE.pdf" } });
+    files.observe({ id: "result", type: "agent.tool_result", tool_use_id: "call", is_error: false, content: [{ type: "document", source: { data: "PRIVATE-BASE64" } }] });
+    files.observe({ id: "reply", type: "agent.message", content: [{ type: "text", text: "稍后分析" }] });
+    store.addAuditLog({ channelType: "lark", installationId: "app", tenantKey: "tenant", openId: "user", chatId: "chat", messageId: "message",
+      action: "file_message", status: "succeeded", fileObservation: files.snapshot() });
+    const endpoint = base + "/api/employees/agent/audit";
+    assert.equal((await fetch(endpoint)).status, 401);
+    const response = await fetch(endpoint, { headers });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.doesNotMatch(JSON.stringify(payload), /PRIVATE|稍后/);
+    const { context, select } = await pageScript(base);
+    context.fetch = async () => ({ ok: true, json: async () => payload });
+    await runInContext("loadAudit()", context);
+    const status = select("#audit-body").children[0].children[3].textContent;
+    assert.match(status, /1 次读取.*1 次文档结果.*读取结果后有回复.*业务结果未自动验收/);
+    assert.doesNotMatch(status, /理解成功|分析完成/);
+  });
+});
+
+test("audit UI makes missing, failed and unmatched file results visible", async () => {
+  await withWeb(async (_store, base) => {
+    const files = new RunFileObserver();
+    files.observe({ id: "missing", type: "agent.tool_use", name: "read" });
+    files.observe({ id: "failed", type: "agent.tool_use", name: "read" });
+    files.observe({ id: "error", type: "agent.tool_result", tool_use_id: "failed", is_error: true });
+    files.observe({ id: "orphan", type: "agent.tool_result", tool_use_id: "unknown", is_error: false, content: [{ type: "document" }] });
+    const { context } = await pageScript(base);
+    context.row = { status: "failed", fileObservation: files.snapshot() };
+    const status = runInContext("auditRunStatus(row)", context);
+    assert.match(status, /1 次读取报错/); assert.match(status, /1 次缺少结果/);
+    assert.match(status, /1 次未关联文档结果/); assert.match(status, /顺序待核实/);
   });
 });
 
