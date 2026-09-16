@@ -8,7 +8,7 @@ import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
 import { loadSessionConfiguration } from "./session-config.ts";
 import { startChannelAfterRecovery } from "./channel-startup.ts";
-import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource, ChannelInspectReaction } from "./channel.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -108,6 +108,7 @@ async function runEmployee(): Promise<void> {
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
+    inspectReaction: channel.inspectReaction,
     ensureAuthorization: (message, request) => auth.ensure(message, request),
     cancelAuthorization: message => auth.cancel(message),
     authorizationStatus: message => auth.status(message),
@@ -207,6 +208,7 @@ async function run(): Promise<void> {
     streamReply: channel.streamReply,
     addReaction: channel.addReaction,
     removeReaction: channel.removeReaction,
+    inspectReaction: channel.inspectReaction,
     beforeCreateSession: ensureCredentialFresh,
     readMessage: channel.readMessage,
     timeoutMs: config.sessionTimeoutMs
@@ -229,6 +231,7 @@ type FeishuRuntime = {
   streamReply?: (message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
   addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
+  inspectReaction?: ChannelInspectReaction;
   loadRecentHistory?: (message: ChannelMessage) => Promise<ChannelHistoryMessage[]>;
   readMessage?: ChannelReadMessage;
   download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;
@@ -248,6 +251,7 @@ async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (m
       streamReply: (message, producer) => adapter.streamReply(message, producer),
       addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
       removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
+      inspectReaction: (message, query, signal) => adapter.inspectReaction?.(message, query, signal) || Promise.resolve({ status: "unknown" }),
       loadRecentHistory: message => adapter.loadRecentHistory?.(message) || Promise.resolve([]),
       readMessage: (message, id, signal) => adapter.readMessage?.(message, id, signal) || Promise.resolve({ status: "unavailable" }),
       download: (resource, message, maxBytes) => adapter.download(resource, message, maxBytes)

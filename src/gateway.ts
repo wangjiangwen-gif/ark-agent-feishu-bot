@@ -1,7 +1,7 @@
 import type {
   ArkClient, RunInspection, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, SessionStats, UserAuthorizationRequired
 } from "./ark.ts";
-import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage } from "./channel.ts";
+import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelInspectReaction, ReactionObservation } from "./channel.ts";
 import { buildConversationTurn, resolveReplyContext } from "./conversation-context.ts";
 import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, mergeSessionRequest, requestEnvironmentId, selectSessionRequest, validateSessionConfiguration, type SessionConfiguration, type SessionScope } from "./session-config.ts";
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
@@ -236,8 +236,27 @@ export class Gateway {
 
   async recoverPendingReactions(channelType: string, installationId: string): Promise<void> {
     if (!this.options.durableQueue || !this.options.removeReaction) return;
-    for (const { receipt, message } of this.store.reactions.pending(channelType, installationId)) {
-      await this.removeTrackedReaction(message, receipt.reactionId!, receipt.id);
+    for (const { receipt, message } of this.store.reactions.pending(channelType, installationId, Boolean(this.options.inspectReaction))) {
+      if (!this.options.inspectReaction) {
+        await this.removeTrackedReaction(message, receipt.reactionId!, receipt.id);
+        continue;
+      }
+      await this.withReactionCleanup(receipt.id, async () => {
+        const signal = AbortSignal.timeout(5000);
+        let abort!: () => void;
+        const cancelled = new Promise<ReactionObservation>(resolve => { abort = () => resolve({ status: "unknown" }); signal.addEventListener("abort", abort, { once: true }); });
+        let observation: ReactionObservation;
+        try {
+          observation = await Promise.race([this.options.inspectReaction!(message, {
+            emoji: receipt.emoji, reactionId: receipt.reactionId, createdAt: receipt.createdAt
+          }, signal), cancelled]);
+        } catch { observation = { status: "unknown" }; }
+        finally { signal.removeEventListener("abort", abort); }
+        if (signal.aborted) observation = { status: "unknown" };
+        const checked = this.store.reactions.recordInspection(receipt, observation);
+        if (observation.status === "present") await this.performReactionRemoval(message, observation.reactionId, checked.id);
+        else if (observation.status === "absent" && checked.reactionId) this.store.reactions.finishAbsent(checked);
+      });
     }
   }
 
@@ -257,13 +276,19 @@ export class Gateway {
 
   private async removeTrackedReaction(message: IncomingMessage, id: string, receiptId?: string): Promise<void> {
     const key = receiptId || JSON.stringify([message.channelType, message.installationId, message.messageId, id]);
+    return this.withReactionCleanup(key, () => this.performReactionRemoval(message, id, receiptId));
+  }
+
+  private async performReactionRemoval(message: IncomingMessage, id: string, receiptId?: string): Promise<void> {
+    const checkpoint = receiptId ? this.store.reactions.startRemoval(receiptId) : undefined;
+    await this.options.removeReaction!(message, id);
+    if (checkpoint) this.store.reactions.finishRemoval(checkpoint);
+  }
+
+  private withReactionCleanup(key: string, work: () => Promise<void>): Promise<void> {
     const previous = this.reactionCleanups.get(key);
     if (previous) return previous;
-    const operation = Promise.resolve().then(async () => {
-      const checkpoint = receiptId ? this.store.reactions.startRemoval(receiptId) : undefined;
-      await this.options.removeReaction!(message, id);
-      if (checkpoint) this.store.reactions.finishRemoval(checkpoint);
-    }).catch(() => console.warn(receiptId ? "表情清理未确认；保留检查点，不重跑业务任务" : "表情清理未确认，不重跑业务任务"))
+    const operation = Promise.resolve().then(work).catch(() => console.warn("表情核查或清理未确认，不重跑业务任务"))
       .finally(() => this.reactionCleanups.delete(key));
     this.reactionCleanups.set(key, operation);
     return operation;
@@ -1196,6 +1221,7 @@ export type GatewayOptions = {
   streamReply?: (message: IncomingMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
   addReaction?: (message: IncomingMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
+  inspectReaction?: ChannelInspectReaction;
   beforeCreateSession?: () => Promise<void>;
   beforeDirectTurn?: (message: IncomingMessage) => Promise<void>;
   platformAccess?: boolean;

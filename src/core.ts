@@ -27,6 +27,9 @@ export type {
   ChannelMessage,
   ChannelMessageLookup,
   ChannelReadMessage,
+  ChannelInspectReaction,
+  ReactionQuery,
+  ReactionObservation,
   ChannelOutbound,
   ChannelResource,
   ChannelType

@@ -1,6 +1,8 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource } from "./channel.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
+import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
+import type { ReactionQuery, ReactionObservation } from "./channel.ts";
 
 type RawLarkMessage = {
   event_id?: string;
@@ -33,7 +35,7 @@ type LarkMessageListResponse = {
 
 type LarkMessageList = (payload: unknown) => Promise<LarkMessageListResponse>;
 
-type FeishuCardStreamClient = FeishuResourceClient & {
+type FeishuCardStreamClient = FeishuResourceClient & ReactionListClient & {
   im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList; get?: LarkMessageList };
     v1?: { messageReaction?: { create(payload: unknown): Promise<{ code?: number; data?: { reaction_id?: string } }>;
       delete(payload: unknown): Promise<{ code?: number }> } } };
@@ -229,6 +231,11 @@ export class LarkChannelAdapter implements ChannelAdapter {
     const client = this.channel.rawClient;
     if (!client) return { status: "unavailable" };
     return readLarkMessage(client, message, messageId, signal);
+  }
+
+  async inspectReaction(message: ChannelMessage, query: ReactionQuery, signal: AbortSignal): Promise<ReactionObservation> {
+    if (!this.channel.rawClient) return { status: "unknown" };
+    return inspectLarkReaction(this.channel.rawClient, this.installationId, message, query, signal);
   }
 
   async download(resource: ChannelResource, message: ChannelMessage, remainingBytes = this.maxFileBytes): Promise<{ bytes: Uint8Array; mimeType: string }> {

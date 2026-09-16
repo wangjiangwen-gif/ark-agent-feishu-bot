@@ -47,6 +47,10 @@ export type ChannelMessageLookup =
 
 export type ChannelReadMessage = (message: ChannelMessage, messageId: string, signal: AbortSignal) => Promise<ChannelMessageLookup>;
 
+export type ReactionQuery = { emoji: "Get" | "OnIt"; reactionId?: string; createdAt?: number };
+export type ReactionObservation = { status: "present"; reactionId: string } | { status: "absent" } | { status: "unknown" };
+export type ChannelInspectReaction = (message: ChannelMessage, query: ReactionQuery, signal: AbortSignal) => Promise<ReactionObservation>;
+
 export type ChannelOutbound =
   | { type: "text"; text: string }
   | { type: "markdown"; markdown: string }
@@ -72,6 +76,7 @@ export interface ChannelAdapter {
   streamReply?(message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>): Promise<void>;
   addReaction?(message: ChannelMessage, emojiType: string): Promise<string>;
   removeReaction?(message: ChannelMessage, reactionId: string): Promise<void>;
+  inspectReaction?: ChannelInspectReaction;
   loadRecentHistory?(message: ChannelMessage): Promise<ChannelHistoryMessage[]>;
   readMessage?: ChannelReadMessage;
   download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;

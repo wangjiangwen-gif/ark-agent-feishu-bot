@@ -9,6 +9,7 @@ import { setImmediate as flush } from "node:timers/promises";
 import { GatewayStore } from "../src/store.ts";
 import { Gateway, type GatewayOptions } from "../src/gateway.ts";
 import type { ChannelMessage } from "../src/channel.ts";
+import { LarkChannelAdapter, type LarkChannelPort } from "../src/lark-channel.ts";
 
 const message = (id = "first"): ChannelMessage => ({ channelType: "lark", installationId: "cli", tenantId: "tenant", senderId: "user",
   conversationId: "chat", conversationType: "group", threadId: "", rootMessageId: "", parentMessageId: "", messageId: id,
@@ -175,4 +176,130 @@ test("failed receipt persistence prevents adding an untracked reaction", async (
     gateway.accept(message()); await until(() => f.store.inbox.findMessage(message())?.state === "completed");
     assert.equal(adds, 0); assert.equal(runs, 1);
   } finally { db.close(); f.close(); }
+});
+
+test("unknown creation is adopted from a verified lookup and only that ID is deleted", async () => {
+  const f = fixture(); const removed: string[] = []; let queried = 0;
+  try {
+    const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+    f.store.reactions.begin(message(), "Get"); f.store.finishMessage(task.id, "failed");
+    const gateway = new Gateway(f.store, { createSession: async () => { throw new Error("no MA"); }, run: async () => { throw new Error("no MA"); } }, async () => {}, {
+      ...options, inspectReaction: async (m, q) => { queried++; assert.equal(m.messageId, "first"); assert.equal(q.emoji, "Get"); assert.ok(q.createdAt); return { status: "present", reactionId: "recovered-id" }; },
+      removeReaction: async (_m, id) => { removed.push(id); }
+    });
+    await gateway.recoverPendingReactions("lark", "cli");
+    assert.equal(queried, 1); assert.deepEqual(removed, ["recovered-id"]);
+    assert.deepEqual(f.store.reactions.pending("lark", "cli", true), []);
+    assert.equal(f.store.inbox.findMessage(message())!.state, "uncertain");
+  } finally { f.close(); }
+});
+
+test("lost deletion response is resolved by absence without repeating DELETE", async () => {
+  const f = fixture(); let removed = 0;
+  try {
+    const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+    const r = f.store.reactions.begin(message(), "Get"); f.store.reactions.activate(r.id, "rid");
+    f.store.reactions.startRemoval(r.id); f.store.finishMessage(task.id, "failed");
+    const gateway = new Gateway(f.store, { createSession: async () => "unused", run: async () => { throw new Error("no MA"); } }, async () => {}, {
+      ...options, inspectReaction: async () => ({ status: "absent" }), removeReaction: async () => { removed++; }
+    });
+    await gateway.recoverPendingReactions("lark", "cli");
+    assert.equal(removed, 0); assert.deepEqual(f.store.reactions.pending("lark", "cli"), []);
+  } finally { f.close(); }
+});
+
+for (const status of ["absent", "unknown", "throws"] as const) {
+  test(`unknown creation stays recoverable after lookup ${status}`, async () => {
+    const f = fixture(); let removed = 0;
+    try {
+      const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+      f.store.reactions.begin(message(), "Get"); f.store.finishMessage(task.id, "failed");
+      const gateway = new Gateway(f.store, { createSession: async () => "unused", run: async () => { throw new Error("no MA"); } }, async () => {}, {
+        ...options, inspectReaction: async () => { if (status === "throws") throw new Error("private-error"); return { status }; }, removeReaction: async () => { removed++; }
+      });
+      await gateway.recoverPendingReactions("lark", "cli");
+      assert.equal(removed, 0); assert.equal(f.store.reactions.pending("lark", "cli", true)[0].receipt.phase, "creating");
+    } finally { f.close(); }
+  });
+}
+
+test("reaction inspection cannot overwrite a newer checkpoint or adopt a different known ID", () => {
+  const f = fixture();
+  try {
+    const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+    const r = f.store.reactions.begin(message(), "Get"), active = f.store.reactions.activate(r.id, "rid");
+    assert.throws(() => f.store.reactions.recordInspection(r, { status: "present", reactionId: "other" }));
+    assert.throws(() => f.store.reactions.recordInspection(active, { status: "present", reactionId: "other" }));
+    assert.throws(() => f.store.reactions.finishAbsent(active));
+    const checked = f.store.reactions.recordInspection(active, { status: "absent" });
+    f.store.reactions.finishAbsent(checked);
+    assert.throws(() => f.store.reactions.finishAbsent(checked));
+  } finally { f.close(); }
+});
+
+test("unknown queued reactions from an old owner remain discoverable after an absent lookup", () => {
+  const f = fixture();
+  try {
+    f.store.receiveMessage(message(), binding); f.store.reactions.begin(message(), "OnIt");
+    f.store.close(); const reopened = new GatewayStore(f.path); reopened.acquireRuntimeLock();
+    try {
+      const saved = reopened.reactions.pending("lark", "cli", true)[0].receipt;
+      reopened.reactions.recordInspection(saved, { status: "absent" });
+      assert.equal(reopened.reactions.pending("lark", "cli", true).length, 1);
+    } finally { reopened.close(); }
+  } finally { f.close(); }
+});
+
+test("native adapter and Gateway resolve accepted creation plus lost deletion acknowledgement", async () => {
+  const f = fixture(); let present = true, gets = 0, deletes = 0;
+  try {
+    const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+    const r = f.store.reactions.begin(message(), "Get"); f.store.finishMessage(task.id, "failed");
+    const port = { rawClient: { im: { v1: { messageReaction: {
+      list: async p => {
+        gets++; assert.equal(p.path.message_id, "first");
+        return { code: 0, data: { has_more: false, items: present ? [{ reaction_id: "rid", operator: { operator_type: "app", operator_id: "cli" },
+          reaction_type: { emoji_type: "Get" }, action_time: String(r.createdAt! + 1) }] : [] } };
+      },
+      delete: async p => { deletes++; assert.equal(p.path.reaction_id, "rid"); present = false; throw new Error("response lost after removal"); }
+    } } } } } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+    const gateway = new Gateway(f.store, { createSession: async () => { throw new Error("no MA"); }, run: async () => { throw new Error("no MA"); } }, async () => {}, {
+      ...options, inspectReaction: adapter.inspectReaction.bind(adapter), removeReaction: adapter.removeReaction.bind(adapter)
+    });
+    await gateway.recoverPendingReactions("lark", "cli");
+    assert.equal(f.store.reactions.pending("lark", "cli")[0].receipt.phase, "removing");
+    await gateway.recoverPendingReactions("lark", "cli");
+    assert.equal(gets, 2); assert.equal(deletes, 1);
+    assert.deepEqual(f.store.reactions.pending("lark", "cli", true), []);
+    assert.equal(f.store.inbox.findMessage(message())!.state, "uncertain");
+  } finally { f.close(); }
+});
+
+test("concurrent recovery coalesces the lookup as well as deletion", async () => {
+  const f = fixture(); let queried = 0, deleted = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  try {
+    const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+    const r = f.store.reactions.begin(message(), "Get"); f.store.reactions.activate(r.id, "rid"); f.store.finishMessage(task.id, "failed");
+    const gateway = new Gateway(f.store, { createSession: async () => "unused", run: async () => { throw new Error("no MA"); } }, async () => {}, {
+      ...options, inspectReaction: async () => { queried++; await gate; return { status: "present", reactionId: "rid" }; }, removeReaction: async () => { deleted++; }
+    });
+    const a = gateway.recoverPendingReactions("lark", "cli"), b = gateway.recoverPendingReactions("lark", "cli");
+    await until(() => queried === 1); release(); await Promise.all([a, b]);
+    assert.equal(queried, 1); assert.equal(deleted, 1);
+  } finally { release?.(); f.close(); }
+});
+
+test("checkpoint changed while querying prevents stale absence from clearing a live receipt", async () => {
+  const f = fixture(); let deleted = 0;
+  try {
+    const task = f.store.receiveMessage(message(), binding)!; f.store.inbox.claim(task.id, binding);
+    const r = f.store.reactions.begin(message(), "Get"); f.store.reactions.activate(r.id, "rid"); f.store.finishMessage(task.id, "failed");
+    const gateway = new Gateway(f.store, { createSession: async () => "unused", run: async () => { throw new Error("no MA"); } }, async () => {}, {
+      ...options, inspectReaction: async () => { f.store.reactions.startRemoval(r.id); return { status: "absent" }; }, removeReaction: async () => { deleted++; }
+    });
+    await gateway.recoverPendingReactions("lark", "cli");
+    assert.equal(deleted, 0); assert.equal(f.store.reactions.pending("lark", "cli").length, 1);
+  } finally { f.close(); }
 });
