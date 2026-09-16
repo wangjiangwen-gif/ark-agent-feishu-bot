@@ -1,4 +1,5 @@
 import test from "node:test";
+import { readOnlyEvidence } from "./helpers/run-evidence.ts";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { Gateway, resultToReply, shouldHandleMessage, toConversationKey, type IncomingMessage } from "../src/gateway.ts";
@@ -533,7 +534,7 @@ test("repeated token_missing stops after one automatic authorization retry", asy
   const gateway = new Gateway(store, {
     createSession: async () => "session",
     run: async () => ({
-      terminal: "idle" as const, messages: ["没有用户凭证"],
+      terminal: "idle" as const, messages: ["没有用户凭证"], evidence: readOnlyEvidence(),
       authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
     })
   }, collectText(replies), {
@@ -659,7 +660,7 @@ test("authorization resumes a Session in place when its user Vault was mounted a
   const incoming = message({ text: "查询今天日程" });
   const key = toConversationKey(incoming);
   store.saveSession(key, "session-current", "agent-1", undefined, ["vlt-bot", "vlt-user"]);
-  store.startAuthorizationRecovery(incoming, "session-current");
+  store.startAuthorizationRecovery(incoming, "session-current", readOnlyEvidence());
   const runs: string[] = [];
   let creates = 0;
   const gateway = new Gateway(store, {

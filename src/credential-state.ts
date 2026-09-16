@@ -133,7 +133,9 @@ export class CredentialStateStore {
         const exists = this.db.prepare("SELECT 1 FROM employee_credentials LIMIT 1").get()
           || this.db.prepare("SELECT 1 FROM employee_oauth WHERE refresh_token LIKE 'sealed:v1:%' LIMIT 1").get()
           || (this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='employee_authorization_flows'").get()
-            && this.db.prepare("SELECT 1 FROM employee_authorization_flows LIMIT 1").get());
+            && this.db.prepare("SELECT 1 FROM employee_authorization_flows LIMIT 1").get())
+          || (this.db.prepare("PRAGMA table_info(authorization_recoveries)").all().some(row => row.name === "evidence")
+            && this.db.prepare("SELECT 1 FROM authorization_recoveries WHERE evidence IS NOT NULL LIMIT 1").get());
         if (exists) throw new Error("missing");
         let created: number | undefined;
         try {

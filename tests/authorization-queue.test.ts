@@ -5,6 +5,7 @@ import { Gateway, KeyedQueue, toConversationKey, type IncomingMessage } from "..
 import { GatewayStore } from "../src/store.ts";
 import { EmployeeAuthorizationManager } from "../src/employee-auth.ts";
 import { OAuthError, type OAuthTokens } from "../src/oauth.ts";
+import { readOnlyEvidence } from "./helpers/run-evidence.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (reason: Error) => void;
@@ -66,7 +67,7 @@ test("OAuth wait pauses only its direct scope, removes Get and recovers before a
   gateway = new Gateway(store, { createSession: async () => `session-${++calls}`,
     run: async (_id, input) => {
       const text = input.match(/<current_request>\n([\s\S]*?)\n<\/current_request>/)![1]; runs.push(text);
-      return { terminal: "idle", messages: ["done"], ...(text === "first" && runs.filter(s => s === "first").length === 1 ? { authorizationRequired: request } : {}) };
+      return { terminal: "idle", messages: ["done"], ...(text === "first" && runs.filter(s => s === "first").length === 1 ? { authorizationRequired: request, evidence: readOnlyEvidence() } : {}) };
     }
   }, async (_m, outbound) => { if (outbound.type === "text") replies.push(outbound.text); }, {
     agentId: "agent", environmentId: "env", vaultId: "bot-vault", timeoutMs: 1000, platformAccess: true, dualIdentity: true,
@@ -83,7 +84,10 @@ test("OAuth wait pauses only its direct scope, removes Get and recovers before a
   gateway.accept(message("other", "other")); await flush();
   assert.deepEqual(runs, ["first", "other"]);
   poll.resolve(tokens()); await flush(); await flush();
-  assert.deepEqual(runs, ["first", "other", "first", "second", "third"]);
+  assert.equal(runs.length, 5);
+  assert.deepEqual([runs[0], runs[1], runs[3], runs[4]], ["first", "other", "second", "third"]);
+  assert.match(runs[2], /原任务的授权恢复事件/);
+  assert.doesNotMatch(runs[2], /first/);
   assert.equal(calls, 2);
 });
 

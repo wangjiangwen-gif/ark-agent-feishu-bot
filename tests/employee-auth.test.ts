@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readOnlyEvidence } from "./helpers/run-evidence.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { EmployeeAuthorizationManager, EMPLOYEE_CALENDAR_USER_SCOPES } from "../src/employee-auth.ts";
 import { Gateway, type IncomingMessage } from "../src/gateway.ts";
@@ -133,7 +134,7 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
     run: async (sessionId: string) => {
       runSessions.push(sessionId);
       return runSessions.length === 1
-        ? { terminal: "idle" as const, messages: [], authorizationRequired: calendarRequest() }
+        ? { terminal: "idle" as const, messages: [], authorizationRequired: calendarRequest(), evidence: readOnlyEvidence() }
         : { terminal: "idle" as const, messages: ["已查询日程"] };
     }
   };

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
 
 export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; processed_at?: string };
 
@@ -6,6 +7,7 @@ export type RunResult = {
   terminal: "idle" | "failed";
   messages: string[];
   authorizationRequired?: UserAuthorizationRequired;
+  evidence?: RunEvidence;
 };
 
 export type UserAuthorizationRequired = {
@@ -456,10 +458,21 @@ export class ArkClient {
         waitFor(this.options.sseHeadStartMs, controller.signal)
       ]);
       await this.sendMessage(sessionId, text, controller.signal);
-      const result = await Promise.any([
+      let result = await Promise.any([
         this.consumeEventStream(eventStream, boundary, onProgress, onDelta),
         this.pollRunResult(sessionId, boundary, controller.signal)
       ]);
+      if (result.authorizationRequired) {
+        // SSE可能漏掉前面的写入或用户锚点。授权续跑只能依赖本轮完整历史，不把流式片段当证明。
+        try {
+          const history = await this.readSessionEvents(sessionId, AbortSignal.any([controller.signal, AbortSignal.timeout(2_000)]), boundary.page);
+          const verified = resultForBoundary(history.events, { ...boundary, anchored: false });
+          result = { ...result, evidence: verified?.authorizationRequired ? verified.evidence : undefined };
+        } catch {
+          console.warn("授权任务历史核验失败，保留授权需求但禁止依据不完整证据自动续跑");
+          result = { ...result, evidence: undefined };
+        }
+      }
       controller.abort();
       return result;
     } catch (error) {
@@ -692,6 +705,7 @@ function resultForBoundary(events: ArkEvent[], boundary: RunBoundary): RunResult
 }
 
 function terminalResult(current: ArkEvent[]): RunResult | undefined {
+  const raw = current;
   current = [...new Map(current.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
   const failed = current.some(event => event.type === "session.error" || event.type === "session.status_failed");
   const idle = current.some(event => event.type === "session.status_idle");
@@ -700,7 +714,13 @@ function terminalResult(current: ArkEvent[]): RunResult | undefined {
   const toolDomains = new Map<string, string>();
   for (const event of current) rememberLarkCliToolDomain(event, toolDomains);
   const authorizationRequired = current.map(event => eventUserAuthorizationRequired(event, toolDomains)).find(Boolean);
-  return { terminal: failed ? "failed" : "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+  const terminal = failed ? "failed" : "idle";
+  if (authorizationRequired) {
+    const collector = new RunEvidenceCollector();
+    for (const event of raw) collector.observe(event, Boolean(eventUserAuthorizationRequired(event, toolDomains)));
+    return { terminal, messages, authorizationRequired, evidence: collector.snapshot(terminal) };
+  }
+  return { terminal, messages };
 }
 
 function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, string>): void {
@@ -708,7 +728,10 @@ function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, str
   const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
   if (typeof input?.command !== "string") return;
   const match = input.command.match(/(?:^|[;&|]\s*|\s)lark-cli\s+([a-z][\w-]*)\b/i);
-  if (match) toolDomains.set(event.id, match[1].toLowerCase());
+  if (match) {
+    toolDomains.set(event.id, match[1].toLowerCase());
+    if (typeof event.tool_use_id === "string") toolDomains.set(event.tool_use_id, match[1].toLowerCase());
+  }
 }
 
 export function eventUserAuthorizationRequired(

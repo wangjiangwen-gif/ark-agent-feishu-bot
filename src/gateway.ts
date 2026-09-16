@@ -7,6 +7,7 @@ import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, merg
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
 import { createHash } from "node:crypto";
 import { baselineCompaction, decideCompaction, startCompaction, finishCompaction } from "./session-compaction.ts";
+import { authorizationContinuation, authorizationRecoveryDecision, type RunEvidence } from "./run-evidence.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -200,7 +201,18 @@ export class Gateway {
           const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2_000));
           if (stats.status !== "idle") throw new Error("原Session尚未确认空闲，未提交授权恢复任务；请检查运行状态，不能重复投递");
         }
-        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
+        const decision = authorizationRecoveryDecision(recovery.evidence);
+        if (decision !== "read_only") {
+          this.store.finishAuthorizationRecovery(message, "blocked");
+          this.store.addAuditLog({ channelType: message.channelType, installationId: message.installationId,
+            tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
+            messageId: message.messageId, sessionId, action: "authorization_recovery_blocked", status: "failed",
+            summary: decision, messageCreateTime: message.createTime });
+          const resources = recovery.evidence?.steps.flatMap(step => step.outcome === "succeeded" ? step.resources : []) || [];
+          await this.replyText(message, `授权已更新，原 Session 已保留。${decision === "writes_present" ? "此前已有写入成功" : "此前执行结果无法完整确认"}，为避免重复创建或发送，未自动重放原任务。${resources.length ? `\n已完成资源：${resources.slice(0, 20).map(resource => `${resource.type}: ${resource.id}`).join("；")}` : ""}\n请确认已完成的部分和需要继续的步骤。`);
+          return;
+        }
+        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction, authorizationContinuation(recovery.evidence!)));
         this.store.finishAuthorizationRecovery(message, "completed");
       } catch (error) {
         this.store.finishAuthorizationRecovery(message, "failed");
@@ -321,7 +333,7 @@ export class Gateway {
     });
   }
 
-  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff, hasReaction = false): Promise<void> {
+  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff, hasReaction = false, continuation?: string): Promise<void> {
     if (!this.options.platformAccess && message.senderId !== this.options.authorizedUserId) {
       await this.replyText(message, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
@@ -390,6 +402,7 @@ export class Gateway {
     }
     const replyContextPromise = (async () => {
       await recentHistoryPromise;
+      if (continuation) return undefined;
       return resolveReplyContext(message, observedHistory,
         message.parentMessageId ? this.store.cachedMessage(message, message.parentMessageId) : undefined,
         this.options.readMessage);
@@ -421,14 +434,14 @@ export class Gateway {
         });
       }, this.options.progressDelayMs ?? 2_500);
     }
-    let input = message.text;
+    let input = continuation ?? message.text;
     try {
       const initialResources: SessionResource[] = [];
       const attachmentKeys: string[] = [];
       const budget = { bytes: 0, inlineBytes: 0 };
       const mounted: string[] = [];
       const inlineTexts: Array<{ name: string; text: string }> = [];
-      if (message.resources.length) {
+      if (message.resources.length && !continuation) {
         if (!this.options.downloadAttachment) throw new Error("当前 Gateway 未配置附件下载能力");
         for (const [index, attachment] of message.resources.entries()) {
           const name = safeFilename(attachment.name, index);
@@ -569,7 +582,7 @@ export class Gateway {
       if (result.authorizationRequired) {
         if (progressTimer) clearTimeout(progressTimer);
         await progressReply;
-        await this.handleAuthorizationRequired(message, sessionId, startedAt, result.authorizationRequired);
+        await this.handleAuthorizationRequired(message, sessionId, startedAt, result.authorizationRequired, result.evidence);
         return;
       }
       const finalReply = withNotices(resultToReply(result));
@@ -601,13 +614,14 @@ export class Gateway {
     message: IncomingMessage,
     sessionId: string,
     startedAt: number,
-    request: UserAuthorizationRequired
+    request: UserAuthorizationRequired,
+    evidence?: RunEvidence
   ): Promise<void> {
     if (this.usesBotOnlyIdentity(message)) {
       throw new Error("群聊场景仅使用 Bot 身份，不能挂载或申请个人用户凭证；请改用 Bot 可访问的群级能力，或私聊数字员工完成需要个人身份的操作");
     }
     if (!this.options.ensureAuthorization) throw new Error("当前 Gateway 未配置用户授权处理器");
-    if (!this.store.startAuthorizationRecovery(message, sessionId)) {
+    if (!this.store.startAuthorizationRecovery(message, sessionId, evidence)) {
       throw new Error("授权后仍未获得用户凭证，请重新授权或联系管理员检查用户 Vault");
     }
     this.store.addAuditLog({

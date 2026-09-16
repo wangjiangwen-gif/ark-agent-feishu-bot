@@ -8,6 +8,7 @@ import type { CompactionCheckpoint } from "./session-compaction.ts";
 import { CredentialStateStore, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
 import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
 import type { OAuthTokens } from "./oauth.ts";
+import type { RunEvidence } from "./run-evidence.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -158,6 +159,7 @@ export class GatewayStore {
     `);
     this.credentials = new CredentialStateStore(this.db, path);
     this.authorizations = new AuthorizationStateStore(this.db, this.credentials);
+    this.ensureColumn("authorization_recoveries", "evidence", "TEXT");
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
     this.ensureColumn("audit_logs", "response_summary", "TEXT");
@@ -494,15 +496,20 @@ export class GatewayStore {
       message.threadId || "", message.senderId, message.messageId]);
   }
 
-  startAuthorizationRecovery(message: ChannelMessage, sessionId: string): boolean {
-    return Number(this.db.prepare("INSERT OR IGNORE INTO authorization_recoveries VALUES (?, ?, 'waiting', ?)")
-      .run(this.authorizationRequestKey(message), sessionId, new Date().toISOString()).changes) === 1;
+  startAuthorizationRecovery(message: ChannelMessage, sessionId: string, evidence?: RunEvidence): boolean {
+    const key = this.authorizationRequestKey(message);
+    const sealed = evidence ? this.credentials.sealAuthorization(JSON.stringify(evidence), `recovery:${key}:${sessionId}`) : null;
+    return Number(this.db.prepare("INSERT OR IGNORE INTO authorization_recoveries (request_key, session_id, state, updated_at, evidence) VALUES (?, ?, 'waiting', ?, ?)")
+      .run(key, sessionId, new Date().toISOString(), sealed).changes) === 1;
   }
 
-  getAuthorizationRecovery(message: ChannelMessage): { sessionId: string; state: AuthorizationRecoveryState } | undefined {
-    const row = this.db.prepare("SELECT session_id, state FROM authorization_recoveries WHERE request_key = ?")
-      .get(this.authorizationRequestKey(message)) as { session_id: string; state: AuthorizationRecoveryState } | undefined;
-    return row ? { sessionId: row.session_id, state: row.state } : undefined;
+  getAuthorizationRecovery(message: ChannelMessage): { sessionId: string; state: AuthorizationRecoveryState; evidence?: RunEvidence } | undefined {
+    const key = this.authorizationRequestKey(message);
+    const row = this.db.prepare("SELECT session_id, state, evidence FROM authorization_recoveries WHERE request_key = ?")
+      .get(key) as { session_id: string; state: AuthorizationRecoveryState; evidence: string | null } | undefined;
+    return row ? { sessionId: row.session_id, state: row.state, ...(row.evidence ? {
+      evidence: JSON.parse(this.credentials.openAuthorization(row.evidence, `recovery:${key}:${row.session_id}`)) as RunEvidence
+    } : {}) } : undefined;
   }
 
   claimAuthorizationRecovery(message: ChannelMessage): boolean {
