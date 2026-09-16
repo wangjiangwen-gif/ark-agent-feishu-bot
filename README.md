@@ -249,7 +249,7 @@ arkagent employee repair-environment
 - **初始化脚本可观测性不足**：安装失败、网络阻塞和缓存复用难以区分，用户只能从 Agent 后续执行失败反推环境状态。
 - **bash 启动不稳定且错误层次模糊**：多次出现“60 秒内未拿到 execution_id”，无法判断是调度排队、容器启动、命令执行还是网络问题。
 - **Vault 占位符不适合所有凭证交换**：App Secret 以占位符注入后，依赖它在请求体中换取 Bot token 的 CLI 流程不可用；最终只能由 Gateway 在本地换取短期 tenant token 再写入 Vault。
-- **Session 的 Vault 集合创建后不可追加**：运行中的 Session 能读取已挂载 Credential 的新值，但不能追加新的 Vault。本项目因此在数字员工首次单聊创建 Session 前预挂用户 Vault，再在 OAuth 后更新同一 Credential；升级前没有挂载记录的遗留 Session 仅做一次兼容性交接。
+- **已有 Session 的凭证变更需要明确生命周期**：当前插件在数字员工首次单聊创建 Session 前预挂用户 Vault，OAuth 后更新同一 Credential，不自动改变 Vault 集合。新版 [MA 升级接口](https://docs.volcengine.com/docs/82379/2673930?lang=zh) 已列出 `vault_ids`，因此不能再笼统断言平台永远无法变更集合；其原地升级、实际权限生效和失败恢复尚待真实验收。源码开发版遇到无法确认旧 Session 挂载记录时仅提示显式选择，不静默交接。
 - **运行时日期不可靠**：Agent 曾把“明天”解析成数月前日期；平台应提供可信的当前时间、时区上下文或标准时间工具。
 - **事件与工具诊断接口偏底层**：排障需要手工读取大量 Session events，缺少面向开发者的 run trace、当前命令、耗时阶段和结构化失败原因。
 - **长任务缺少稳定的用户反馈契约**：Session 可以运行数分钟，但 Gateway 只能自行轮询和设计超时/处理中消息，平台没有直接面向消息渠道的阶段性状态协议。
@@ -320,6 +320,12 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 ### 源码开发版：声明式配置与只读诊断
 
 以下能力尚未作为新的npm版本发布；本地测试请先 `npm run build`，再用 `node dist/cli.js` 替代 `arkagent`。
+
+源码开发版新增 MA 原地升级的协议层 `ArkClient.upgradeSession(sessionId, request, signal?)` 和 `waitForSessionUpgrade(submission, options?)`，**尚未接入网关命令、自动升级、OAuth 或 WebUI 操作**。升级请求只接受官方列出的 `agent`、`environment`、`initial_events`、`vault_ids`；嵌套对象按调用方提供的原生 JSON 保留，不将创建 Session 的 `agent` 字符串、`environment_id` 或 `resources` 自动转换为升级参数。官方当前升级页未展开 Agent/Environment 的嵌套字段，不能据此承诺创建配置可直接用于升级。
+
+提交只发一次 POST；除结构化 `400/InvalidParameter` 外，网络中断、拒绝、限流、服务端错误或异常响应均保留“结果未知”，不重试写入，也不新建替代 Session。`initial_events` 可能触发业务，不会另行重发。轮询只读 GET，默认最多30秒、间隔750毫秒（可配置等待上限120秒）；仅在本次观测到 `upgrading → idle` 时报告 `settled`，这不是目标配置在沙箱实际生效或后续业务成功的证明。超时保留最后状态，取消只停止本地等待、不撤销服务端升级；回执超过30秒不作为新一轮等待的起始证明。
+
+这两个方法是面向可信服务端调用方的低层能力，不自带数字员工授权判断或持久化：接入前还须完成应用/Agent/Vault身份校验、同会话与普通任务互斥、提交意图落盘、重启后的未知结果核查及配置实际生效验证。返回只保留状态和配置Hash，不返回SP、环境变量值或事件内容。目前普通对话不额外调用升级或状态查询，也不改变 `durableQueue` 默认关闭状态。
 
 源码开发版在行为日志中记录本轮文件读取观测：读取调用数、工具是否返回文档/报错、缺失或未关联的结果、读取后是否还有回复。元数据来自MA事件，不保存文档正文、Base64或原始路径；读取路径只保存Hash。日志中的`succeeded`仍是网关处理/交付状态，**不表示文件理解或业务分析已验收**。重复、乱序、多MA线程或超出观测上限时显示“待核实”，不以片段推断完整结果。
 

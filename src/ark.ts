@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
-import { ArkHttpError, ArkNetworkError, safeErrorCode, safeRequestId } from "./ark-errors.ts";
+import { ArkHttpError, ArkNetworkError, failureDiagnostic, safeErrorCode, safeRequestId } from "./ark-errors.ts";
 export { ArkHttpError } from "./ark-errors.ts";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
 import { RunFileObserver, type RunFileObservation } from "./run-file-observation.ts";
 import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
 import { inspectUploadedFile, validUploadName, type FileUploadQuery, type FileUploadInspection } from "./upload-inspection.ts";
+import {
+  prepareSessionUpgrade, parseSessionUpgradeSnapshot, validUpgradeSessionId, validateUpgradeWait,
+  type SessionUpgradeRequest, type SessionUpgradeSubmission, type SessionUpgradeObservation, type SessionUpgradeWaitOptions
+} from "./session-upgrade.ts";
 
 export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; processed_at?: string };
 
@@ -175,6 +179,64 @@ export class ArkClient {
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
     return { id: String(data.id || agentId), version: data.version === undefined ? undefined : String(data.version) };
+  }
+
+  // 这是原生协议层，不是普通聊天用户的升级入口。调用方须先校验身份并持久化提交意图。
+  // 官方契约：https://docs.volcengine.com/docs/82379/2673930?lang=zh
+  async upgradeSession(sessionId: string, request: SessionUpgradeRequest, signal?: AbortSignal): Promise<SessionUpgradeSubmission> {
+    if (!validUpgradeSessionId(sessionId)) throw new Error("Session ID 无效");
+    const prepared = prepareSessionUpgrade(request);
+    signal?.throwIfAborted();
+    const requestFingerprint = prepared.fingerprint;
+    const combined = AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]);
+    try {
+      // initial_events也可能产生业务副作用，任何结果未知都不得自动重发。
+      const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/upgrades`, {
+        method: "POST", body: prepared.body, signal: combined
+      });
+      const body = await boundedHistoryBody(response, 4 * 1024 * 1024,
+        AbortSignal.any([combined, AbortSignal.timeout(this.options.inspectionTimeoutMs)]));
+      const snapshot = parseSessionUpgradeSnapshot(JSON.parse(body), sessionId);
+      return snapshot ? { status: "accepted", requestFingerprint, snapshot }
+        : { status: "unknown", reason: "invalid_response", requestFingerprint };
+    } catch (error) {
+      const rejected = error instanceof ArkHttpError && error.status === 400 && error.code === "InvalidParameter";
+      return { status: rejected ? "rejected" : "unknown", reason: "request_failed", requestFingerprint, failure: failureDiagnostic(error) };
+    }
+  }
+
+  async waitForSessionUpgrade(submission: SessionUpgradeSubmission, options: SessionUpgradeWaitOptions = {}): Promise<SessionUpgradeObservation> {
+    const receipt = validateUpgradeWait(submission, options);
+    let last = receipt.snapshot;
+    let observedUpgrading = last.status === "upgrading";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 30_000);
+    const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
+    const observation = (status: SessionUpgradeObservation["status"], reason: SessionUpgradeObservation["reason"]): SessionUpgradeObservation => ({
+      status, reason, snapshot: last, requestFingerprint: receipt.requestFingerprint,
+      configurationVerified: false, businessResult: "not_assessed"
+    });
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const response = await this.request(`/sessions/${encodeURIComponent(last.sessionId)}`, { signal });
+        const body = await boundedHistoryBody(response, 4 * 1024 * 1024, signal);
+        let snapshot;
+        try { snapshot = parseSessionUpgradeSnapshot(JSON.parse(body), last.sessionId); }
+        catch { return observation("unknown", "invalid_response"); }
+        if (!snapshot) return observation("unknown", "invalid_response");
+        if (Date.parse(snapshot.updatedAt) < Date.parse(last.updatedAt)) return observation("unknown", "time_regressed");
+        last = snapshot;
+        if (snapshot.status === "idle") return observation(observedUpgrading ? "settled" : "unknown", observedUpgrading ? "upgrading_to_idle" : "transition_not_observed");
+        if (snapshot.status !== "upgrading") return observation("unknown", "status_not_confirmed");
+        observedUpgrading = true;
+        await waitFor(options.pollIntervalMs ?? 750, signal);
+      }
+    } catch {
+      if (options.signal?.aborted) return observation("unknown", "cancelled");
+      if (controller.signal.aborted) return observation(last.status === "upgrading" ? "pending" : "unknown", "timeout");
+      return observation("unknown", "query_failed");
+    } finally { clearTimeout(timer); controller.abort(); }
   }
 
   async getSessionInfo(sessionId: string): Promise<{

@@ -10,6 +10,9 @@ export {
   type SessionStats,
   type UserAuthorizationRequired
 } from "./ark.ts";
+export type {
+  SessionUpgradeRequest, SessionUpgradeSnapshot, SessionUpgradeSubmission, SessionUpgradeObservation, SessionUpgradeWaitOptions
+} from "./session-upgrade.ts";
 export {
   Gateway,
   KeyedQueue,

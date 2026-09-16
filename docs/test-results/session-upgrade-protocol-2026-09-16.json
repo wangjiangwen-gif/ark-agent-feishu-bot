@@ -1,0 +1,53 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "34ecfa5",
+  "scope": "Session原地升级的原生协议层，不是完整U01验收",
+  "contract": {
+    "upgrade": "https://docs.volcengine.com/docs/82379/2673930?lang=zh",
+    "upgradeUpdatedAt": "2026-09-10 22:05:27",
+    "sessionDetails": "https://docs.volcengine.com/docs/82379/2555937?lang=zh",
+    "sessionDetailsUpdatedAt": "2026-09-11 17:58:14",
+    "verified": ["POST /sessions/{sessionId}/upgrades", "agent/environment/initial_events/vault_ids", "查询详情返回裸Session对象", "upgrading到idle的状态切换"],
+    "notVerified": ["Agent/Environment嵌套升级schema", "目标配置实际应用到沙箱", "并发升级和重启核查的服务端契约"]
+  },
+  "testFirst": {
+    "initialFailingTests": 26,
+    "additionalHardeningFailures": 3,
+    "hardeningFixes": ["未知状态不输出原文", "等待前校验回执状态和Hash", "轮询使用回执副本，拒绝调用方后续修改影响结果"]
+  },
+  "finalTests": {
+    "new": 34,
+    "total": 720,
+    "passed": 720,
+    "failed": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "durationMs": 6121.805375,
+    "syntaxCheck": "passed",
+    "build": "passed",
+    "diffCheck": "passed",
+    "log": "/tmp/ark-session-upgrade-tests.log"
+  },
+  "coverage": [
+    "请求原生字段与空对象/数组保留、规范Hash、拒绝创建接口别名",
+    "请求大小/深度/节点上限、非JSON/循环/getter/toJSON拒绝",
+    "非幂等POST不重试，initial_events不另行重发",
+    "400明确拒绝与403/429/500及网络异常的未知结果区分",
+    "错误/异常/跨Session/类型不符/非法时间/未知信封响应",
+    "upgrading到idle、idle单独不足、其他状态不假定升级成功",
+    "轮询超时/取消/查询失败、时间倒退和过期回执",
+    "响应大小/UTF-8/等待上限及响应流取消",
+    "不返回SP、环境变量值、文件资源原文和initial_events内容",
+    "真实本机HTTP三项：分片UTF-8、服务端接收后断开响应、轮询Abort关闭连接"
+  ],
+  "externalServices": "MA服务端为模拟，未访问真实MA/飞书或使用真实凭证",
+  "performance": "未改变普通对话调用路径；未完成真实升级耗时或用户端P95验收",
+  "remaining": [
+    "网关身份校验、任务互斥与升级管理入口",
+    "持久化提交意图、未知结果/重启恢复",
+    "嵌套schema和目标配置/资源实际生效验证",
+    "动态MemoryStore、Memory/TOS真实访问",
+    "其他阶段的部分写入续办、完整队列恢复、PDF复现、真实E2E/性能/回退"
+  ],
+  "deployment": "本轮未部署、未发布、未默认开启durableQueue"
+}
