@@ -110,6 +110,7 @@ async function runEmployee(): Promise<void> {
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     ensureAuthorization: (message, request) => auth.ensure(message, request),
     cancelAuthorization: message => auth.cancel(message),
+    authorizationStatus: message => auth.status(message),
     getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
     beforeDirectTurn: message => auth.ensureCredentialFresh(message),
     beforeCreateSession: ensureBotToken, dualIdentity: true, sharedGroupSessions: true,

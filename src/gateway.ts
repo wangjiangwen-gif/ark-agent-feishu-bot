@@ -103,6 +103,22 @@ export class Gateway {
     if (!shouldHandleMessage(message)) return false;
     // 飞书可能为同一条消息重复投递不同 event_id；message_id 才是业务幂等键。
     if (!this.store.claimEvent(message.channelType, message.installationId, message.messageId)) return false;
+    if (message.text.trim() === "/auth status" && this.options.authorizationStatus) {
+      // 只读控制路径不受业务队列暂停影响，群内也不读取个人凭证。
+      void (async () => {
+        try {
+          const text = message.conversationType === "direct" ? await this.options.authorizationStatus!(message)
+            : "群聊和话题仅使用 Bot 身份，不查询或申请个人用户授权。";
+          await this.replyText(message, text);
+          this.store.completeEvent(message.channelType, message.installationId, message.messageId, "completed");
+        } catch {
+          this.store.completeEvent(message.channelType, message.installationId, message.messageId, "failed");
+          try { await this.replyText(message, "查询授权状态失败，请检查网关本地记录；本次查询未刷新凭证或重放任务。"); }
+          catch { console.warn("发送授权查询状态失败"); }
+        }
+      })();
+      return true;
+    }
     if (message.conversationType === "direct" && message.text.trim() === "/auth cancel" && this.options.cancelAuthorization) {
       // 控制命令不进入业务队列，避免等待授权的任务阻塞自己的取消操作。
       void (async () => {
@@ -1006,6 +1022,7 @@ export type GatewayOptions = {
   platformAccess?: boolean;
   ensureAuthorization?: (message: IncomingMessage, request: UserAuthorizationRequired) => Promise<boolean>;
   cancelAuthorization?: (message: IncomingMessage) => boolean | Promise<boolean>;
+  authorizationStatus?: (message: IncomingMessage) => string | Promise<string>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   perMessageSessions?: boolean;
   sharedGroupSessions?: boolean;

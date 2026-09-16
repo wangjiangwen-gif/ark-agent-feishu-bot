@@ -254,6 +254,60 @@ export class EmployeeAuthorizationManager {
     return true;
   }
 
+  // 只读本地检查点，不刷新Token、不恢复流程；授权完成和业务完成分别展示。
+  status(message: IncomingMessage): string {
+    this.assertOpen();
+    if (message.conversationType !== "direct") return "群聊和话题仅使用 Bot 身份，不查询或申请个人用户授权。";
+    const identity = this.identity(message);
+    const credential = this.store.credentials.get(identity);
+    const flow = this.store.authorizations.get(identity);
+    const messages = flow?.messages.filter(item => item.conversationId === message.conversationId
+      && (item.threadId || "") === (message.threadId || "")) || [];
+    const lines = ["授权状态（本地记录，未实时校验飞书服务端）："];
+    const credentialLabels: Record<CredentialState["status"], string> = {
+      binding: "已预留用户凭证，尚未完成授权",
+      ready: "本地凭证已就绪，不代表全部资源均有权限",
+      refreshing: "刷新请求进行中；结果未确认前不会重复刷新",
+      refresh_uncertain: "刷新结果尚未确认，需检查运行记录，不能自动重复刷新",
+      sync_pending: "用户凭证已保存，等待同步到 MA",
+      reauth_required: "需要重新授权，下一次实际调用按权限错误处理"
+    };
+    lines.push(`凭证：${!credential ? "没有当前应用身份的授权记录；旧版授权是否有效需另行核实"
+      : credential.status === "ready" && credential.expiresAt <= Date.now() ? "凭证有效期已到，业务执行前需刷新或重新授权"
+      : credentialLabels[credential.status]}`);
+    if (!flow || !messages.length) {
+      lines.push("当前会话没有授权流程记录；本次查询不会创建授权或业务任务。");
+      return lines.join("\n");
+    }
+    const phaseLabels: Record<AuthorizationFlow["phase"], string> = {
+      starting: "正在发起授权请求", card_pending: "授权卡片发送结果待确认", waiting: "等待你完成授权",
+      polling: "正在查询授权结果", verifying: "正在校验授权账号和租户", sync_pending: "已授权，等待同步到 MA",
+      ready: "授权已就绪，等待任务恢复处理", completed: "授权流程已结束，不等于业务已完成",
+      cancelled: "已取消本次授权等待", expired: "授权流程已过期", failed: "授权流程未完成",
+      uncertain: "授权请求结果尚未确认，未自动重复交换凭证"
+    };
+    lines.push(`流程：${phaseLabels[flow.phase]}`);
+    if (!isAuthorizationTerminal(flow.phase) && !["sync_pending", "ready"].includes(flow.phase)) {
+      lines.push(flow.expiresAt <= Date.now() ? "等待期限已到，终态尚待处理；查询不会延长有效期。"
+        : `当前阶段剩余等待时间约 ${Math.ceil((flow.expiresAt - Date.now()) / 1000)} 秒。`);
+    }
+    const recoveryLabels = {
+      waiting: "等待授权恢复处理", resuming: "恢复任务已领取，执行结果尚待确认",
+      completed: "恢复执行已结束，请以原任务回复和产物为准", failed: "恢复未完成，请核实执行记录，勿重复提交写入",
+      blocked: "待确认，未自动重放；请核实已完成操作再明确剩余步骤",
+      cancelled: "已取消续跑", expired: "已过期，未续跑"
+    };
+    // 只展示同会话的最近任务和标识，不返回原始请求、工具输入、凭证或授权链接。
+    for (const item of messages.slice(-10)) {
+      const recovery = this.store.getAuthorizationRecovery(item);
+      const safeId = (value: string) => /^[\w-]{1,160}$/.test(value) ? value : "[标识已隐藏]";
+      lines.push(`任务 ${safeId(item.messageId)}：${recovery ? recoveryLabels[recovery.state] : "没有恢复检查点，执行状态未知"}${recovery ? `（Session ${safeId(recovery.sessionId)}）` : ""}`);
+    }
+    if (messages.length > 10) lines.push(`仅展示最近 10 条，共 ${messages.length} 条关联任务。`);
+    if (!isAuthorizationTerminal(flow.phase)) lines.push("可发送 /auth cancel 取消本次等待和续跑；不会撤销飞书授权或已完成操作。");
+    return lines.join("\n");
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
