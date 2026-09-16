@@ -11,6 +11,7 @@ import type { OAuthTokens } from "./oauth.ts";
 import type { RunEvidence } from "./run-evidence.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
 import { MessageInbox, type InboxBinding, type InboxTask } from "./message-inbox.ts";
+import { ReactionStateStore } from "./reaction-state.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -61,6 +62,7 @@ export class GatewayStore {
   readonly credentials: CredentialStateStore;
   readonly authorizations: AuthorizationStateStore;
   readonly inbox: MessageInbox;
+  readonly reactions: ReactionStateStore;
   private db: DatabaseSync;
   private runtimeToken?: string;
   private closed = false;
@@ -163,6 +165,7 @@ export class GatewayStore {
     this.credentials = new CredentialStateStore(this.db, path);
     this.authorizations = new AuthorizationStateStore(this.db, this.credentials);
     this.inbox = new MessageInbox(this.db, this.credentials, () => this.assertRuntimeLock());
+    this.reactions = new ReactionStateStore(this.db, this.credentials, this.inbox, () => this.assertRuntimeLock());
     this.ensureColumn("authorization_recoveries", "evidence", "TEXT");
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");

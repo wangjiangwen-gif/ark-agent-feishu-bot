@@ -79,6 +79,7 @@ export class Gateway {
   private inboxBlockedScopes = new Set<string>();
   private inboxReconciliations = new Map<string, Promise<void>>();
   private inboxRecoveryBatches = new Map<string, Promise<void>>();
+  private reactionCleanups = new Map<string, Promise<void>>();
   private sessionStatsCheckedAt = new Map<string, number>();
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
@@ -181,6 +182,7 @@ export class Gateway {
   recoverPendingMessages(channelType: string, installationId: string): void {
     if (!this.options.durableQueue) return;
     const pending = this.store.recoverMessages(channelType, installationId);
+    void this.recoverPendingReactions(channelType, installationId).catch(() => console.warn("历史表情检查点读取失败，未清理未知目标"));
     for (const task of pending.interrupted) this.blockInboxScope(task.binding.scope);
     for (const task of pending.awaitingAuthorization) {
       if (!this.store.settleAuthorizationMessage(task.message)) this.queue.pause(task.binding.scope);
@@ -229,6 +231,41 @@ export class Gateway {
       console.warn("原运行核查或检查点保存失败，未重发任务或解除暂停");
     }).finally(() => this.inboxReconciliations.delete(task.id));
     this.inboxReconciliations.set(task.id, operation);
+    return operation;
+  }
+
+  async recoverPendingReactions(channelType: string, installationId: string): Promise<void> {
+    if (!this.options.durableQueue || !this.options.removeReaction) return;
+    for (const { receipt, message } of this.store.reactions.pending(channelType, installationId)) {
+      await this.removeTrackedReaction(message, receipt.reactionId!, receipt.id);
+    }
+  }
+
+  private async addTrackedReaction(message: IncomingMessage, emoji: "Get" | "OnIt"): Promise<{ id: string; receiptId?: string }> {
+    const receipt = this.options.durableQueue ? this.store.reactions.begin(message, emoji) : undefined;
+    const id = await this.options.addReaction!(message, emoji);
+    if (receipt) {
+      try { this.store.reactions.activate(receipt.id, id); }
+      catch {
+        // 已得到确切ID但落库失败，尽力撤销本次表情；失败仍保留creating供后续核查。
+        try { await this.options.removeReaction!(message, id); } catch { console.warn("表情确认落库失败且即时清理未完成"); }
+        throw new Error("表情确认未保存");
+      }
+    }
+    return { id, ...(receipt ? { receiptId: receipt.id } : {}) };
+  }
+
+  private async removeTrackedReaction(message: IncomingMessage, id: string, receiptId?: string): Promise<void> {
+    const key = receiptId || JSON.stringify([message.channelType, message.installationId, message.messageId, id]);
+    const previous = this.reactionCleanups.get(key);
+    if (previous) return previous;
+    const operation = Promise.resolve().then(async () => {
+      const checkpoint = receiptId ? this.store.reactions.startRemoval(receiptId) : undefined;
+      await this.options.removeReaction!(message, id);
+      if (checkpoint) this.store.reactions.finishRemoval(checkpoint);
+    }).catch(() => console.warn(receiptId ? "表情清理未确认；保留检查点，不重跑业务任务" : "表情清理未确认，不重跑业务任务"))
+      .finally(() => this.reactionCleanups.delete(key));
+    this.reactionCleanups.set(key, operation);
     return operation;
   }
 
@@ -402,12 +439,11 @@ export class Gateway {
       void Promise.resolve().then(task);
       return;
     }
-    let queuedReaction = Promise.resolve<string | undefined>(undefined);
+    let queuedReaction = Promise.resolve<{ id: string; receiptId?: string } | undefined>(undefined);
     const queued = this.queue.enqueue(this.store.conversationKey(key), async () => {
-      const reactionId = await queuedReaction;
-      if (reactionId && this.options.removeReaction) {
-        try { await this.options.removeReaction(message, reactionId); }
-        catch (error) { console.warn("移除排队中表情失败：", error instanceof Error ? error.message : error); }
+      const reaction = await queuedReaction;
+      if (reaction && this.options.removeReaction) {
+        await this.removeTrackedReaction(message, reaction.id, reaction.receiptId);
       }
       await task();
     }, priority, control);
@@ -415,8 +451,8 @@ export class Gateway {
       queued && message.conversationType === "group" && this.options.sharedGroupSessions
       && this.options.addReaction && this.options.removeReaction
     ) {
-      queuedReaction = this.options.addReaction(message, "OnIt").catch(error => {
-        console.warn("添加排队中表情失败，将直接等待执行：", error instanceof Error ? error.message : error);
+      queuedReaction = this.addTrackedReaction(message, "OnIt").catch(() => {
+        console.warn("添加排队中表情未确认，将直接等待执行");
         return undefined;
       });
     }
@@ -431,17 +467,16 @@ export class Gateway {
   }
 
   private async withReaction(message: IncomingMessage, task: (hasReaction: boolean) => Promise<void>): Promise<void> {
-    let reactionId: string | undefined;
+    let reaction: { id: string; receiptId?: string } | undefined;
     if (this.options.addReaction && this.options.removeReaction) {
-      try { reactionId = await this.options.addReaction(message, "Get"); }
-      catch (error) { console.warn("添加处理中表情失败，将使用文本提示：", error instanceof Error ? error.message : error); }
+      try { reaction = await this.addTrackedReaction(message, "Get"); }
+      catch { console.warn("添加处理中表情未确认，将使用文本提示"); }
     }
     try {
-      await task(Boolean(reactionId));
+      await task(Boolean(reaction));
     } finally {
-      if (reactionId && this.options.removeReaction) {
-        try { await this.options.removeReaction(message, reactionId); }
-        catch (error) { console.warn("移除处理中表情失败：", error instanceof Error ? error.message : error); }
+      if (reaction && this.options.removeReaction) {
+        await this.removeTrackedReaction(message, reaction.id, reaction.receiptId);
       }
     }
   }

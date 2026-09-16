@@ -16,6 +16,41 @@ function normalized(overrides: Partial<NormalizedMessage> = {}): NormalizedMessa
   };
 }
 
+for (const phase of ["create", "delete"] as const) {
+  test(`reaction ${phase} requires native business success instead of trusting SDK void`, async () => {
+    const client = { im: { v1: { messageReaction: {
+      create: async () => ({ code: 230001, msg: "private-error", data: { reaction_id: "misleading-id" } }),
+      delete: async () => ({ code: 230001, msg: "private-error" })
+    } } } };
+    const port = { rawClient: client, addReaction: async () => "unchecked", removeReaction: async () => {} } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+    const inbound = normalizeLarkChannelMessage(normalized(), "cli");
+    await assert.rejects(phase === "create" ? adapter.addReaction(inbound, "Get") : adapter.removeReaction(inbound, "rid"), error => {
+      assert.ok(error instanceof Error); assert.equal(error.message.includes("private-error"), false); return true;
+    });
+  });
+}
+
+test("native reaction success uses exact message and receipt IDs", async () => {
+  const calls: unknown[] = [];
+  const port = { rawClient: { im: { v1: { messageReaction: {
+    create: async p => { calls.push(p); return { code: 0, data: { reaction_id: "rid" } }; },
+    delete: async p => { calls.push(p); return { code: 0 }; }
+  } } } } } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized(), "cli");
+  await adapter.removeReaction(inbound, await adapter.addReaction(inbound, "Get"));
+  assert.deepEqual(calls, [{ path: { message_id: "om-1" }, data: { reaction_type: { emoji_type: "Get" } } }, { path: { message_id: "om-1", reaction_id: "rid" } }]);
+});
+
+for (const response of [{}, { code: 0, data: { reaction_id: "" } }]) {
+  test(`native reaction rejects incomplete creation response ${JSON.stringify(response)}`, async () => {
+    const port = { rawClient: { im: { v1: { messageReaction: { create: async () => response } } } } } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+    await assert.rejects(adapter.addReaction(normalizeLarkChannelMessage(normalized(), "cli"), "Get"));
+  });
+}
+
 test("direct message lookup validates the exact chat and thread before exposing content", async () => {
   const trigger = normalizeLarkChannelMessage(normalized({ createTime: 200 }), "cli");
   const payloads: unknown[] = [];

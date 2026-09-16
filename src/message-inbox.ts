@@ -170,6 +170,11 @@ export class MessageInbox {
     });
   }
 
+  findTask(id: string): InboxTask | undefined {
+    this.runtimeOwner();
+    return this.get(id);
+  }
+
   private get(id: string): InboxTask | undefined {
     const row = this.db.prepare("SELECT * FROM gateway_message_inbox WHERE id = ?").get(id);
     return row ? this.decode(row) : undefined;

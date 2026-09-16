@@ -34,7 +34,9 @@ type LarkMessageListResponse = {
 type LarkMessageList = (payload: unknown) => Promise<LarkMessageListResponse>;
 
 type FeishuCardStreamClient = FeishuResourceClient & {
-  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList; get?: LarkMessageList } };
+  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList; get?: LarkMessageList };
+    v1?: { messageReaction?: { create(payload: unknown): Promise<{ code?: number; data?: { reaction_id?: string } }>;
+      delete(payload: unknown): Promise<{ code?: number }> } } };
   cardkit?: { v1?: {
     cardElement?: { content(payload: unknown): Promise<unknown> };
     card?: { settings(payload: unknown): Promise<unknown> };
@@ -196,11 +198,24 @@ export class LarkChannelAdapter implements ChannelAdapter {
     }
   }
 
-  addReaction(message: ChannelMessage, emojiType: string): Promise<string> {
+  async addReaction(message: ChannelMessage, emojiType: string): Promise<string> {
+    const api = this.channel.rawClient?.im.v1?.messageReaction;
+    if (api?.create) {
+      const response = await api.create({ path: { message_id: message.messageId }, data: { reaction_type: { emoji_type: emojiType } } });
+      assertReactionSuccess(response);
+      const id = response.data?.reaction_id;
+      if (typeof id !== "string" || !id.trim() || id.length > 1024) throw new Error("飞书表情响应缺少有效ID");
+      return id;
+    }
     return this.channel.addReaction(message.messageId, emojiType);
   }
 
-  removeReaction(message: ChannelMessage, reactionId: string): Promise<void> {
+  async removeReaction(message: ChannelMessage, reactionId: string): Promise<void> {
+    const api = this.channel.rawClient?.im.v1?.messageReaction;
+    if (api?.delete) {
+      assertReactionSuccess(await api.delete({ path: { message_id: message.messageId, reaction_id: reactionId } }));
+      return;
+    }
     return this.channel.removeReaction(message.messageId, reactionId);
   }
 
@@ -223,6 +238,11 @@ export class LarkChannelAdapter implements ChannelAdapter {
     if (bytes.byteLength > limit) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(limit)} 限制`);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
+}
+
+function assertReactionSuccess(response: { code?: number } | undefined): void {
+  // Channel SDK的删除封装返回void且不检查业务码，不能直接作为恢复清理的确认。
+  if (response?.code !== 0) throw new Error(`飞书表情操作未确认成功（${typeof response?.code === "number" ? response.code : "invalid_response"}）`);
 }
 
 function assertCardKitSuccess(response: unknown, operation: "content" | "settings"): void {
