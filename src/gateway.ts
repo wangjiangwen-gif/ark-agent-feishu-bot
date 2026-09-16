@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { baselineCompaction, decideCompaction, startCompaction, finishCompaction } from "./session-compaction.ts";
 import { authorizationContinuation, authorizationRecoveryDecision, type RunEvidence } from "./run-evidence.ts";
 import type { InboxBinding, InboxTask } from "./message-inbox.ts";
+import type { AttachmentStage, AttachmentStageDetails } from "./attachment-trace.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -786,7 +787,15 @@ export class Gateway {
           vaultIds,
           initialResources
         );
-        sessionId = await this.ark.createSession(request);
+        const mounts = attachmentKeys.filter(key => this.store.getAttachment(key)?.fileId).map(key => ({
+          key, id: this.store.attachmentTrace.begin(message, key, "mount", this.store.getAttachment(key))
+        }));
+        try { sessionId = await this.ark.createSession(request); }
+        catch (error) {
+          for (const mount of mounts) this.store.attachmentTrace.finish(mount.id, "error");
+          throw error;
+        }
+        for (const mount of mounts) this.store.attachmentTrace.finish(mount.id, "succeeded", { sessionId });
         this.store.saveCompactionCheckpoint(sessionId, baselineCompaction({ eventCount: 0 }));
         const agentVersion = typeof request.agent === "object" && request.agent.version !== undefined ? String(request.agent.version) : undefined;
         if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId, agentVersion, request.vault_ids);
@@ -797,7 +806,12 @@ export class Gateway {
         });
       } else if (initialResources.length) {
         for (const resource of initialResources) {
-          try { await this.addSessionResource(sessionId, resource); }
+          const resourceKey = attachmentKeys.find(key => this.store.getAttachment(key)?.fileId === resource.file_id && this.store.getAttachment(key)?.mountPath === resource.mount_path);
+          try {
+            if (!resourceKey) throw new Error("附件挂载缺少来源记录");
+            await this.traceAttachment(message, resourceKey, "mount", () => this.addSessionResource(sessionId!, resource),
+              { ...this.store.getAttachment(resourceKey), sessionId });
+          }
           catch (error) {
             const failedKey = attachmentKeys.find(key => this.store.getAttachment(key)?.fileId === resource.file_id);
             const file = failedKey ? this.store.getAttachment(failedKey) : undefined;
@@ -1205,7 +1219,8 @@ export class Gateway {
           continue;
         }
         if (!this.store.isAttachmentMounted(sessionId, prepared.key)) {
-          await this.addSessionResource(sessionId, { type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath });
+          await this.traceAttachment(sourceMessage, prepared.key, "mount", () => this.addSessionResource(sessionId, { type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath }),
+            { ...prepared, sessionId });
           this.store.markAttachmentMounted(sessionId, prepared.key);
         }
         updated.set(item.messageId, {
@@ -1238,13 +1253,25 @@ export class Gateway {
   private async prepareAttachment(message: IncomingMessage, resource: IncomingMessage["resources"][number], index: number, budget: { bytes: number; inlineBytes: number }) {
     const name = safeFilename(resource.name, index);
     const key = attachmentKey(message, resource.id);
-    const cached = this.store.getAttachment(key);
+    let cached = this.store.getAttachment(key);
     const mountPath = `/mnt/data/${key.slice(0, 24)}/${name}`;
+    if (!cached && !isInlineTextFile(name)) {
+      const confirmed = this.store.attachmentTrace.confirmedUpload(message, key);
+      if (confirmed) {
+        cached = { name, mountPath, bytes: confirmed.bytes!, fileId: confirmed.fileId!, sha256: confirmed.sha256 };
+        // 上传回执已落盘、缓存尚未保存时退出，使用原File ID补全本地记录。
+        this.store.saveAttachment(key, cached);
+      }
+    }
     if (budget.bytes >= 40 * 1024 * 1024) throw new Error("单轮附件总量达到 40 MB，请分批处理");
     if (isInlineTextFile(name) && budget.inlineBytes >= MAX_INLINE_TEXT_BYTES) throw new Error("单轮纯文本总量达到 256 KB，请分批处理");
     const remainingBytes = Math.min(40 * 1024 * 1024 - budget.bytes, isInlineTextFile(name) ? MAX_INLINE_TEXT_BYTES - budget.inlineBytes : 20 * 1024 * 1024);
-    const downloaded = cached ? undefined : await this.options.downloadAttachment!(resource, message, remainingBytes);
+    const downloaded = cached ? undefined : await this.traceAttachment(message, key, "download", async () => {
+      const result = await this.options.downloadAttachment!(resource, message, remainingBytes);
+      return { ...result, sha256: createHash("sha256").update(result.bytes).digest("hex") };
+    }, {}, result => ({ bytes: result.bytes.byteLength, sha256: result.sha256 }));
     const bytes = cached?.bytes ?? downloaded!.bytes.byteLength;
+    const sha256 = cached?.sha256 ?? downloaded?.sha256;
     budget.bytes += bytes;
     if (budget.bytes > 40 * 1024 * 1024) throw new Error("单轮附件总量超过 40 MB，请分批处理");
     if (isInlineTextFile(name)) {
@@ -1252,19 +1279,42 @@ export class Gateway {
       if (budget.inlineBytes > MAX_INLINE_TEXT_BYTES) throw new Error("单轮纯文本总量超过 256 KB，请分批处理");
       let inlineText = cached?.inlineText;
       if (inlineText === undefined) {
-        try { inlineText = new TextDecoder("utf-8", { fatal: true }).decode(downloaded!.bytes); }
-        catch { throw new Error("不是有效的 UTF-8 编码，请转为 UTF-8 后发送"); }
-        this.store.saveAttachment(key, { name, mountPath, bytes, inlineText });
+        inlineText = await this.traceAttachment(message, key, "inline", async () => {
+          try { return new TextDecoder("utf-8", { fatal: true }).decode(downloaded!.bytes); }
+          catch { throw new Error("不是有效的 UTF-8 编码，请转为 UTF-8 后发送"); }
+        }, { bytes, sha256 });
+        this.store.saveAttachment(key, { name, mountPath, bytes, inlineText, sha256 });
+      } else {
+        await this.traceAttachment(message, key, "cache", async () => undefined, { bytes, sha256 });
       }
-      return { key, name, mountPath, inlineText, bytes };
+      return { key, name, mountPath, inlineText, bytes, sha256 };
     }
-    if (cached?.fileId) return { ...cached, key };
+    if (cached?.fileId) {
+      await this.traceAttachment(message, key, "cache", async () => undefined, cached);
+      return { ...cached, key };
+    }
     if (!this.ark.uploadFile) throw new Error("当前 Gateway 未配置方舟文件上传能力");
-    const file = await this.ark.uploadFile(name, downloaded!.mimeType, downloaded!.bytes);
-    const value = { name, mountPath, bytes, fileId: file.id };
+    const file = await this.traceAttachment(message, key, "upload", () => this.ark.uploadFile!(name, downloaded!.mimeType, downloaded!.bytes),
+      { bytes, sha256 }, result => ({ fileId: result.id }));
+    const value = { name, mountPath, bytes, sha256, fileId: file.id };
     // 先记录上传结果，挂载失败后可以继续使用原 File ID，避免反复产生孤儿文件。
     this.store.saveAttachment(key, value);
     return { ...value, key, inlineText: undefined };
+  }
+
+  private async traceAttachment<T>(message: IncomingMessage, key: string, stage: AttachmentStage, operation: () => Promise<T>,
+    details: AttachmentStageDetails = {}, describe: (value: T) => AttachmentStageDetails = () => ({})): Promise<T> {
+    const id = this.store.attachmentTrace.begin(message, key, stage, details);
+    let value: T;
+    try { value = await operation(); }
+    catch (error) {
+      // 不保存上游原始错误，可能包含请求正文、下载URL或凭证。
+      this.store.attachmentTrace.finish(id, "error");
+      throw error;
+    }
+    // 与远端调用分开：本地落盘失败不能伪装成远端明确失败。
+    this.store.attachmentTrace.finish(id, "succeeded", describe(value));
+    return value;
   }
 
   private defaultSessionEnvironment(message: IncomingMessage): Record<string, string> {
@@ -1408,7 +1458,13 @@ function historyFingerprint(message: ChannelHistoryMessage): string {
 function attachmentError(error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
   if (/file type not supported/i.test(reason)) return "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown";
-  return reason.slice(0, 180);
+  if (reason === "不是有效的 UTF-8 编码，请转为 UTF-8 后发送") return reason;
+  if (/^单轮附件总量(?:达到|超过) 40 MB，请分批处理$/.test(reason)) return reason;
+  if (/^单轮纯文本总量(?:达到|超过) 256 KB，请分批处理$/.test(reason)) return reason;
+  if (/^文件 .* 超过(?:本轮剩余 )?.* 限制$/.test(reason)) return "文件大小超过本轮剩余额度，请缩小文件或分批处理";
+  if (reason === "当前 Gateway 未配置附件下载能力" || reason === "当前 Gateway 未配置方舟文件上传能力") return reason;
+  // SDK错误可能回显签名URL、请求头或正文，不能送进模型输入、飞书回复或普通日志。
+  return "附件处理失败，请管理员按该消息的附件阶段记录核查；本次不确认文件已可用";
 }
 
 function appendAttachmentNotices(reply: string, notices: string[]): string {

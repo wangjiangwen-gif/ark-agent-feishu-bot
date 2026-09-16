@@ -1,0 +1,50 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "b86e581",
+  "scope": "附件准备阶段记录、已确认上传的缓存恢复窗口、附件错误脱敏",
+  "newTests": 12,
+  "fullRegression": {
+    "command": "npm test",
+    "tests": 553,
+    "passed": 553,
+    "failed": 0,
+    "skipped": 0,
+    "durationMs": 3833.80575,
+    "sandboxNote": "初次普通沙箱完整回归3项本机HTTP监听EPERM；允许127.0.0.1监听后完整通过，没有跳过测试"
+  },
+  "checks": { "syntax": "passed", "build": "passed", "diffWhitespace": "passed", "fullTypecheck": "not_run" },
+  "evidence": [
+    "新Session两份初始附件：下载、上传、挂载回执先于MA run完成",
+    "多文件历史消息：失败附件与成功附件分别记录，不声称失败文件已挂载",
+    "SQLite重开后原上传缓存和Hash保留，不重复下载或上传",
+    "真实Gateway子进程在模拟uploadFile中exit(79)：上传阶段pending保留，不伪造成功",
+    "真实Gateway子进程在上传确认后saveAttachment前exit(79)：后续提及复用confirmed-file，下载和上传调用均为0",
+    "纯文本记录inline阶段，不记录虚假的文件系统mount",
+    "上游模拟敏感错误不进入阶段记录或模型输入",
+    "应用、租户、群、话题、源消息隔离及203条记录分页"
+  ],
+  "benchmark": {
+    "script": "scripts/benchmark-attachment-stages.mjs",
+    "externalServices": "mock",
+    "database": "real SQLite file, WAL",
+    "perScenarioSamples": 30,
+    "perScenarioWarmups": 5,
+    "baseline": {
+      "plainText": { "p50Ms": 1.601333, "p95Ms": 2.537125 },
+      "two4_5MiBBuffers": { "p50Ms": 1.866666, "p95Ms": 3.451208 }
+    },
+    "current": {
+      "plainText": { "p50Ms": 1.15575, "p95Ms": 2.033375 },
+      "two4_5MiBBuffers": { "p50Ms": 6.872542, "p95Ms": 8.53575 }
+    },
+    "callsPerCompleteBenchmarkBothVersions": { "download": 70, "upload": 70, "create": 70, "run": 70 },
+    "review": "附件准备P95增加5.084542ms且相对超过10%；包括新增SHA-256和持久化证据成本，不作为性能最终验收通过。没有新增外部调用；普通文本观察未退化。数据不是有效PDF，仅测准备开销。"
+  },
+  "limitations": [
+    "MA和飞书传输均为模拟，不是真实外部端到端",
+    "客户PDF理解提前结束尚未关闭",
+    "未知上传和挂载结果的核查及完整准备阶段恢复尚未完成",
+    "尚未关联工具读取、业务结果、request ID或结构化错误码",
+    "未发布GitHub/npm，未部署开发机或生产"
+  ]
+}
