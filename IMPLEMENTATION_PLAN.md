@@ -52,6 +52,9 @@
 验证：新增15项测试（OAuth底层4项、授权生命周期及Gateway集成11项），全量259/259通过；check（语法）、build、diff检查通过。首次普通沙箱运行仅WebUI本地监听EPERM，允许本机监听后全部通过，没有跳过测试。模拟链路串起真实FeishuOAuth客户端、Gateway、Manager、SQLite：发卡→取消→迟到Token，不更新凭证、不新建Session、不重放任务，Get正常清理。证据见`docs/test-results/authorization-lifecycle-2026-09-16.json`。
 尚未闭环：这里只持久化取消/过期终态，不是完整活跃Device Flow重启恢复；单聊授权等待时的队列暂停、恢复后的部分写入防重、真实飞书/MA端到端均待继续。原始请求安全续跑不能以本次取消测试代替。
 
+授权第四增量（2026-09-16，本地基线a7a095f）：活跃流程加密持久化，按starting/card_pending/waiting/polling/verifying/sync_pending/ready恢复；明确pending才续轮询，未知交换或卡片结果停止自动重试。已拿到的Token在身份校验前加密保存，校验后凭证与同步阶段原子落盘；取消与全部关联任务终态也是事务。已领取的业务请求重启后不重复派发。过期待同步Token使用轮换后Refresh Token，短期身份校验不因重启延期，关闭后迟到刷新不访问已关闭数据库。启动连接期间消息先缓存，恢复失败关闭Channel，成功后按序放行。
+验证：全量281/281通过（新增22项，包含真实子进程退出恢复、事务故障注入、启动顺序、加密与身份隔离）；check（语法）、build、diff检查。普通沙箱仅WebUI回环监听EPERM，允许本机监听后完整通过。未操作生产凭证，不声明真实飞书OAuth端到端完成。证据见`docs/test-results/authorization-restart-2026-09-16.json`。仍需队列暂停、部分写入安全续跑、平台文件/upgrade及真实端到端。
+
 ## Stage 4: 文件终态与平台扩展
 **Goal**: 附件阶段追踪、运行与交付状态区分、早停准确反馈；验证upgrade与动态MemoryStore契约后接入。
 **Success Criteria**: F01-F05、U01；未证实接口不伪实现；客户PDF问题未复现不关单。

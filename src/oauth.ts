@@ -27,6 +27,11 @@ export type DeviceAuthorization = {
   expiresAt: number;
   intervalMs: number;
 };
+export type DevicePollingCheckpoint = {
+  nextPollAt?: number;
+  onAttempt?: () => void;
+  onPending?: (nextPollAt: number, intervalMs: number) => void;
+};
 
 type Fetch = typeof fetch;
 
@@ -60,7 +65,7 @@ export class FeishuOAuth {
     };
   }
 
-  async poll(device: DeviceAuthorization, signal?: AbortSignal): Promise<OAuthTokens> {
+  async poll(device: DeviceAuthorization, signal?: AbortSignal, checkpoint: DevicePollingCheckpoint = {}): Promise<OAuthTokens> {
     if (signal?.aborted) throw cancellationError(signal);
     if (!Number.isFinite(device.expiresAt) || !Number.isFinite(device.intervalMs) || device.intervalMs <= 0) throw new OAuthError("invalid_response");
     if (Date.now() >= device.expiresAt) throw new OAuthError("expired", { outcome: "rejected" });
@@ -70,7 +75,12 @@ export class FeishuOAuth {
     const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
     let interval = device.intervalMs;
     try {
+      if (checkpoint.nextPollAt && checkpoint.nextPollAt > Date.now()) {
+        await delay(Math.min(checkpoint.nextPollAt, device.expiresAt) - Date.now(), combined);
+      }
       while (Date.now() < device.expiresAt) {
+        if (combined.aborted) throw cancellationError(combined);
+        checkpoint.onAttempt?.();
         try {
           const payload = await this.request("https://open.feishu.cn/open-apis/authen/v2/oauth/token", {
             method: "POST", headers: { "Content-Type": "application/json" }, signal: combined,
@@ -83,6 +93,7 @@ export class FeishuOAuth {
         } catch (error) {
           if (!(error instanceof OAuthError) || error.kind !== "pending") throw error;
           if (error.oauthType === "slow_down") interval += 5_000;
+          checkpoint.onPending?.(Date.now() + interval, interval);
           await delay(Math.min(interval, Math.max(0, device.expiresAt - Date.now())), combined);
         }
       }

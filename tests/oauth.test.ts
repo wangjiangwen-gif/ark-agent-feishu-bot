@@ -141,3 +141,27 @@ test("device expiry aborts a hung token response rather than waiting for request
       error => error instanceof OAuthError && error.kind === "expired" && error.outcome === "unknown");
   } finally { clearInterval(keepAlive); }
 });
+
+test("device polling checkpoints mark attempts before HTTP and preserve slow_down across restart", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000 });
+  const events: string[] = [];
+  const controller = new AbortController();
+  let nextPollAt = 0, intervalMs = 1000;
+  const oauth = new FeishuOAuth("cli", "secret", async () => {
+    events.push("http"); return new Response(JSON.stringify({ error: "slow_down" }), { status: 400 });
+  });
+  const device = { deviceCode: "test", verificationUrl: "https://example.test", expiresAt: 30_000, intervalMs };
+  const polling = oauth.poll(device, controller.signal, {
+    onAttempt: () => { events.push("attempt"); },
+    onPending: (next, interval) => { nextPollAt = next; intervalMs = interval; events.push("waiting"); }
+  });
+  const stopped = assert.rejects(polling, error => error instanceof OAuthError && error.kind === "cancelled");
+  await flush(); controller.abort(); await stopped;
+  assert.deepEqual(events, ["attempt", "http", "waiting"]);
+  assert.equal(nextPollAt, 7000); assert.equal(intervalMs, 6000);
+  const restarted = new FeishuOAuth("cli", "secret", async () => {
+    events.push("restart-http"); return new Response(JSON.stringify({ access_token: "a", refresh_token: "r", expires_in: 7200 }));
+  }).poll({ ...device, intervalMs }, undefined, { nextPollAt });
+  t.mock.timers.tick(5999); await flush(); assert.equal(events.includes("restart-http"), false);
+  t.mock.timers.tick(1); await restarted; assert.equal(events.at(-1), "restart-http");
+});

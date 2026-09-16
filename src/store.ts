@@ -6,6 +6,8 @@ import { hostname } from "node:os";
 import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
 import type { CompactionCheckpoint } from "./session-compaction.ts";
 import { CredentialStateStore, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
+import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
+import type { OAuthTokens } from "./oauth.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -54,6 +56,7 @@ export type AuthorizationRecoveryState = "waiting" | "resuming" | "completed" | 
 
 export class GatewayStore {
   readonly credentials: CredentialStateStore;
+  readonly authorizations: AuthorizationStateStore;
   private db: DatabaseSync;
   private runtimeToken?: string;
   private closed = false;
@@ -154,6 +157,7 @@ export class GatewayStore {
       );
     `);
     this.credentials = new CredentialStateStore(this.db, path);
+    this.authorizations = new AuthorizationStateStore(this.db, this.credentials);
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
     this.ensureColumn("audit_logs", "response_summary", "TEXT");
@@ -511,6 +515,30 @@ export class GatewayStore {
       .run(state, new Date().toISOString(), this.authorizationRequestKey(message));
   }
 
+  finishAuthorizationFlow(flow: AuthorizationFlow, phase: "cancelled" | "expired" | "failed" | "uncertain"): AuthorizationFlow {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.authorizations.save(flow.identity, flow, { phase });
+      for (const message of flow.messages) this.finishAuthorizationRecovery(message, phase === "uncertain" ? "blocked" : phase);
+      this.db.exec("COMMIT");
+      return updated;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  stageAuthorizationCredential(flow: AuthorizationFlow, tokens: OAuthTokens, defaultScopes: string[]): AuthorizationFlow {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.credentials.get(flow.identity);
+      if (!current || flow.phase !== "verifying") throw new Error("授权凭证绑定或身份校验阶段不正确");
+      this.credentials.save(flow.identity, { ...current, status: "sync_pending", retryAfter: undefined,
+        refreshToken: tokens.refreshToken, pendingAccessToken: tokens.accessToken, expiresAt: tokens.expiresAt,
+        scopes: tokens.scopes ?? defaultScopes }, current.revision);
+      const updated = this.authorizations.save(flow.identity, flow, { phase: "sync_pending", tokens: undefined });
+      this.db.exec("COMMIT");
+      return updated;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
   saveEmployeeOAuth(value: Omit<EmployeeOAuth, "updatedAt">): EmployeeOAuth {
     const updatedAt = new Date().toISOString();
     this.db.prepare(`INSERT INTO employee_oauth (tenant_key, open_id, vault_id, credential_id, refresh_token, expires_at, scopes, updated_at)
@@ -582,6 +610,11 @@ export class GatewayStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  assertRuntimeLock(): void {
+    const owner = this.db.prepare("SELECT token FROM gateway_runtime_lock WHERE id = 1").get() as { token: string } | undefined;
+    if (!this.runtimeToken || owner?.token !== this.runtimeToken) throw new Error("恢复授权前必须持有Gateway数据库运行锁");
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {

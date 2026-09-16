@@ -5,11 +5,12 @@ import { OAuthError, type OAuthTokens } from "./oauth.ts";
 import type { GatewayStore } from "./store.ts";
 import { credentialIdentityKey, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
 import { createHash } from "node:crypto";
+import { isAuthorizationTerminal, type AuthorizationFlow } from "./authorization-state.ts";
 
 export const EMPLOYEE_CALENDAR_USER_SCOPES = ["offline_access", "auth:user.id:read", "calendar:calendar:read", "calendar:calendar.event:read", "calendar:calendar.free_busy:read"];
 
 type EmployeeAuthArk = Pick<ArkClient, "listVaults" | "createVault" | "listCredentials" | "createEnvironmentVariableCredential" | "updateEnvironmentCredential">;
-type PendingAuthorization = { messages: IncomingMessage[]; controller: AbortController; timer?: ReturnType<typeof setTimeout>; task?: Promise<void> };
+type PendingAuthorization = { flow: AuthorizationFlow; controller: AbortController; restored?: boolean; timer?: ReturnType<typeof setTimeout>; task?: Promise<void> };
 type AuthorizationLifecycleOptions = { notify?: (message: IncomingMessage, text: string) => Promise<void> };
 
 export class EmployeeAuthorizationManager {
@@ -66,6 +67,7 @@ export class EmployeeAuthorizationManager {
     let tokens: OAuthTokens;
     try { tokens = await this.oauth.refresh(state.refreshToken!); }
     catch (error) {
+      this.assertOpen();
       if (error instanceof OAuthError && error.kind === "reauth_required") {
         state = this.store.credentials.save(identity, { ...state, status: "sync_pending", refreshToken: undefined,
           pendingAccessToken: "ARKAGENT_USER_AUTH_PENDING", expiresAt: 0 }, state.revision);
@@ -77,6 +79,7 @@ export class EmployeeAuthorizationManager {
       if (error instanceof OAuthError) throw error;
       throw new Error("用户凭证刷新未完成，结果尚未确认；已有授权记录未清除");
     }
+    this.assertOpen();
     // 飞书轮换成功后先落盘，再更新MA。MA失败或重启都只重试同一Credential同步。
     state = this.store.credentials.save(identity, { ...state, status: "sync_pending", refreshToken: tokens.refreshToken,
       pendingAccessToken: tokens.accessToken, expiresAt: tokens.expiresAt, scopes: tokens.scopes ?? state.scopes }, state.revision);
@@ -99,10 +102,12 @@ export class EmployeeAuthorizationManager {
     const key = credentialIdentityKey(this.identity(message));
     const existing = this.pending.get(key);
     if (existing) {
-      if (!existing.messages.some(item => item.messageId === message.messageId)) existing.messages.push(message);
+      if (!existing.flow.messages.some(item => item.messageId === message.messageId)) {
+        this.checkpoint(key, existing, { messages: [...existing.flow.messages, message] });
+      }
       return false;
     }
-    const pending: PendingAuthorization = { messages: [message], controller: new AbortController() };
+    const pending: PendingAuthorization = { flow: this.store.authorizations.create(this.identity(message), [message]), controller: new AbortController() };
     this.pending.set(key, pending);
     this.setDeadline(key, pending, Date.now() + 30_000);
     try {
@@ -110,10 +115,12 @@ export class EmployeeAuthorizationManager {
       this.assertActive(key, pending);
       if (!Number.isFinite(device.expiresAt)) throw new OAuthError("invalid_response");
       if (device.expiresAt <= Date.now()) throw new OAuthError("expired", { outcome: "rejected" });
+      this.checkpoint(key, pending, { phase: "card_pending", device, expiresAt: device.expiresAt });
       this.setDeadline(key, pending, device.expiresAt);
       await this.sendCard(message, device.verificationUrl);
       this.assertActive(key, pending);
-      pending.task = this.complete(key, pending, device).finally(() => this.removePending(key, pending));
+      this.checkpoint(key, pending, { phase: "waiting" });
+      this.launch(key, pending);
     } catch (error) {
       if (!this.isActive(key, pending)) return false;
       this.stop(key, pending, error instanceof OAuthError && error.kind === "expired" ? "expired" : "failed");
@@ -122,36 +129,105 @@ export class EmployeeAuthorizationManager {
     return false;
   }
 
-  private async complete(
-    key: string,
-    pending: PendingAuthorization,
-    device: Awaited<ReturnType<FeishuOAuth["begin"]>>
-  ): Promise<void> {
-    const message = pending.messages[0];
+  // 启动时只恢复本应用的流程。全局数据库锁防止两个Gateway同时重启同一轮询。
+  restore(): number {
+    this.assertOpen();
+    this.store.assertRuntimeLock();
+    if (!this.oauth.applicationId) throw new Error("恢复授权必须指定飞书应用身份");
+    let count = 0;
+    for (const flow of this.store.authorizations.listActive(this.oauth.applicationId)) {
+      const key = credentialIdentityKey(flow.identity);
+      if (this.pending.has(key)) continue;
+      const pending: PendingAuthorization = { flow, controller: new AbortController(), restored: true };
+      this.pending.set(key, pending); count++;
+      if (["starting", "card_pending", "polling"].includes(flow.phase)) {
+        this.stop(key, pending, "uncertain");
+        void this.notify(flow.messages[0], "网关重启时授权请求或卡片发送结果尚未确认，未重复交换Token或重放任务。请检查授权状态后重新发起所需操作。");
+      } else if (flow.expiresAt <= Date.now() && flow.phase !== "sync_pending" && flow.phase !== "ready") {
+        this.stop(key, pending, "expired");
+        void this.notify(flow.messages[0], "上次授权流程已过期，未自动续跑任务。请重新发起所需操作。");
+      } else {
+        // 仅已校验身份的凭证恢复可使用刷新窗口；不能延长用户授权或身份校验期限。
+        const refreshable = flow.phase === "sync_pending" || flow.phase === "ready";
+        this.setDeadline(key, pending, refreshable ? Math.max(flow.expiresAt, Date.now() + 30_000) : flow.expiresAt);
+        this.launch(key, pending);
+      }
+    }
+    return count;
+  }
+
+  private launch(key: string, pending: PendingAuthorization): void {
+    pending.task = this.complete(key, pending).catch(() => {
+      // 存储损坏等非业务异常不暴露敏感payload，也不留下未处理Promise。
+      console.error("授权恢复状态处理失败，请检查数据库；未自动重放业务任务");
+    }).finally(() => this.removePending(key, pending));
+  }
+
+  private async complete(key: string, pending: PendingAuthorization): Promise<void> {
+    const message = pending.flow.messages[0], identity = pending.flow.identity;
     try {
-      const tokens = await this.oauth.poll(device, pending.controller.signal);
-      this.assertActive(key, pending);
-      const user = await this.oauth.getUserIdentity(tokens.accessToken, pending.controller.signal);
-      this.assertActive(key, pending);
-      if (user.openId !== message.senderId || user.tenantKey !== message.tenantId) throw new Error("授权账号或租户与消息发送者不一致，请使用发送消息的飞书账号授权");
-      const identity = this.identity(message);
-      const credential = await this.ensureUserCredentialBinding(message);
-      this.assertActive(key, pending);
-      await this.exclusive(identity, async () => {
+      if (pending.flow.phase === "waiting") {
+        const device = pending.flow.device;
+        if (!device) throw new Error("授权设备信息缺失");
+        const tokens = await this.oauth.poll(device, pending.controller.signal, {
+          nextPollAt: pending.flow.nextPollAt,
+          onAttempt: () => this.checkpoint(key, pending, { phase: "polling" }),
+          onPending: (nextPollAt, intervalMs) => this.checkpoint(key, pending,
+            { phase: "waiting", nextPollAt, device: { ...device, intervalMs } })
+        });
+        // Token交换成功先加密落盘；校验用户信息的GET可在重启后安全重做。
+        this.checkpoint(key, pending, { phase: "verifying", tokens, device: undefined, nextPollAt: undefined, expiresAt: tokens.expiresAt });
+        this.setDeadline(key, pending, tokens.expiresAt);
+      }
+      if (pending.flow.phase === "verifying") {
+        const tokens = pending.flow.tokens;
+        if (!tokens || tokens.expiresAt <= Date.now()) throw new OAuthError("expired");
+        const user = await this.oauth.getUserIdentity(tokens.accessToken, pending.controller.signal);
         this.assertActive(key, pending);
-        const current = this.store.credentials.get(identity)!;
-        const state = this.store.credentials.save(identity, { ...current, status: "sync_pending", retryAfter: undefined,
-          refreshToken: tokens.refreshToken, pendingAccessToken: tokens.accessToken, expiresAt: tokens.expiresAt,
-          scopes: tokens.scopes ?? EMPLOYEE_CALENDAR_USER_SCOPES }, current.revision);
-        await this.syncCredential(identity, state);
-      });
+        if (user.openId !== message.senderId || user.tenantKey !== message.tenantId) throw new Error("授权账号或租户与消息发送者不一致");
+        await this.ensureUserCredentialBinding(message);
+        this.assertActive(key, pending);
+        await this.exclusive(identity, async () => {
+          this.assertActive(key, pending);
+          pending.flow = this.store.stageAuthorizationCredential(pending.flow, tokens, EMPLOYEE_CALENDAR_USER_SCOPES);
+        });
+      }
+      if (pending.flow.phase === "sync_pending" || pending.flow.phase === "ready") {
+        await this.exclusive(identity, async () => {
+          this.assertActive(key, pending);
+          const current = this.store.credentials.get(identity);
+          if (!current) throw new Error("授权凭证绑定缺失");
+          await this.refreshCredential(identity);
+          this.assertActive(key, pending);
+          const updated = this.store.credentials.get(identity)!;
+          if (updated.status !== "ready" || updated.expiresAt <= Date.now()) throw new Error("授权凭证状态尚未确认");
+          this.checkpoint(key, pending, { phase: "ready", expiresAt: updated.expiresAt });
+        });
+      }
       this.assertActive(key, pending);
-      for (const queued of pending.messages) {
+      const credential = this.store.credentials.get(identity);
+      if (pending.flow.phase !== "ready" || credential?.status !== "ready") throw new Error("授权未就绪");
+      for (const queued of pending.flow.messages) {
+        const recovery = this.store.getAuthorizationRecovery(queued);
+        if (recovery?.state === "resuming" || (pending.restored && !recovery)) {
+          this.store.finishAuthorizationRecovery(queued, "blocked");
+          void this.notify(queued, "用户授权已恢复，但上次业务投递结果尚未确认，未再次提交任务。请检查原Session执行记录后确认下一步。");
+          continue;
+        }
+        if (recovery && recovery.state !== "waiting") continue;
         this.resume(queued, credential.vaultId);
       }
+      this.checkpoint(key, pending, { phase: "completed" });
     } catch (error) {
       if (!this.isActive(key, pending)) return;
-      this.stop(key, pending, error instanceof OAuthError && error.kind === "expired" ? "expired" : "failed");
+      const credentialStatus = this.store.credentials.get(identity)?.status;
+      if (pending.flow.phase === "sync_pending" && (credentialStatus === "sync_pending" || credentialStatus === "ready")) {
+        await this.notify(message, "用户凭证已加密保存，但同步到MA未完成。重启恢复时只重试同一凭证同步，不重新交换Token或重放已执行操作。");
+        return;
+      }
+      const uncertain = credentialStatus === "refresh_uncertain" || credentialStatus === "refreshing"
+        || (pending.flow.phase === "polling" && (!(error instanceof OAuthError) || error.outcome === "unknown"));
+      this.stop(key, pending, error instanceof OAuthError && error.kind === "expired" ? "expired" : uncertain ? "uncertain" : "failed");
       const reason = error instanceof OAuthError && error.kind === "denied" ? "用户拒绝了授权"
         : error instanceof OAuthError && error.kind === "expired" ? "授权已过期"
         : "身份校验、网络请求或凭证同步未完成";
@@ -162,8 +238,13 @@ export class EmployeeAuthorizationManager {
   cancel(message: IncomingMessage): boolean {
     if (message.conversationType !== "direct" || this.closed) return false;
     const key = credentialIdentityKey(this.identity(message));
-    const pending = this.pending.get(key);
-    if (!pending) return false;
+    let pending = this.pending.get(key);
+    if (!pending) {
+      const flow = this.store.authorizations.get(this.identity(message));
+      if (!flow || isAuthorizationTerminal(flow.phase)) return false;
+      pending = { flow, controller: new AbortController() };
+      this.pending.set(key, pending);
+    }
     this.stop(key, pending, "cancelled");
     return true;
   }
@@ -171,11 +252,17 @@ export class EmployeeAuthorizationManager {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    for (const [key, pending] of this.pending) this.stop(key, pending, "blocked");
+    // 关闭不是取消：保留可恢复阶段；正在交换Token的polling由下一次启动标记未确认。
+    for (const [key, pending] of this.pending) {
+      this.removePending(key, pending);
+      pending.controller.abort(new OAuthError("cancelled"));
+    }
   }
 
   private isActive(key: string, pending: PendingAuthorization): boolean {
-    return !this.closed && this.pending.get(key) === pending && !pending.controller.signal.aborted;
+    if (this.closed || this.pending.get(key) !== pending || pending.controller.signal.aborted) return false;
+    const current = this.store.authorizations.get(pending.flow.identity);
+    return current?.id === pending.flow.id && current.revision === pending.flow.revision && !isAuthorizationTerminal(current.phase);
   }
 
   private assertActive(key: string, pending: PendingAuthorization): void {
@@ -187,10 +274,16 @@ export class EmployeeAuthorizationManager {
     if (this.pending.get(key) === pending) this.pending.delete(key);
   }
 
-  private stop(key: string, pending: PendingAuthorization, state: "cancelled" | "expired" | "failed" | "blocked"): void {
+  private checkpoint(key: string, pending: PendingAuthorization, patch: Parameters<GatewayStore["authorizations"]["save"]>[2]): void {
+    this.assertActive(key, pending);
+    pending.flow = this.store.authorizations.save(pending.flow.identity, pending.flow, patch);
+  }
+
+  private stop(key: string, pending: PendingAuthorization, state: "cancelled" | "expired" | "failed" | "uncertain"): void {
+    this.assertActive(key, pending);
+    pending.flow = this.store.finishAuthorizationFlow(pending.flow, state);
     this.removePending(key, pending);
     pending.controller.abort(new OAuthError(state === "expired" ? "expired" : "cancelled"));
-    for (const message of pending.messages) this.store.finishAuthorizationRecovery(message, state);
   }
 
   private setDeadline(key: string, pending: PendingAuthorization, expiresAt: number): void {
@@ -198,7 +291,7 @@ export class EmployeeAuthorizationManager {
     pending.timer = setTimeout(() => {
       if (!this.isActive(key, pending)) return;
       this.stop(key, pending, "expired");
-      void this.notify(pending.messages[0], "授权等待超时，本次任务未自动续跑。请重新发起所需操作；旧卡片不能恢复已过期的任务。");
+      void this.notify(pending.flow.messages[0], "授权等待超时，本次任务未自动续跑。请重新发起所需操作；旧卡片不能恢复已过期的任务。");
     }, Math.max(0, Math.min(expiresAt - Date.now(), 2_147_483_647)));
     pending.timer.unref?.();
   }

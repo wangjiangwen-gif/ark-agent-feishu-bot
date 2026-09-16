@@ -106,6 +106,25 @@ test("refresh-in-flight state after crash is uncertain and does not reuse old Re
   store.close();
 });
 
+test("late refresh response after shutdown does not access the closed database or update MA", async () => {
+  for (const succeeds of [true, false]) {
+    const store = new GatewayStore(":memory:");
+    store.credentials.save(identity, initial, 0);
+    let resolveRefresh!: (value: typeof fresh) => void;
+    let rejectRefresh!: (reason: Error) => void;
+    let updates = 0;
+    const auth = manager(store, () => new Promise((resolve, reject) => { resolveRefresh = resolve; rejectRefresh = reject; }), async () => { updates++; });
+    const pending = auth.ensureCredentialFresh(message);
+    const rejected = assert.rejects(pending, error => error instanceof OAuthError && error.kind === "cancelled");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(store.credentials.get(identity)?.status, "refreshing");
+    auth.close(); store.close();
+    if (succeeds) resolveRefresh(fresh); else rejectRefresh(new OAuthError("network"));
+    await rejected;
+    assert.equal(updates, 0);
+  }
+});
+
 test("application mismatch rejects before any credential access or OAuth request", async () => {
   const store = new GatewayStore(":memory:");
   let calls = 0;

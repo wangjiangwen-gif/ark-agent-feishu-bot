@@ -1,0 +1,36 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "a7a095f",
+  "location": "local macOS workspace",
+  "packageVersion": "0.2.9",
+  "published": false,
+  "suite": { "command": "npm test", "tests": 281, "passed": 281, "failed": 0, "skipped": 0, "durationMs": 2356.019333 },
+  "checks": ["npm run check (syntax only)", "npm run build", "git diff --check"],
+  "newCoverage": [
+    "Encrypted messages, device codes and unverified tokens survive reopening without plaintext database secrets",
+    "Flow identity/CAS, authenticated metadata and missing-key rejection",
+    "Credential staging and cancellation transactions roll back on injected SQLite failure",
+    "Confirmed pending polling resumes without another card and preserves nextPollAt",
+    "In-flight token exchange or card delivery is marked uncertain, never blindly retried",
+    "Persisted tokens are checked against user and tenant before MA write",
+    "Same Credential synchronization resumes after failure without reusing old Refresh Token",
+    "Already claimed business recovery is never dispatched again",
+    "Runtime lock and application-scoped recovery",
+    "Real child process exit followed by durable flow recovery",
+    "Expired pending access token uses the persisted rotated refresh token",
+    "Short identity-verification deadline is not extended by restart",
+    "Late refresh success and failure after shutdown do not access closed database",
+    "Startup buffers arrivals until recovery; failure or overflow closes the channel"
+  ],
+  "redGreen": [
+    "Restored short-expiry test initially remained verifying instead of expired; fixed deadline policy",
+    "Shutdown refresh test initially raised database is not open; fixed post-await lifecycle guards"
+  ],
+  "environmentRestriction": "Initial normal-sandbox suite passed 280/281; WebUI loopback listen was EPERM. Full rerun with loopback permission passed without disabling tests.",
+  "limitations": [
+    "OAuth and MA HTTP endpoints are mocked; child process termination is real",
+    "No production deployment or credentials modified",
+    "Scope queue pause and partial-write-safe continuation remain pending",
+    "Real Feishu/MA end-to-end, file persistence, Memory/TOS and upgrade acceptance remain pending"
+  ]
+}

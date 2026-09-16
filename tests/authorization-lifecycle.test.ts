@@ -103,12 +103,13 @@ test("old cancelled completion cannot delete a replacement flow", async t => {
   assert.deepEqual(f.resumed, []); assert.deepEqual(f.writes, []);
 });
 
-test("close aborts outstanding work before database shutdown", async t => {
+test("close aborts outstanding work but preserves the durable recovery phase", async t => {
   const f = fixture(t);
   await f.auth.ensure(message(), request); f.auth.close();
   f.poll.resolve(tokens()); await flush();
   assert.deepEqual(f.resumed, []); assert.deepEqual(f.writes, []);
-  assert.equal(f.store.getAuthorizationRecovery(message())?.state, "blocked");
+  assert.equal(f.store.getAuthorizationRecovery(message())?.state, "waiting");
+  assert.equal(f.store.authorizations.get({ channelType: "lark", installationId: "cli", tenantId: "tenant", openId: "user" })?.phase, "waiting");
 });
 
 test("closing database during MA synchronization leaves no late resume or database access", async t => {

@@ -7,6 +7,7 @@ import { loadConfig, loadConfigFile } from "./config.ts";
 import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
 import { loadSessionConfiguration } from "./session-config.ts";
+import { startChannelAfterRecovery } from "./channel-startup.ts";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource } from "./channel.ts";
 
 const command = process.argv[2] || "run";
@@ -123,6 +124,17 @@ async function runEmployee(): Promise<void> {
   console.log(`- 方舟 Agent ID：${config.arkAgentId}`);
   console.log(`- 管理后台：${web.url}`);
   console.log("正在连接飞书 WebSocket；获准用户可私聊 Bot 或在群里 @Bot。");
+  try {
+    await startChannelAfterRecovery(channel, () => {
+      const restored = auth.restore();
+      if (restored) console.log(`已检查并恢复 ${restored} 个授权流程；结果未知的交换不会自动重试。`);
+    }, message => gateway.accept(message));
+  } catch (error) {
+    auth.close();
+    web.server.close();
+    store.close();
+    throw error;
+  }
   const syntheticText = process.env.ARKAGENT_SYNTHETIC_MESSAGE?.trim();
   if (syntheticText) {
     const recent = store.listAuditLogs(1)[0];
@@ -135,14 +147,6 @@ async function runEmployee(): Promise<void> {
       createTime: Date.now(), senderId: recent.openId,
       tenantId: recent.tenantKey, text: syntheticText, resources: [], mentionedBot: false
     });
-  }
-  try {
-    await channel.start(message => gateway.accept(message));
-  } catch (error) {
-    auth.close();
-    web.server.close();
-    store.close();
-    throw error;
   }
 }
 

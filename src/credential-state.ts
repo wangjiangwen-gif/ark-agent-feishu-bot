@@ -57,6 +57,8 @@ export class CredentialStateStore {
   }
 
   sealLegacy(value: string, tenantKey: string, openId: string): string { return this.seal(value, this.legacyContext(tenantKey, openId)); }
+  sealAuthorization(value: string, context: string): string { return this.seal(value, `authorization:${context}`); }
+  openAuthorization(value: string, context: string): string { return this.open(value, `authorization:${context}`); }
   openLegacy(value: string, tenantKey: string, openId: string): string {
     return value.startsWith("sealed:v1:") ? this.open(value, this.legacyContext(tenantKey, openId)) : value;
   }
@@ -129,7 +131,9 @@ export class CredentialStateStore {
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         const exists = this.db.prepare("SELECT 1 FROM employee_credentials LIMIT 1").get()
-          || this.db.prepare("SELECT 1 FROM employee_oauth WHERE refresh_token LIKE 'sealed:v1:%' LIMIT 1").get();
+          || this.db.prepare("SELECT 1 FROM employee_oauth WHERE refresh_token LIKE 'sealed:v1:%' LIMIT 1").get()
+          || (this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='employee_authorization_flows'").get()
+            && this.db.prepare("SELECT 1 FROM employee_authorization_flows LIMIT 1").get());
         if (exists) throw new Error("missing");
         let created: number | undefined;
         try {
