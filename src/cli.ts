@@ -97,7 +97,10 @@ async function runEmployee(): Promise<void> {
     new FeishuOAuth(config.feishuAppId, config.feishuAppSecret),
     sendAuthorizationCard,
     (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId),
-    { notify: (message, text) => channel.reply(message, { type: "text", text }) }
+    {
+      notify: (message, text) => channel.reply(message, { type: "text", text }),
+      onStateChange: (messages, flowId, active) => gateway.setAuthorizationWaiting(messages, flowId, active)
+    }
   );
   closeAuthorization = () => auth.close();
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {

@@ -11,7 +11,10 @@ export const EMPLOYEE_CALENDAR_USER_SCOPES = ["offline_access", "auth:user.id:re
 
 type EmployeeAuthArk = Pick<ArkClient, "listVaults" | "createVault" | "listCredentials" | "createEnvironmentVariableCredential" | "updateEnvironmentCredential">;
 type PendingAuthorization = { flow: AuthorizationFlow; controller: AbortController; restored?: boolean; timer?: ReturnType<typeof setTimeout>; task?: Promise<void> };
-type AuthorizationLifecycleOptions = { notify?: (message: IncomingMessage, text: string) => Promise<void> };
+type AuthorizationLifecycleOptions = {
+  notify?: (message: IncomingMessage, text: string) => Promise<void>;
+  onStateChange?: (messages: IncomingMessage[], flowId: string, active: boolean) => void;
+};
 
 export class EmployeeAuthorizationManager {
   private pending = new Map<string, PendingAuthorization>();
@@ -111,6 +114,7 @@ export class EmployeeAuthorizationManager {
     this.pending.set(key, pending);
     this.setDeadline(key, pending, Date.now() + 30_000);
     try {
+      this.publishState(pending.flow);
       const device = await this.oauth.begin(EMPLOYEE_CALENDAR_USER_SCOPES, pending.controller.signal);
       this.assertActive(key, pending);
       if (!Number.isFinite(device.expiresAt)) throw new OAuthError("invalid_response");
@@ -140,6 +144,7 @@ export class EmployeeAuthorizationManager {
       if (this.pending.has(key)) continue;
       const pending: PendingAuthorization = { flow, controller: new AbortController(), restored: true };
       this.pending.set(key, pending); count++;
+      this.publishState(flow);
       if (["starting", "card_pending", "polling"].includes(flow.phase)) {
         this.stop(key, pending, "uncertain");
         void this.notify(flow.messages[0], "网关重启时授权请求或卡片发送结果尚未确认，未重复交换Token或重放任务。请检查授权状态后重新发起所需操作。");
@@ -277,6 +282,7 @@ export class EmployeeAuthorizationManager {
   private checkpoint(key: string, pending: PendingAuthorization, patch: Parameters<GatewayStore["authorizations"]["save"]>[2]): void {
     this.assertActive(key, pending);
     pending.flow = this.store.authorizations.save(pending.flow.identity, pending.flow, patch);
+    this.publishState(pending.flow);
   }
 
   private stop(key: string, pending: PendingAuthorization, state: "cancelled" | "expired" | "failed" | "uncertain"): void {
@@ -284,6 +290,11 @@ export class EmployeeAuthorizationManager {
     pending.flow = this.store.finishAuthorizationFlow(pending.flow, state);
     this.removePending(key, pending);
     pending.controller.abort(new OAuthError(state === "expired" ? "expired" : "cancelled"));
+    this.publishState(pending.flow);
+  }
+
+  private publishState(flow: AuthorizationFlow): void {
+    this.lifecycle.onStateChange?.(flow.messages, flow.id, !isAuthorizationTerminal(flow.phase));
   }
 
   private setDeadline(key: string, pending: PendingAuthorization, expiresAt: number): void {

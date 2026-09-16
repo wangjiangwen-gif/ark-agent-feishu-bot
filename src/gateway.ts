@@ -29,20 +29,50 @@ export type IncomingMessage = ChannelMessage;
 export type Reply = (message: IncomingMessage, outbound: ChannelOutbound) => Promise<void>;
 
 export class KeyedQueue {
-  private tails = new Map<string, Promise<void>>();
+  private scopes = new Map<string, { running: boolean; paused: boolean; tasks: { run: () => Promise<void>; control: boolean }[]; priority: (() => Promise<void>)[] }>();
 
-  enqueue(key: string, task: () => Promise<void>): boolean {
-    const previous = this.tails.get(key);
-    const current = (previous || Promise.resolve()).catch(() => undefined).then(task).finally(() => {
-      if (this.tails.get(key) === current) this.tails.delete(key);
-    });
-    this.tails.set(key, current);
-    return Boolean(previous);
+  private state(key: string) {
+    let state = this.scopes.get(key);
+    if (!state) { state = { running: false, paused: false, tasks: [], priority: [] }; this.scopes.set(key, state); }
+    return state;
+  }
+
+  enqueue(key: string, task: () => Promise<void>, priority = false, control = false): boolean {
+    const state = this.state(key);
+    const queued = state.running || state.paused || state.tasks.length > 0 || state.priority.length > 0;
+    if (priority && !control) state.priority.push(task);
+    else state.tasks.push({ run: task, control });
+    this.drain(key);
+    return queued;
+  }
+
+  pause(key: string): void { this.state(key).paused = true; }
+  resume(key: string): void {
+    const state = this.scopes.get(key);
+    if (!state) return;
+    state.paused = false;
+    this.drain(key);
+  }
+
+  private drain(key: string): void {
+    const state = this.scopes.get(key);
+    if (!state || state.running) return;
+    // 平常严格FIFO；只有授权暂停/续跑时，显式重置才能先于后续业务和旧任务恢复。
+    const controlIndex = state.paused || state.priority.length ? state.tasks.findIndex(task => task.control) : -1;
+    if (state.paused && controlIndex < 0) return;
+    const task = controlIndex >= 0 ? state.tasks.splice(controlIndex, 1)[0].run : state.priority.shift() || state.tasks.shift()?.run;
+    if (!task) { this.scopes.delete(key); return; }
+    state.running = true;
+    void Promise.resolve().then(task).catch(() => {
+      // 业务层负责记录具体失败；队列兜底不泄露异常payload，也不能饿死后续任务。
+      console.error("会话队列任务异常退出，请检查业务审计记录");
+    }).finally(() => { state.running = false; this.drain(key); });
   }
 }
 
 export class Gateway {
   private queue = new KeyedQueue();
+  private authorizationWaits = new Map<string, Set<string>>();
   private sessionStatsCheckedAt = new Map<string, number>();
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
@@ -91,8 +121,11 @@ export class Gateway {
     const heartbeat = setInterval(() => this.store.touchEvent(message), 60_000);
     heartbeat.unref();
     const key = this.conversationKey(message);
+    const resetControl = message.conversationType === "direct" && message.text.trim() === "/new" && Boolean(this.options.cancelAuthorization);
     this.schedule(message, key, async () => {
       try {
+        // 显式重置先取消旧授权续跑；控制任务可穿过暂停，但不能打断已在运行的MA请求。
+        if (resetControl) await this.options.cancelAuthorization!(message);
         await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
         this.store.completeEvent(message.channelType, message.installationId, message.messageId, "completed");
       } catch (error) {
@@ -102,7 +135,7 @@ export class Gateway {
       } finally {
         clearInterval(heartbeat);
       }
-    });
+    }, false, resetControl);
     return true;
   }
 
@@ -126,6 +159,21 @@ export class Gateway {
       try { await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction)); }
       catch (error) { await this.replyText(message, `执行失败：${error instanceof Error ? error.message.slice(0, 240) : String(error)}`); }
     });
+  }
+
+  setAuthorizationWaiting(messages: IncomingMessage[], flowId: string, active: boolean): void {
+    for (const message of messages) {
+      if (message.conversationType !== "direct") continue;
+      const key = this.store.conversationKey(this.conversationKey(message));
+      const waits = this.authorizationWaits.get(key) || new Set<string>();
+      if (active) {
+        waits.add(flowId); this.authorizationWaits.set(key, waits); this.queue.pause(key);
+      } else {
+        waits.delete(flowId);
+        if (waits.size) continue;
+        this.authorizationWaits.delete(key); this.queue.resume(key);
+      }
+    }
   }
 
   resumeAfterAuthorization(message: IncomingMessage, userVaultId: string): void {
@@ -158,7 +206,7 @@ export class Gateway {
         this.store.finishAuthorizationRecovery(message, "failed");
         await this.replyText(message, `授权恢复未完成：${error instanceof Error ? error.message.slice(0, 240) : "请检查运行记录"}`);
       }
-    });
+    }, this.authorizationWaits.has(this.store.conversationKey(key)));
   }
 
   resumeWithHandoff(message: IncomingMessage): void {
@@ -181,7 +229,7 @@ export class Gateway {
     });
   }
 
-  private schedule(message: IncomingMessage, key: ConversationKey, task: () => Promise<void>): void {
+  private schedule(message: IncomingMessage, key: ConversationKey, task: () => Promise<void>, priority = false, control = false): void {
     if (this.usesIsolatedSession(message)) {
       void Promise.resolve().then(task);
       return;
@@ -194,7 +242,7 @@ export class Gateway {
         catch (error) { console.warn("移除排队中表情失败：", error instanceof Error ? error.message : error); }
       }
       await task();
-    });
+    }, priority, control);
     if (
       queued && message.conversationType === "group" && this.options.sharedGroupSessions
       && this.options.addReaction && this.options.removeReaction
