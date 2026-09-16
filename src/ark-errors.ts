@@ -46,5 +46,38 @@ export class ArkNetworkError extends Error {
 }
 
 export function failureDiagnostic(error: unknown): FailureDiagnostic {
-  return error instanceof ArkHttpError || error instanceof ArkNetworkError ? sanitizeFailure(error) : { kind: "unknown" };
+  return error instanceof ArkRunError ? sanitizeFailure(error.failure)
+    : error instanceof ArkHttpError || error instanceof ArkNetworkError ? sanitizeFailure(error) : { kind: "unknown" };
+}
+
+// 只解析已观测的结构化错误；原始message、URL与嵌套响应不进入回复/审计。
+export function sessionFailure(event: Record<string, unknown>): FailureDiagnostic {
+  const error = event.error && typeof event.error === "object" ? event.error as Record<string, unknown> : {};
+  if (error.type === "model_rate_limited_error") return { kind: "rate_limit", code: "model_rate_limited_error" };
+  if (error.type !== "model_request_failed_error") return { kind: "unknown" };
+  const fallback: FailureDiagnostic = { kind: "upstream", code: "model_request_failed_error" };
+  if (typeof error.message !== "string" || error.message.length > 32768) return fallback;
+  try {
+    const inner = JSON.parse(error.message)?.error;
+    if (inner?.code !== "InvalidParameter" || inner?.param !== "file_url" || typeof inner.message !== "string"
+      || !/^Timeout while processing file_url(?:\s|$)/.test(inner.message)) return fallback;
+    const requestId = safeRequestId(inner.message.match(/\bRequest id:\s*([A-Za-z0-9_.:-]+)(?:\s|$)/)?.[1]);
+    return { kind: "timeout", code: "model_file_processing_timeout", ...(requestId ? { requestId } : {}) };
+  } catch { return fallback; }
+}
+
+export class ArkRunError extends Error {
+  failure: FailureDiagnostic;
+  constructor(failure?: FailureDiagnostic) {
+    const safe = sanitizeFailure(failure);
+    const reason = safe.code === "model_file_processing_timeout" ? "模型侧文件内容处理超时（file_url），本轮未完成；网关不会自动重跑任务。"
+      : safe.kind === "rate_limit" ? "模型请求被限流，本轮未完成；网关不会自动重跑任务。"
+      : "Agent Session 执行失败，请检查 MA 运行记录；网关不会自动重跑任务。";
+    super(`${reason}${safe.requestId ? ` Request ID: ${safe.requestId}` : ""}`);
+    this.name = "ArkRunError"; this.failure = safe;
+  }
+}
+
+export function streamFailureText(error: unknown): string {
+  return `执行失败：${error instanceof ArkRunError ? new ArkRunError(error.failure).message : "本次回复未完成，请查看网关与 MA 运行记录。"}`;
 }

@@ -755,7 +755,7 @@ test("gateway falls back to local audit context when OAuth handoff summarization
   store.close();
 });
 
-test("automatic compaction keeps using the same Session when compact fails", async () => {
+test("ordinary work never attempts compact even when the compact adapter would fail", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
@@ -779,14 +779,14 @@ test("automatic compaction keeps using the same Session when compact fails", asy
   await delay(40);
 
   assert.equal(creates, 0);
-  assert.deepEqual(operations, ["session-old:/compact", "session-old:继续当前任务"]);
+  assert.deepEqual(operations, ["session-old:继续当前任务"]);
   assert.equal(store.getSession(key), "session-old");
   const compactLog = store.listAuditLogs().find(log => log.action === "session_compact");
-  assert.equal(compactLog?.status, "failed");
+  assert.equal(compactLog, undefined);
   store.close();
 });
 
-test("gateway automatically compacts an oversized Session in place", async () => {
+test("gateway leaves oversized Session compaction to MA without extra statistics requests", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
@@ -814,11 +814,11 @@ test("gateway automatically compacts an oversized Session in place", async () =>
   gateway.accept(message({ text: "继续" }));
   await delay(40);
 
-  assert.deepEqual(operations, ["stats:session-old", "run:session-old:/compact", "stats:session-old", "run:session-old:继续"]);
+  assert.deepEqual(operations, ["run:session-old:继续"]);
   assert.equal(creates, 0);
   assert.equal(store.getSession(key), "session-old");
   const compactLog = store.listAuditLogs().find(log => log.action === "session_compact");
-  assert.equal(compactLog?.status, "succeeded");
+  assert.equal(compactLog, undefined);
   store.close();
 });
 
@@ -848,7 +848,7 @@ test("gateway reuses a Session below the compaction threshold", async () => {
   store.close();
 });
 
-test("gateway does not compact the same event range repeatedly", async () => {
+test("gateway sends only user tasks across multiple high-event-count turns", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-current", "agent-1");
@@ -872,7 +872,7 @@ test("gateway does not compact the same event range repeatedly", async () => {
   gateway.accept(message({ messageId: "message-compact-2", text: "任务二" }));
   await delay(30);
 
-  assert.deepEqual(inputs, ["/compact", "任务一", "任务二"]);
+  assert.deepEqual(inputs, ["任务一", "任务二"]);
   assert.equal(store.getSession(key), "session-current");
   store.close();
 });

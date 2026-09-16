@@ -1,6 +1,7 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource, ReplyDeliveryObserver } from "./channel.ts";
 import { replyContentFingerprint } from "./reply-delivery.ts";
+import { streamFailureText } from "./ark-errors.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
 import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
 import { inspectLarkReply } from "./lark-reply-inspection.ts";
@@ -151,16 +152,23 @@ export class LarkChannelAdapter implements ChannelAdapter {
     }
     await observer?.({ type: "begin", mode: "sdk_stream" });
     await observer?.({ type: "sending" });
+    let streamError: unknown;
+    let streamFailed = false;
     const sent = await this.channel.stream(message.conversationId, {
-      markdown: async controller => progressivelyWriteMarkdown({
-        append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
-        setContent: controller.setContent.bind(controller)
-      }, producer, this.streaming)
+      markdown: async controller => {
+        try {
+          await progressivelyWriteMarkdown({
+            append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
+            setContent: controller.setContent.bind(controller)
+          }, producer, this.streaming);
+        } catch (error) { streamFailed = true; streamError = error; throw error; }
+      }
     }, replyOptions(message));
     await observer?.({ type: "sent", messageIds: sent.messageId ? [sent.messageId] : [] });
     // SDK 0.4.1会吞掉部分流式更新/收尾错误，只返回首条messageId；此回退不能提供最终送达证明。
-    // 无observer保持原行为；实验持久队列会保留未核实投递，不把SDK resolve当成原生接口确认。
+    // 实验持久队列保留未核实投递；回调中已观察到的失败不得被SDK resolve抹掉。
     if (sent.messageId) this.onSent?.(message, sent.messageId);
+    if (streamFailed) throw streamError;
   }
 
   private async streamNativeCardKit(
@@ -192,6 +200,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
       await observer?.({ type: "content_confirmed", sequence, contentFingerprint });
     };
 
+    let streamError: unknown;
+    let streamFailed = false;
     try {
       await progressivelyWriteMarkdown({
         append: async chunk => {
@@ -205,7 +215,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
           await push();
         }
       }, producer, this.streaming);
-    } finally {
+    } catch (error) { streamFailed = true; streamError = error; }
+    try {
       if (lastChunkChars) {
         const settleMs = Math.ceil(lastChunkChars / this.streaming.printStep) * this.streaming.printFrequencyMs
           + this.streaming.settlePaddingMs;
@@ -226,7 +237,11 @@ export class LarkChannelAdapter implements ChannelAdapter {
       });
       assertCardKitSuccess(response, "settings");
       await observer?.({ type: "finalized", sequence });
+    } catch (error) {
+      if (!streamFailed) throw error;
+      console.warn("流式卡片关闭未确认，保留原始执行失败");
     }
+    if (streamFailed) throw streamError;
     // producer、正文更新或关闭流式任一失败，均不能到达最终送达确认。
     await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(content || STREAMING_PLACEHOLDER) });
   }
@@ -324,6 +339,7 @@ async function progressivelyWriteMarkdown(
   let producerFinished = false;
 
   let writerError: unknown;
+  let writerFailed = false;
   const writerTask = (async () => {
     while (!producerFinished || rendered !== target) {
       if (rendered === target) {
@@ -337,22 +353,30 @@ async function progressivelyWriteMarkdown(
       rendered = next;
       if (rendered !== target) await wait(options.intervalMs);
     }
-  })().catch(error => { writerError = error; });
+  })().catch(error => { writerFailed = true; writerError = error; });
 
   let producerError: unknown;
+  let producerFailed = false;
   try {
     await producer(async snapshot => {
       if (snapshot && snapshot !== target) target = snapshot;
     });
   } catch (error) {
+    producerFailed = true;
     producerError = error;
   } finally {
     producerFinished = true;
   }
 
   await writerTask;
-  if (writerError) throw writerError;
-  if (producerError) throw producerError;
+  if (producerFailed) {
+    // 使用同一卡片替换占位/过程正文；更新失败不重发新卡片，也不吞掉原始失败。
+    try { await writer.setContent(streamFailureText(producerError)); }
+    catch { console.warn("流式失败状态更新未确认，保留原始失败供网关处理"); }
+    throw producerError;
+  }
+  // 仅投递失败时保留原正文和指纹，供只读核验；不能覆盖可能已成功送达的结果。
+  if (writerFailed) throw writerError;
 }
 
 function nextProgressiveSnapshot(current: string, target: string, options: Required<StreamingOptions>): string {

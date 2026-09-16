@@ -33,29 +33,6 @@ export function baselineCompaction(stats: SessionStats): CompactionCheckpoint {
   };
 }
 
-export function decideCompaction(
-  checkpoint: CompactionCheckpoint | undefined, stats: SessionStats, messageId: string, now: number,
-  limits: { maxEvents?: number; maxInputTokens?: number } = {}
-): { compact: boolean; checkpoint: CompactionCheckpoint } {
-  if (!checkpoint) return { compact: false, checkpoint: baselineCompaction(stats) };
-  const waiting = checkpoint.attempt?.result === "running" || checkpoint.attempt?.result === "unknown";
-  const platform = stats.latestCompaction;
-  if (!waiting && stats.status === "idle" && platform && platform.eventId !== checkpoint.platformCompactionEventId) {
-    return { compact: false, checkpoint: { ...checkpoint, baselineEventCount: platform.eventCount,
-      consumedTokenSampleId: platform.tokenSampleId, lastBusinessEventId: platform.businessEventId,
-      platformCompactionEventId: platform.eventId, failures: 0, paused: false, cooldownUntil: now + 300000 } };
-  }
-  const newBusiness = Boolean(stats.latestBusinessEventId && stats.latestBusinessEventId !== checkpoint.lastBusinessEventId);
-  const freshSample = Boolean(stats.latestTokenSampleId && stats.latestTokenSampleId !== checkpoint.consumedTokenSampleId);
-  const oversized = stats.eventCount - checkpoint.baselineEventCount >= (limits.maxEvents ?? 120)
-    || (freshSample && (stats.latestInputTokens ?? 0) >= (limits.maxInputTokens ?? 20000));
-  return {
-    compact: !waiting && !checkpoint.paused && now >= checkpoint.cooldownUntil
-      && checkpoint.lastMessageId !== messageId && stats.status === "idle" && newBusiness && oversized,
-    checkpoint
-  };
-}
-
 export function startCompaction(
   checkpoint: CompactionCheckpoint, stats: SessionStats, messageId: string,
   source: "manual" | "automatic", now: number

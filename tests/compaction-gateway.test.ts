@@ -35,12 +35,12 @@ function harness(store: GatewayStore, options: { stats?: () => SessionStats; obs
   return { gateway, inputs, replies, creates: () => creates, inspections: () => inspections };
 }
 
-test("legacy high-token Session is baselined and reused, not immediately compacted", async t => {
+test("legacy high-token Session is reused without an automatic statistics baseline", async t => {
   const store = new GatewayStore(":memory:"); t.after(() => store.close());
   store.saveSession(toConversationKey(message("one")), "session", "agent");
   const h = harness(store); h.gateway.accept(message("one")); await until(() => h.replies.length === 1);
   assert.equal(h.inputs.length, 1); assert.notEqual(h.inputs[0], "/compact");
-  assert.equal(store.getCompactionCheckpoint("session")?.consumedTokenSampleId, "m5");
+  assert.equal(store.getCompactionCheckpoint("session"), undefined);
 });
 
 test("manual idle without completion proof is unknown, never success or automatic replay", async t => {
@@ -73,8 +73,8 @@ test("confirmed compaction failure persists across restart without replaying old
   const first = new GatewayStore(path);
   first.saveSession(toConversationKey(message("one")), "session", "agent");
   first.saveCompactionCheckpoint("session", baselineCompaction({ eventCount: 0 }));
-  const a = harness(first, { fail: true }); a.gateway.accept(message("one")); await until(() => a.replies.length === 1);
-  assert.equal(a.inputs[0], "/compact"); assert.equal(a.inputs.length, 2);
+  const a = harness(first, { fail: true }); a.gateway.accept(message("one", "/compact")); await until(() => a.replies.length === 1);
+  assert.equal(a.inputs[0], "/compact"); assert.equal(a.inputs.length, 1);
   assert.equal(first.getCompactionCheckpoint("session")?.attempt?.result, "failed"); first.close();
   const second = new GatewayStore(path); t.after(() => second.close());
   const checkpoint = second.getCompactionCheckpoint("session")!;

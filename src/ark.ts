@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { ArkHttpError, ArkNetworkError, failureDiagnostic, safeErrorCode, safeRequestId } from "./ark-errors.ts";
+import { ArkHttpError, ArkNetworkError, failureDiagnostic, safeErrorCode, safeRequestId, sessionFailure, type FailureDiagnostic } from "./ark-errors.ts";
 export { ArkHttpError } from "./ark-errors.ts";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
 import { RunFileObserver, type RunFileObservation } from "./run-file-observation.ts";
@@ -18,6 +18,7 @@ export type RunResult = {
   authorizationRequired?: UserAuthorizationRequired;
   evidence?: RunEvidence;
   fileObservation?: RunFileObservation;
+  failure?: FailureDiagnostic;
 };
 
 export type RunInspection =
@@ -597,12 +598,14 @@ export class ArkClient {
           result = { ...result, evidence: undefined };
         }
       }
+      // 即使上游错误把已知密钥放进格式正确的Request ID，也不能回传。
+      this.redactRunFailure(result);
       controller.abort();
       return result;
     } catch (error) {
       if (!controller.signal.aborted) throw error;
       const recovered = boundary ? await this.recoverTimedOutRun(sessionId, boundary) : undefined;
-      if (recovered) return recovered;
+      if (recovered) return this.redactRunFailure(recovered);
       throw new Error("Session 运行超时");
     } finally {
       controller.abort();
@@ -679,6 +682,7 @@ export class ArkClient {
       if (["session.error", "session.status_failed", "session.status_idle"].includes(String(event.type))) {
         const fileObservation = files.snapshot();
         return { terminal: event.type === "session.status_idle" ? "idle" : "failed", messages,
+          ...(event.type !== "session.status_idle" ? { failure: sessionFailure(event) } : {}),
           ...(fileObservation ? { fileObservation } : {}), ...(authorizationRequired ? { authorizationRequired } : {}) };
       }
     }
@@ -708,11 +712,18 @@ export class ArkClient {
       combined.throwIfAborted();
       const { events } = await this.readSessionEvents(sessionId, combined, undefined, true);
       combined.throwIfAborted();
-      return inspectRunHistory(events, requestFingerprint);
+      const inspection = inspectRunHistory(events, requestFingerprint);
+      if (inspection.status === "ended") this.redactRunFailure(inspection.result);
+      return inspection;
     } catch {
       // 上游错误可能包含凭证或文档片段；核查状态只返回稳定原因，不转发原始错误。
       return { status: "unknown", reason: "history_unavailable" };
     }
+  }
+
+  private redactRunFailure(result: RunResult): RunResult {
+    if (result.failure?.requestId?.includes(this.apiKey)) delete result.failure.requestId;
+    return result;
   }
 
   private async readSessionEvents(sessionId: string, signal?: AbortSignal, startPage?: string, strict = false): Promise<{ events: ArkEvent[]; lastPage?: string }> {
@@ -947,7 +958,8 @@ function terminalResult(current: ArkEvent[]): RunResult | undefined {
   const files = new RunFileObserver();
   for (const event of raw) files.observe(event);
   const fileObservation = files.snapshot();
-  const observed = fileObservation ? { fileObservation } : {};
+  const observed = { ...(fileObservation ? { fileObservation } : {}),
+    ...(failed ? { failure: sessionFailure(current.find(event => event.type === "session.error") || {}) } : {}) };
   if (authorizationRequired) {
     const collector = new RunEvidenceCollector();
     for (const event of raw) collector.observe(event, Boolean(eventUserAuthorizationRequired(event, toolDomains)));

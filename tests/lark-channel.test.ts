@@ -323,7 +323,7 @@ test("Channel adapter streams snapshots and manages the Get reaction", async () 
   assert.deepEqual(reactions, ["add:om-1:Get", "remove:om-1:reaction-1"]);
 });
 
-test("Channel adapter preserves producer failures after flushing the latest snapshot", async () => {
+test("Channel adapter preserves producer failures and replaces the partial snapshot with safe failure text", async () => {
   const snapshots: string[] = [];
   const port = {
     connect: async () => undefined,
@@ -346,7 +346,8 @@ test("Channel adapter preserves producer failures after flushing the latest snap
     await update("已生成部分内容");
     throw new Error("upstream failed");
   }), /upstream failed/);
-  assert.equal(snapshots.at(-1), "已生成部分内容");
+  assert.ok(snapshots.includes("已生成部分内容"));
+  assert.match(snapshots.at(-1)!, /执行失败/);
 });
 
 test("Channel adapter progressively reveals a complete upstream snapshot", async () => {

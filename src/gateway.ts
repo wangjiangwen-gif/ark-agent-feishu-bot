@@ -1,5 +1,5 @@
 import type {
-  ArkClient, RunInspection, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, SessionStats, UserAuthorizationRequired
+  ArkClient, RunInspection, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, UserAuthorizationRequired
 } from "./ark.ts";
 import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelInspectReaction, ReactionObservation, ReplyDeliveryObserver, ChannelInspectReply, ReplyObservation } from "./channel.ts";
 import { replyInspectionQuery } from "./reply-delivery.ts";
@@ -7,12 +7,12 @@ import { buildConversationTurn, resolveReplyContext } from "./conversation-conte
 import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, mergeSessionRequest, requestEnvironmentId, selectSessionRequest, validateSessionConfiguration, type SessionConfiguration, type SessionScope } from "./session-config.ts";
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
 import { createHash } from "node:crypto";
-import { baselineCompaction, decideCompaction, startCompaction, finishCompaction } from "./session-compaction.ts";
+import { baselineCompaction, startCompaction, finishCompaction } from "./session-compaction.ts";
 import { authorizationContinuation, authorizationRecoveryDecision, type RunEvidence } from "./run-evidence.ts";
 import type { InboxBinding, InboxTask } from "./message-inbox.ts";
 import type { AttachmentStage, AttachmentStageDetails } from "./attachment-trace.ts";
 import { ArkHttpError } from "./ark.ts";
-import { failureDiagnostic } from "./ark-errors.ts";
+import { ArkRunError, failureDiagnostic } from "./ark-errors.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -92,7 +92,6 @@ export class Gateway {
   private inboxReconciliations = new Map<string, Promise<void>>();
   private inboxRecoveryBatches = new Map<string, Promise<void>>();
   private reactionCleanups = new Map<string, Promise<void>>();
-  private sessionStatsCheckedAt = new Map<string, number>();
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
@@ -528,11 +527,9 @@ export class Gateway {
       try {
         await this.withReaction(message, async hasReaction => {
           const isolatedSession = this.usesIsolatedSession(message);
-          const sourceSessionId = isolatedSession ? undefined : this.store.getSession(key);
           const handoff = isolatedSession ? undefined : await this.createSessionHandoff(key, message);
           if (!isolatedSession) {
             this.store.resetSession(key);
-            if (sourceSessionId) this.clearSessionStats(sourceSessionId);
           }
           await this.process(message, key, handoff, hasReaction);
         });
@@ -643,9 +640,7 @@ export class Gateway {
         await this.replyText(message, "当前模式每条消息都会创建独立 Agent Session，无需手动开启新会话。");
         return;
       }
-      const sourceSessionId = this.store.getSession(key);
       this.store.resetSession(key);
-      if (sourceSessionId) this.clearSessionStats(sourceSessionId);
       await this.replyText(message, "已开启新会话，下一条消息会创建新的 Agent Session。");
       if (this.options.platformAccess) this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
@@ -654,7 +649,7 @@ export class Gateway {
       });
       return;
     }
-    if (message.text.trim() === "/compact") {
+    if (message.text.trim().toLowerCase() === "/compact") {
       if (this.usesIsolatedSession(message)) {
         await this.replyText(message, "当前模式每条消息都会创建独立 Agent Session，无需手动压缩。");
         return;
@@ -669,7 +664,7 @@ export class Gateway {
       if (!compacted) {
         const result = this.store.getCompactionCheckpoint(sessionId)?.attempt?.result;
         await this.replyText(message, result === "unknown" || result === "running"
-          ? "压缩结果尚未确认，已暂停自动重复压缩；当前 Session 与文件保持不变。请检查运行记录后再处理。"
+          ? "压缩结果尚未确认：未取得原生压缩完成证据，不会自动重试。当前 Session 与文件保持不变，请检查运行记录后再处理。"
           : "Agent Session 上下文压缩失败，当前 Session 与文件保持不变。");
         return;
       }
@@ -772,11 +767,8 @@ export class Gateway {
       }
 
       if (sessionId) {
-        const stats = await this.shouldCompactSession(message, sessionId);
-        if (stats) {
-          await this.compactSession(message, sessionId, stats);
-          await this.assertCompactionSettled(sessionId);
-        }
+        // 常规上下文压缩交由MA处理；只核查此前未决命令，不按阈值主动发送/compact。
+        await this.assertCompactionSettled(sessionId);
       }
       if (!sessionId) {
         // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
@@ -928,6 +920,7 @@ export class Gateway {
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
         sessionId, action: message.resources.length ? "file_message" : "message", status: "failed",
+        requestId: failureDiagnostic(error).requestId,
         durationMs: Date.now() - startedAt, summary: error instanceof Error ? error.message.slice(0, 240) : "执行失败",
         messageCreateTime: message.createTime,
         ...(result?.fileObservation ? { fileObservation: result.fileObservation } : {})
@@ -976,7 +969,7 @@ export class Gateway {
   private async assertCompactionSettled(sessionId: string, refresh = false): Promise<void> {
     const state = this.store.getCompactionCheckpoint(sessionId);
     if (state?.attempt?.result !== "running" && state?.attempt?.result !== "unknown") return;
-    // 已确认结束但效果未知，只暂停自动压缩；普通业务不必每轮重复查询旧尝试。
+    // 已确认结束但效果未知，不自动重试；普通业务不必每轮重复查询旧尝试。
     if (!refresh && state.attempt.terminal) return;
     if (!this.ark.getSessionStats) throw new Error("无法核查压缩运行状态；保留当前 Session，未提交新的业务任务");
     const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2000));
@@ -991,45 +984,16 @@ export class Gateway {
     } else throw new Error("当前适配器不能核查压缩结果；未提交新的业务任务");
   }
 
-  private async shouldCompactSession(message: IncomingMessage, sessionId: string): Promise<SessionStats | undefined> {
-    // 先核查跨重启的未决尝试，不能因关闭自动压缩或检查节流绕过运行互斥。
-    await this.assertCompactionSettled(sessionId);
-    const policy = this.options.sessionCompaction ?? this.options.sessionRotation;
-    if (policy === false || !this.ark.getSessionStats) return undefined;
-    const now = Date.now();
-    const lastCheckedAt = this.sessionStatsCheckedAt.get(sessionId) || 0;
-    if (now - lastCheckedAt < (this.options.sessionStatsCheckIntervalMs ?? 60_000)) return undefined;
-    this.sessionStatsCheckedAt.set(sessionId, now);
-    const limits = policy || {};
-    try {
-      const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2_000));
-      const decision = decideCompaction(this.store.getCompactionCheckpoint(sessionId), stats, message.messageId, now, limits);
-      this.store.saveCompactionCheckpoint(sessionId, decision.checkpoint);
-      if (decision.compact) {
-        console.info(`Session ${sessionId} 达到上下文阈值，将在当前 Session 内执行 /compact`);
-        return stats;
-      }
-      return undefined;
-    } catch (error) {
-      console.warn("检查 Session 上下文大小失败，将继续复用当前 Session：", error instanceof Error ? error.message : error);
-      return undefined;
-    }
-  }
-
-  private clearSessionStats(sessionId: string): void {
-    this.sessionStatsCheckedAt.delete(sessionId);
-  }
-
-  private async compactSession(message: IncomingMessage, sessionId: string, suppliedStats?: SessionStats): Promise<boolean> {
+  private async compactSession(message: IncomingMessage, sessionId: string): Promise<boolean> {
     const startedAt = Date.now();
-    await this.assertCompactionSettled(sessionId, !suppliedStats);
+    await this.assertCompactionSettled(sessionId, true);
     const previous = this.store.getCompactionCheckpoint(sessionId);
-    if (previous?.attempt?.result === "running" || (suppliedStats && previous?.attempt?.result === "unknown")) return false;
-    const stats = suppliedStats || await this.ark.getSessionStats?.(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2000));
+    if (previous?.attempt?.result === "running") return false;
+    const stats = await this.ark.getSessionStats?.(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2000));
     if (!stats || (stats.status !== "idle" && stats.status !== "failed") || (!stats.latestEventId && stats.eventCount > 0)) {
       throw new Error("无法确认压缩前的事件边界或空闲状态，未提交压缩请求");
     }
-    const checkpoint = startCompaction(previous || baselineCompaction(stats), stats, message.messageId, suppliedStats ? "automatic" : "manual", startedAt);
+    const checkpoint = startCompaction(previous || baselineCompaction(stats), stats, message.messageId, "manual", startedAt);
     this.store.saveCompactionCheckpoint(sessionId, checkpoint);
     try {
       const timeoutMs = Math.min(this.options.handoffTimeoutMs ?? 120_000, this.options.timeoutMs);
@@ -1046,7 +1010,6 @@ export class Gateway {
       const outcome = observation?.result || "unknown";
       this.store.saveCompactionCheckpoint(sessionId, finishCompaction(checkpoint, outcome, after, Date.now(), 300000,
         { eventId: observation?.evidenceEventId, terminal: observation?.terminal || result.terminal }));
-      this.sessionStatsCheckedAt.set(sessionId, Date.now());
       this.recordSessionCompact(message, sessionId, outcome === "succeeded" ? "succeeded" : "failed", Date.now() - startedAt, outcome);
       return outcome === "succeeded";
     } catch (error) {
@@ -1401,9 +1364,11 @@ export type GatewayOptions = {
   timeoutMs: number;
   progressDelayMs?: number;
   handoffTimeoutMs?: number;
+  /** @deprecated 网关不再自动压缩。保留旧配置类型，但阈值不生效。 */
   sessionCompaction?: false | { maxEvents?: number; maxInputTokens?: number };
-  /** @deprecated Use sessionCompaction. Kept for compatibility with versions before 0.2.7. */
+  /** @deprecated 网关不再自动轮换或压缩。保留旧配置类型，但阈值不生效。 */
   sessionRotation?: false | { maxEvents?: number; maxInputTokens?: number };
+  /** @deprecated 不再为自动压缩定期查询上下文统计。 */
   sessionStatsCheckIntervalMs?: number;
   sessionStatsTimeoutMs?: number;
   streamReply?: (message: IncomingMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>, observer?: ReplyDeliveryObserver) => Promise<void>;
@@ -1570,7 +1535,7 @@ export function toConversationKey(message: IncomingMessage, sharedGroupSessions 
 }
 
 export function resultToReply(result: RunResult): string {
-  if (result.terminal === "failed") throw new Error("Agent Session 执行失败");
+  if (result.terminal === "failed") throw new ArkRunError(result.failure);
   if (!result.messages.length) throw new Error("Agent Session 已结束，但没有产生回复");
   const files = result.fileObservation;
   if (files && !files.ambiguous && !files.truncated && files.replyTiming === "before_reads_finished") {
