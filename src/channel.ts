@@ -61,6 +61,11 @@ export type ReplyDeliveryEvent =
   | { type: "finalizing" | "finalized"; sequence: number }
   | { type: "completed"; contentFingerprint: string };
 export type ReplyDeliveryObserver = (event: ReplyDeliveryEvent) => Promise<void>;
+export type ReplyInspectionQuery = { mode: "native_card"; messageId: string; elementId: string; contentFingerprint: string };
+export type ReplyObservation =
+  | { status: "confirmed"; messageId: string; elementId: string; contentFingerprint: string; observedAt: number }
+  | { status: "unknown"; reason: "unsupported" | "unavailable" | "invalid_response" | "identity_mismatch" | "content_mismatch" | "streaming" | "cancelled" };
+export type ChannelInspectReply = (message: ChannelMessage, query: ReplyInspectionQuery, signal: AbortSignal) => Promise<ReplyObservation>;
 
 export type ChannelOutbound =
   | { type: "text"; text: string }
@@ -88,6 +93,7 @@ export interface ChannelAdapter {
   addReaction?(message: ChannelMessage, emojiType: string): Promise<string>;
   removeReaction?(message: ChannelMessage, reactionId: string): Promise<void>;
   inspectReaction?: ChannelInspectReaction;
+  inspectReply?: ChannelInspectReply;
   loadRecentHistory?(message: ChannelMessage): Promise<ChannelHistoryMessage[]>;
   readMessage?: ChannelReadMessage;
   download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;

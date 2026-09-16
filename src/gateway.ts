@@ -1,7 +1,8 @@
 import type {
   ArkClient, RunInspection, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, SessionStats, UserAuthorizationRequired
 } from "./ark.ts";
-import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelInspectReaction, ReactionObservation, ReplyDeliveryObserver } from "./channel.ts";
+import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelInspectReaction, ReactionObservation, ReplyDeliveryObserver, ChannelInspectReply, ReplyObservation } from "./channel.ts";
+import { replyInspectionQuery } from "./reply-delivery.ts";
 import { buildConversationTurn, resolveReplyContext } from "./conversation-context.ts";
 import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, mergeSessionRequest, requestEnvironmentId, selectSessionRequest, validateSessionConfiguration, type SessionConfiguration, type SessionScope } from "./session-config.ts";
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
@@ -219,8 +220,24 @@ export class Gateway {
       catch { observation = { status: "unknown", reason: "history_unavailable" }; }
       // 查询期间可能发生显式重置或配置切换；不得用旧查询结果放行新绑定。
       if (!matches()) return;
-      const inspected = this.store.recordMessageInspection(task, observation);
-      if (observation.status !== "ended" || !inspected.replyConfirmed || observation.result.authorizationRequired) return;
+      let inspected = this.store.recordMessageInspection(task, observation);
+      if (observation.status !== "ended" || observation.result.authorizationRequired) return;
+      const query = replyInspectionQuery(inspected.delivery, inspected.replyIntent?.contentFingerprint);
+      if (!inspected.replyConfirmed && query && this.options.inspectReply) {
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let proof: ReplyObservation;
+        try {
+          proof = await Promise.race([
+            this.options.inspectReply(inspected.message, query, controller.signal),
+            new Promise<ReplyObservation>(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ status: "unknown", reason: "cancelled" }); }, 5000); })
+          ]);
+        } catch { proof = { status: "unknown", reason: "unavailable" }; }
+        finally { clearTimeout(timer); controller.abort(); }
+        if (!matches()) return;
+        inspected = this.store.inbox.recordReplyInspection(inspected, proof);
+      }
+      if (!inspected.replyConfirmed) return;
       this.store.settleInspectedMessage(inspected);
       if (!this.store.inbox.hasBlockingTasks(task.message, task.binding)) {
         this.inboxBlockedScopes.delete(task.binding.scope);
@@ -1231,6 +1248,7 @@ export type GatewayOptions = {
   addReaction?: (message: IncomingMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
   inspectReaction?: ChannelInspectReaction;
+  inspectReply?: ChannelInspectReply;
   beforeCreateSession?: () => Promise<void>;
   beforeDirectTurn?: (message: IncomingMessage) => Promise<void>;
   platformAccess?: boolean;

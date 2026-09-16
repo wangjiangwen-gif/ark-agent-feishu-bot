@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ReplyDeliveryEvent } from "./channel.ts";
+import type { ReplyDeliveryEvent, ReplyInspectionQuery } from "./channel.ts";
 
 export type ReplyDeliveryState = {
   mode: "native_card" | "message" | "sdk_stream";
@@ -10,6 +10,13 @@ export type ReplyDeliveryState = {
 export const replyContentFingerprint = (text: string): string => createHash("sha256").update(text).digest("hex");
 const validId = (id: unknown): id is string => typeof id === "string" && Boolean(id.trim()) && id.length <= 1024;
 export const validReplyFingerprint = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+
+export function replyInspectionQuery(state: ReplyDeliveryState | undefined, fingerprint: string | undefined): ReplyInspectionQuery | undefined {
+  if (!state || state.mode !== "native_card" || !["updating", "updated", "finalizing", "finalized"].includes(state.phase)
+    || state.messageIds?.length !== 1 || !validId(state.messageIds[0]) || !validId(state.elementId) || !validId(state.cardId)
+    || !validReplyFingerprint(fingerprint) || (state.pendingContentFingerprint || state.contentFingerprint) !== fingerprint) return undefined;
+  return { mode: "native_card", messageId: state.messageIds[0], elementId: state.elementId, contentFingerprint: fingerprint };
+}
 
 export function advanceReplyDelivery(previous: ReplyDeliveryState | undefined, event: ReplyDeliveryEvent): ReplyDeliveryState {
   if (event.type === "begin") {

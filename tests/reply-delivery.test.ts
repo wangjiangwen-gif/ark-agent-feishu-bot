@@ -7,9 +7,10 @@ import { join } from "node:path";
 import { setImmediate as flush } from "node:timers/promises";
 import { spawnSync } from "node:child_process";
 import { GatewayStore } from "../src/store.ts";
-import { Gateway, type GatewayOptions } from "../src/gateway.ts";
+import { Gateway, toConversationKey, type GatewayOptions } from "../src/gateway.ts";
 import { LarkChannelAdapter, type LarkChannelPort } from "../src/lark-channel.ts";
 import type { ChannelMessage, ReplyDeliveryEvent } from "../src/channel.ts";
+import { replyInspectionQuery } from "../src/reply-delivery.ts";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const result = { terminal: "idle" as const, messages: ["final-private-text"] };
@@ -250,4 +251,141 @@ test("Gateway recovers crash after adapter final receipt without rerunning MA or
       assert.equal(runs, 1); assert.equal(writes.length, writeCount);
     } finally { reopened.close(); }
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("remote proof requires matching MA result, attempted final body and fresh exact receipt", async () => {
+  const f = fixture(), { adapter } = port("settings");
+  try {
+    f.store.inbox.planReply(f.id, result, result.messages[0]);
+    await assert.rejects(adapter.streamReply(message, async update => { await update(result.messages[0]); }, async event => { f.store.inbox.recordReplyDelivery(f.id, event); }));
+    const uncertain = f.store.inbox.finish(f.id, "failed");
+    const proof = { status: "confirmed" as const, messageId: "reply", elementId: "arkagent_stream_md", contentFingerprint: hash(result.messages[0]), observedAt: Date.now() };
+    assert.throws(() => f.store.inbox.recordReplyInspection(uncertain, proof), /核查/);
+    const inspected = f.store.inbox.recordInspection(uncertain, { status: "ended", anchorEventId: "a", terminalEventId: "b", result });
+    proof.observedAt = Date.now();
+    for (const bad of [{ ...proof, messageId: "other" }, { ...proof, elementId: "other" }, { ...proof, contentFingerprint: hash("wrong") },
+      { ...proof, observedAt: Date.now() - 31000 }, { ...proof, observedAt: inspected.inspection!.checkedAt - 1 }, { ...proof, observedAt: Date.now() + 60000 }])
+      assert.throws(() => f.store.inbox.recordReplyInspection(inspected, bad), /回复/);
+    const saved = f.store.inbox.recordReplyInspection(inspected, proof);
+    assert.equal(saved.replyConfirmed, true); assert.equal(saved.delivery?.phase, "completed");
+    assert.equal(saved.replyInspection?.status, "confirmed");
+    assert.throws(() => f.store.inbox.recordReplyInspection(inspected, proof), /版本/);
+    assert.equal(f.store.inbox.settleInspection(saved).state, "completed");
+  } finally { f.close(); }
+});
+
+test("unsupported or unattempted delivery cannot request remote final confirmation", () => {
+  assert.equal(replyInspectionQuery(undefined, hash("final")), undefined);
+  for (const mode of ["message", "sdk_stream"] as const) assert.equal(replyInspectionQuery({ mode, phase: "sent", sequence: 0, messageIds: ["reply"] }, hash("final")), undefined);
+  assert.equal(replyInspectionQuery({ mode: "native_card", phase: "sent", sequence: 0, messageIds: ["reply"], elementId: "body" }, hash("final")), undefined);
+  assert.equal(replyInspectionQuery({ mode: "native_card", phase: "finalizing", sequence: 2, messageIds: ["reply"], elementId: "body", contentFingerprint: hash("partial") }, hash("final")), undefined);
+});
+
+for (const lost of ["content", "settings"] as const) test(`Gateway recovers remote ${lost} success with lost acknowledgement without writes`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ark-remote-delivery-")), path = join(dir, "gateway.db");
+  const store = new GatewayStore(path); store.acquireRuntimeLock(); const { adapter, channel, writes } = port();
+  let text = "Thinking...", streaming = true, gets = 0, runs = 0;
+  channel.rawClient!.im.message = { list: async () => ({}), get: async () => {
+    gets++; return { code: 0, data: { items: [{ message_id: "reply", chat_id: "chat", deleted: false, msg_type: "interactive",
+      sender: { id: "cli", id_type: "app_id", sender_type: "app", tenant_key: "tenant" },
+      body: { content: JSON.stringify({ schema: "2.0", config: { streaming_mode: streaming }, body: { elements: [{ tag: "markdown", element_id: "arkagent_stream_md", content: text }] } }) } }] } };
+  } };
+  channel.rawClient!.cardkit!.v1!.cardElement!.content = async (payload: any) => { writes.push("content"); text = payload.data.content; if (lost === "content") throw new Error("response lost"); return { code: 0 }; };
+  channel.rawClient!.cardkit!.v1!.card!.settings = async () => { writes.push("settings"); streaming = false; if (lost === "settings") throw new Error("response lost"); return { code: 0 }; };
+  try {
+    const gateway = new Gateway(store, { createSession: async () => "session", run: async () => { runs++; return result; } }, async () => {},
+      { ...options, streamReply: adapter.streamReply.bind(adapter) });
+    gateway.accept(message); await until(() => store.inbox.findMessage(message)?.state === "uncertain");
+    assert.equal(store.inbox.findMessage(message)!.replyConfirmed, undefined); const before = writes.length;
+    store.close(); const reopened = new GatewayStore(path); reopened.acquireRuntimeLock();
+    try {
+      const recovered = new Gateway(reopened, { createSession: async () => { throw new Error("must not create"); },
+        run: async () => { runs++; throw new Error("must not run"); }, inspectRun: async () => ({ status: "ended", anchorEventId: "a", terminalEventId: "b", result }) },
+        async () => { throw new Error("must not send"); }, { ...options, inspectReply: adapter.inspectReply.bind(adapter) });
+      await Promise.all([recovered.reconcilePendingMessage(message), recovered.reconcilePendingMessage(message)]);
+      const task = reopened.inbox.findMessage(message)!;
+      assert.equal(task.state, "completed"); assert.equal(task.replyInspection?.status, "confirmed");
+      assert.equal(runs, 1); assert.equal(gets, 1); assert.equal(writes.length, before);
+    } finally { reopened.close(); }
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("unknown remote reply stays blocked and can be inspected again without business replay", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ark-reply-unknown-")), path = join(dir, "gateway.db");
+  const store = new GatewayStore(path); store.acquireRuntimeLock(); const { adapter } = port("settings");
+  try {
+    new Gateway(store, { createSession: async () => "session", run: async () => result }, async () => {},
+      { ...options, streamReply: adapter.streamReply.bind(adapter) }).accept(message);
+    await until(() => store.inbox.findMessage(message)?.state === "uncertain");
+    let lookups = 0;
+    const recovered = new Gateway(store, { createSession: async () => { throw new Error("unexpected create"); }, run: async () => { throw new Error("unexpected run"); },
+      inspectRun: async () => ({ status: "ended", anchorEventId: "a", terminalEventId: "b", result }) }, async () => { throw new Error("unexpected send"); },
+      { ...options, inspectReply: async (_m, query) => {
+        lookups++;
+        if (lookups === 1) throw new Error("upstream-secret");
+        return { status: "confirmed", messageId: query.messageId, elementId: query.elementId, contentFingerprint: query.contentFingerprint, observedAt: Date.now() };
+      } });
+    await recovered.reconcilePendingMessage(message);
+    const task = store.inbox.findMessage(message)!;
+    assert.equal(task.state, "uncertain"); assert.deepEqual(task.replyInspection, { status: "unknown", reason: "unavailable" });
+    assert.equal(task.replyConfirmed, undefined);
+    await recovered.reconcilePendingMessage(message);
+    assert.equal(store.inbox.findMessage(message)!.state, "completed"); assert.equal(lookups, 2);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const change of ["revision", "session"] as const) test(`late remote proof cannot overwrite a changed ${change}`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ark-reply-cas-")), path = join(dir, "gateway.db");
+  const store = new GatewayStore(path); store.acquireRuntimeLock(); const { adapter } = port("settings");
+  try {
+    new Gateway(store, { createSession: async () => "session", run: async () => result }, async () => {},
+      { ...options, streamReply: adapter.streamReply.bind(adapter) }).accept(message);
+    await until(() => store.inbox.findMessage(message)?.state === "uncertain");
+    const recovered = new Gateway(store, { createSession: async () => "unexpected", run: async () => result,
+      inspectRun: async () => ({ status: "ended", anchorEventId: "a", terminalEventId: "b", result }) }, async () => {},
+      { ...options, inspectReply: async (_m, query) => {
+        if (change === "revision") store.recordMessageInspection(store.inbox.findMessage(message)!, { status: "unknown", reason: "history_unavailable" });
+        else store.saveSession(toConversationKey(message, true), "replacement", "agent");
+        return { status: "confirmed", messageId: query.messageId, elementId: query.elementId, contentFingerprint: query.contentFingerprint, observedAt: Date.now() };
+      } });
+    await recovered.reconcilePendingMessage(message);
+    assert.equal(store.inbox.findMessage(message)!.state, "uncertain");
+    assert.equal(store.inbox.findMessage(message)!.replyConfirmed, undefined);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("real process exits after remote settings effect before acknowledgement and GET recovers it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ark-reply-remote-crash-")), path = join(dir, "gateway.db");
+  const worker = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", `
+    import {GatewayStore} from './src/store.ts'; import {Gateway} from './src/gateway.ts'; import {LarkChannelAdapter} from './src/lark-channel.ts';
+    const store=new GatewayStore(${JSON.stringify(path)});store.acquireRuntimeLock();let text='Thinking...';
+    const adapter=new LarkChannelAdapter({appId:'cli',appSecret:'',streaming:{intervalMs:1,minChunkChars:100,maxSteps:1,printFrequencyMs:1,printStep:100,settlePaddingMs:0},
+      channel:{createCard:async()=>({cardId:'card'}),send:async()=>({messageId:'reply'}),rawClient:{im:{},cardkit:{v1:{
+        cardElement:{content:async p=>{text=p.data.content;return {code:0}}},card:{settings:async()=>{
+          process.stdout.write(JSON.stringify({schema:'2.0',config:{streaming_mode:false},body:{elements:[{tag:'markdown',element_id:'arkagent_stream_md',content:text}]}}));process.exit(78);
+        }}}}}}});
+    new Gateway(store,{createSession:async()=>"session",run:async()=>(${JSON.stringify(result)})},async()=>{},
+      {...${JSON.stringify(options)},streamReply:adapter.streamReply.bind(adapter)}).accept(${JSON.stringify(message)});setTimeout(()=>process.exit(9),2000);
+  `], { cwd: process.cwd(), encoding: "utf8", timeout: 5000 });
+  try {
+    assert.equal(worker.status, 78, worker.stderr); const remoteCard = JSON.parse(worker.stdout);
+    const store = new GatewayStore(path); store.acquireRuntimeLock(); let reads = 0;
+    try {
+      assert.equal(store.inbox.findMessage(message)!.delivery?.phase, "finalizing");
+      assert.equal(store.inbox.findMessage(message)!.replyConfirmed, undefined);
+      const { adapter, channel, writes } = port();
+      channel.rawClient!.im.message = { list: async () => ({}), get: async () => { reads++; return { code: 0, data: { items: [{ message_id: "reply",
+        chat_id: "chat", msg_type: "interactive", deleted: false, sender: { id: "cli", id_type: "app_id", sender_type: "app", tenant_key: "tenant" }, body: { content: JSON.stringify(remoteCard) } }] } }; } };
+      const gateway = new Gateway(store, { createSession: async () => { throw new Error("must not create"); }, run: async () => { throw new Error("must not run"); },
+        inspectRun: async () => ({ status: "ended", anchorEventId: "a", terminalEventId: "b", result }) }, async () => { throw new Error("must not send"); },
+        { ...options, inspectReply: adapter.inspectReply.bind(adapter) });
+      gateway.recoverPendingMessages("lark", "cli");
+      await until(() => store.inbox.findMessage(message)?.state === "completed");
+      assert.equal(reads, 1); assert.deepEqual(writes, []);
+      assert.equal(store.inbox.findMessage(message)?.replyInspection?.status, "confirmed");
+    } finally { store.close(); }
+    const reloaded = new GatewayStore(path); reloaded.acquireRuntimeLock();
+    try { assert.equal(reloaded.inbox.findMessage(message)?.replyInspection?.status, "confirmed"); }
+    finally { reloaded.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -99,6 +99,11 @@
 性能观察：真实SQLite与模拟CardKit做30组交替对照，1800字符/10次正文更新，每轮13次模拟外部写入，启用检查点不增加外部写请求。无检查点P50/P95=14.260/14.964ms，有检查点=17.692/21.268ms，同步检查点自身P50/P95=3.371/6.546ms。1ms模拟渲染放大本地开销，P95约增加6.3ms（约42%），不能当默认80ms渲染或真实用户P95，不能宣称性能门槛已完成。脚本scripts/probe-reply-checkpoints.mjs可重跑。
 发现及边界：安装的Channel SDK 0.4.1流式completeTerminal吞掉部分更新/finishStreamingCard错误且仅返回首条messageId，因此SDK流式回退只记录已知ID，实验队列不接受其最终确认；无observer保持原行为。默认原生CardKit路径严格验证content/settings业务码。接口已生效但响应/本地确认丢失后的远程消息/卡片核查、准备阶段副作用、用户处理入口、CLI默认接入、真实外部E2E和性能继续未完成。没有发布或部署。证据见docs/test-results/reply-delivery-2026-09-16.json。
 
+原生卡片远程投递核查增量（2026-09-16，本地基线7950cfd）：依据飞书官方消息GET/列表markdown规范，新增ChannelInspectReply和原生单卡片查询。只使用已持久化messageId与elementId、已尝试提交的最终正文指纹；GET请求显式选择user_card_content。严格验证业务code、单条响应、应用/租户/chat/thread、未撤回、schema2.0单markdown元素、正文SHA-256一致及streaming_mode=false。缺字段、扁平内容、权限/网络失败、取消、超限响应、多个元素均不造最终确认。Gateway只在原MA运行结束后查询，等待上限5秒；保存前再次校验Session绑定及Inbox revision/dispatchId，证明必须晚于本轮运行核查且30秒内有效。成功保存加密proof后可结束原任务，不重跑MA、不写飞书，正常回复路径不增加查询。CLI接线但实验队列仍未默认开启。
+验证：先增加缺失模块/导出的失败测试，再实现；新增29项，全量525/525通过（3286.53875ms），零失败/跳过，check（语法）、build、diff通过。含实际Node子进程在模拟CardKit settings服务端已生效但未返回时exit(78)，重启从finalizing读取检查点，经一次只读消息GET确认并结束，零MA重放/零额外飞书写入。另测content响应丢失、settings响应丢失、并发核查去重、权限失败后重查、迟到结果遇到revision/Session变化、错误身份/群/话题/正文、streaming占位、过期及早于运行核查的证明、加密证明重开可读。外部MA/CardKit故障为模拟。普通沙箱全量仅WebUI回环EPERM，允许本机监听后完整通过。
+真实只读证据：现有Bot群消息列表934.5ms、单条GET616.3ms，已更新卡片返回schema2.0、唯一markdown元素683字符、streaming_mode=false，列表与单条正文哈希一致；新增inspectLarkReply直接访问同一消息返回confirmed（695.4ms）。仅证明已更新卡片读取契约与实现兼容，没有新增/修改消息，没有真实故障注入，不作为完整外部E2E或P95性能验收。证据docs/test-results/reply-inspection-2026-09-16.json。
+未完成：无messageId的发送结果、普通/分片消息、SDK fallback、未关闭流式卡片的受控收尾、准备阶段副作用、人工处理入口、CLI默认启用与真实端到端/性能验收。没有发布或部署；其余Stage保持原范围。
+
 ## Stage 4: 文件终态与平台扩展
 **Goal**: 附件阶段追踪、运行与交付状态区分、早停准确反馈；验证upgrade与动态MemoryStore契约后接入。
 **Success Criteria**: F01-F05、U01；未证实接口不伪实现；客户PDF问题未复现不关单。

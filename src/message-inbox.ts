@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { ChannelMessage, ReplyDeliveryEvent } from "./channel.ts";
-import { advanceReplyDelivery, replyContentFingerprint, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
+import type { ChannelMessage, ReplyDeliveryEvent, ReplyObservation } from "./channel.ts";
+import { advanceReplyDelivery, replyContentFingerprint, replyInspectionQuery, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
 import type { CredentialStateStore } from "./credential-state.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
 
@@ -16,6 +16,7 @@ export type InboxTask = {
   dispatchId?: string;
   replyIntent?: { resultFingerprint: string; contentFingerprint: string };
   delivery?: ReplyDeliveryState;
+  replyInspection?: ReplyObservation;
   inspection?: { checkedAt: number; observation: RunInspection };
 };
 type Row = Record<string, unknown>;
@@ -95,7 +96,7 @@ export class MessageInbox {
   dispatched(id: string, sessionId: string, requestFingerprint: string): InboxTask {
     const task = this.owned(id);
     if (task.state !== "preparing" || !sessionId || !requestFingerprint) throw new Error("任务状态不允许记录派发");
-    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, inspection: undefined });
+    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, replyInspection: undefined, inspection: undefined });
   }
 
   planReply(id: string, result: RunResult, text: string, dispatchId?: string): InboxTask {
@@ -144,6 +145,24 @@ export class MessageInbox {
     return this.save(task, { ...task, owner: this.runtimeOwner(), state: "completed" });
   }
 
+  recordReplyInspection(expected: InboxTask, observation: ReplyObservation): InboxTask {
+    const task = this.expectedUncertain(expected), run = task.inspection, now = Date.now();
+    const query = replyInspectionQuery(task.delivery, task.replyIntent?.contentFingerprint);
+    if (!task.dispatchId || !query || !run || run.observation.status !== "ended" || run.observation.result.authorizationRequired
+      || now - run.checkedAt > 30_000 || task.replyIntent!.resultFingerprint !== this.resultFingerprint(run.observation.result)) throw new Error("原运行核查或回复意图不足以确认投递");
+    if (observation.status === "unknown") {
+      if (!["unsupported", "unavailable", "invalid_response", "identity_mismatch", "content_mismatch", "streaming", "cancelled"].includes(observation.reason)) throw new Error("回复核查原因无效");
+      return this.save(task, { ...task, replyInspection: { status: "unknown", reason: observation.reason } });
+    }
+    if (observation.status !== "confirmed" || observation.messageId !== query.messageId || observation.elementId !== query.elementId
+      || observation.contentFingerprint !== query.contentFingerprint || !Number.isSafeInteger(observation.observedAt)
+      || observation.observedAt < run.checkedAt || observation.observedAt > now || now - observation.observedAt > 30_000) throw new Error("回复核查证明过期或不匹配");
+    const proof: ReplyObservation = { status: "confirmed", messageId: query.messageId, elementId: query.elementId,
+      contentFingerprint: query.contentFingerprint, observedAt: observation.observedAt };
+    return this.save(task, { ...task, replyInspection: proof, replyConfirmed: true, replyResultFingerprint: task.replyIntent!.resultFingerprint,
+      delivery: { ...task.delivery!, phase: "completed", contentFingerprint: query.contentFingerprint, pendingContentFingerprint: undefined } });
+  }
+
   hasBlockingTasks(message: ChannelMessage, binding: InboxBinding): boolean {
     this.runtimeOwner();
     return Boolean(this.db.prepare(`SELECT 1 FROM gateway_message_inbox WHERE channel_type=? AND installation_id=? AND scope=?
@@ -154,7 +173,7 @@ export class MessageInbox {
     this.runtimeOwner();
     const current = this.get(expected.id);
     if (!current || current.state !== "uncertain" || current.revision !== expected.revision
-      || current.sessionId !== expected.sessionId || current.requestFingerprint !== expected.requestFingerprint
+      || current.sessionId !== expected.sessionId || current.requestFingerprint !== expected.requestFingerprint || current.dispatchId !== expected.dispatchId
       || current.binding.scope !== expected.binding.scope || current.binding.agentId !== expected.binding.agentId
       || current.binding.configFingerprint !== expected.binding.configFingerprint) throw new Error("待核查任务版本或绑定已变化");
     return current;
@@ -241,7 +260,7 @@ export class MessageInbox {
 
   private encode(task: InboxTask): string {
     const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint,
-      dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, inspection: task.inspection };
+      dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection };
     return this.credentials.sealAuthorization(JSON.stringify(payload), this.context({ ...task,
       eventKey: this.eventKey(task.message), channelType: task.message.channelType, installationId: task.message.installationId }));
   }
@@ -256,7 +275,7 @@ export class MessageInbox {
     const cleartext = this.credentials.openAuthorization(String(row.secret), this.context({ ...metadata,
       eventKey: String(row.event_key), channelType: String(row.channel_type), installationId: String(row.installation_id) }));
     let message: ChannelMessage;
-    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "inspection"> = {};
+    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection"> = {};
     try {
       const payload = JSON.parse(cleartext);
       // 旧密文仅包含ChannelMessage，首次状态更新时升级；不补造旧回复的送达证明。
@@ -269,9 +288,17 @@ export class MessageInbox {
         if (payload.replyIntent && (!validReplyFingerprint(payload.replyIntent.resultFingerprint) || !validReplyFingerprint(payload.replyIntent.contentFingerprint))) throw new Error("invalid intent");
         if (payload.delivery && payload.replyConfirmed && (payload.delivery.phase !== "completed" || !payload.replyIntent
           || payload.replyIntent.resultFingerprint !== payload.replyResultFingerprint || payload.delivery.contentFingerprint !== payload.replyIntent.contentFingerprint)) throw new Error("invalid delivery confirmation");
+        if (payload.replyInspection) {
+          const proof = payload.replyInspection;
+          if (proof.status === "confirmed") {
+            if (!payload.replyConfirmed || proof.contentFingerprint !== payload.replyIntent?.contentFingerprint
+              || payload.delivery?.messageIds?.length !== 1 || proof.messageId !== payload.delivery.messageIds[0]
+              || proof.elementId !== payload.delivery.elementId || !Number.isSafeInteger(proof.observedAt) || proof.observedAt <= 0) throw new Error("invalid remote receipt");
+          } else if (proof.status !== "unknown" || !["unsupported", "unavailable", "invalid_response", "identity_mismatch", "content_mismatch", "streaming", "cancelled"].includes(proof.reason)) throw new Error("invalid remote inspection");
+        }
         checkpoint = { ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}),
           ...(payload.dispatchId ? { dispatchId: payload.dispatchId } : {}), ...(payload.replyIntent ? { replyIntent: payload.replyIntent } : {}),
-          ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}) };
+          ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.replyInspection ? { replyInspection: payload.replyInspection } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}) };
       } else message = payload;
     }
     catch { throw new Error("持久化消息结构损坏，未恢复任务"); }

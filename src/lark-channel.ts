@@ -3,7 +3,8 @@ import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMess
 import { replyContentFingerprint } from "./reply-delivery.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
 import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
-import type { ReactionQuery, ReactionObservation } from "./channel.ts";
+import { inspectLarkReply } from "./lark-reply-inspection.ts";
+import type { ReactionQuery, ReactionObservation, ReplyInspectionQuery, ReplyObservation } from "./channel.ts";
 
 type RawLarkMessage = {
   event_id?: string;
@@ -261,6 +262,11 @@ export class LarkChannelAdapter implements ChannelAdapter {
   async inspectReaction(message: ChannelMessage, query: ReactionQuery, signal: AbortSignal): Promise<ReactionObservation> {
     if (!this.channel.rawClient) return { status: "unknown" };
     return inspectLarkReaction(this.channel.rawClient, this.installationId, message, query, signal);
+  }
+
+  async inspectReply(message: ChannelMessage, query: ReplyInspectionQuery, signal: AbortSignal): Promise<ReplyObservation> {
+    if (!this.channel.rawClient) return { status: "unknown", reason: "unsupported" };
+    return inspectLarkReply(this.channel.rawClient, this.installationId, message, query, signal);
   }
 
   async download(resource: ChannelResource, message: ChannelMessage, remainingBytes = this.maxFileBytes): Promise<{ bytes: Uint8Array; mimeType: string }> {
