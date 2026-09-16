@@ -12,6 +12,7 @@ import { authorizationContinuation, authorizationRecoveryDecision, type RunEvide
 import type { InboxBinding, InboxTask } from "./message-inbox.ts";
 import type { AttachmentStage, AttachmentStageDetails } from "./attachment-trace.ts";
 import { ArkHttpError } from "./ark.ts";
+import { failureDiagnostic } from "./ark-errors.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -793,7 +794,7 @@ export class Gateway {
         }));
         try { sessionId = await this.ark.createSession(request); }
         catch (error) {
-          for (const mount of mounts) this.store.attachmentTrace.finish(mount.id, "error");
+          for (const mount of mounts) this.store.attachmentTrace.finish(mount.id, "error", { failure: failureDiagnostic(error) });
           throw error;
         }
         for (const mount of mounts) this.store.attachmentTrace.finish(mount.id, "succeeded", { sessionId });
@@ -1331,8 +1332,8 @@ export class Gateway {
     let file: { id: string; name: string };
     try { file = await this.ark.uploadFile(name, downloaded!.mimeType, downloaded!.bytes, { uploadName: intent.uploadName! }); }
     catch (error) {
-      this.store.attachmentTrace.finish(intent.id, "error", error instanceof ArkHttpError && error.status === 400
-        && error.code === "InvalidParameter" ? { rejected: true } : {});
+      this.store.attachmentTrace.finish(intent.id, "error", { failure: failureDiagnostic(error),
+        ...(error instanceof ArkHttpError && error.status === 400 && error.code === "InvalidParameter" ? { rejected: true as const } : {}) });
       throw error;
     }
     // 本地保存失败不改写成“远端上传失败”；下一次先核查此操作，不重传。
@@ -1350,8 +1351,8 @@ export class Gateway {
     try { value = await operation(); }
     catch (error) {
       // 不保存上游原始错误，可能包含请求正文、下载URL或凭证。
-      this.store.attachmentTrace.finish(id, "error", stage === "mount" && error instanceof ArkHttpError
-        && error.status === 400 && error.code === "InvalidParameter" ? { rejected: true } : {});
+      this.store.attachmentTrace.finish(id, "error", { failure: failureDiagnostic(error),
+        ...(stage === "mount" && error instanceof ArkHttpError && error.status === 400 && error.code === "InvalidParameter" ? { rejected: true as const } : {}) });
       throw error;
     }
     // 与远端调用分开：本地落盘失败不能伪装成远端明确失败。

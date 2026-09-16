@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { GatewayStore } from "../src/store.ts";
 import { Gateway, type IncomingMessage } from "../src/gateway.ts";
-import { ArkHttpError } from "../src/ark.ts";
+import { ArkClient, ArkHttpError } from "../src/ark.ts";
 
 const key = "a".repeat(64);
 const message = (patch: Partial<IncomingMessage> = {}): IncomingMessage => ({
@@ -15,6 +15,46 @@ const message = (patch: Partial<IncomingMessage> = {}): IncomingMessage => ({
   conversationType: "direct", senderId: "user", eventId: "event", messageId: "message",
   threadId: "", rootMessageId: "", parentMessageId: "", createTime: 100,
   text: "分析文件", resources: [], mentionedBot: false, ...patch
+});
+
+for (const stage of ["upload", "mount", "create"] as const) test(`Gateway persists safe MA diagnostics for ${stage} failures after database reopen`, async () => {
+  const path = join(mkdtempSync(join(tmpdir(), "ark-error-trace-")), "gateway.db");
+  let store = new GatewayStore(path);
+  const replies: string[] = [];
+  const source = message({ messageId: "source", eventId: "source", createTime: 50, conversationType: stage === "mount" ? "group" : "direct",
+    resources: [{ id: "file", name: "a.pdf", type: "file" }] });
+  let calls = 0;
+  const client = new ArkClient("PRIVATE-KEY", "https://example.invalid", async () => {
+    calls++;
+    return new Response(JSON.stringify({ error: { code: "APIAccountRpmRateLimitExceeded", message: "PRIVATE-KEY FILE-CONTENT" } }),
+      { status: 429, headers: { "x-request-id": "request-trace-123" } });
+  });
+  const gateway = new Gateway(store, {
+    createSession: async request => stage === "create" ? client.createSession(request) : "session",
+    uploadFile: async (name, mime, bytes) => stage === "upload" ? client.uploadFile(name, mime, bytes) : { id: "file", name },
+    addSessionResource: async (id, resource) => client.addSessionResource(id, resource),
+    run: async () => ({ terminal: "idle", messages: ["完成"] })
+  }, async (_chat, content) => { replies.push(content); }, {
+    agentId: "agent", environmentId: "env", vaultId: "vault", timeoutMs: 1000, authorizedUserId: "user", platformAccess: true, sharedGroupSessions: true,
+    loadRecentHistory: async () => [{ messageId: source.messageId, senderId: "user", senderType: "user", source: "chat", text: "附件", createTime: 50, resources: source.resources }],
+    downloadAttachment: async () => ({ bytes: new Uint8Array([1]), mimeType: "application/pdf" })
+  });
+  await execute(gateway, stage === "mount" ? message({ conversationType: "group", mentionedBot: true }) : source, replies);
+  store.close(); store = new GatewayStore(path);
+  const record = store.attachmentTrace.list(source).items.find(item => item.status === "error")!;
+  assert.equal(record.stage, stage === "upload" ? "upload" : "mount");
+  assert.deepEqual(record.failure, { kind: "rate_limit", status: 429, code: "APIAccountRpmRateLimitExceeded", requestId: "request-trace-123" });
+  assert.equal(record.rejected, undefined); assert.equal(calls, 1);
+  assert.doesNotMatch(JSON.stringify(record) + replies.join(""), /PRIVATE-KEY|FILE-CONTENT/);
+  store.close();
+});
+
+test("attachment failure metadata drops unknown fields and invalid diagnostic values", () => {
+  const store = new GatewayStore(":memory:");
+  const id = store.attachmentTrace.begin(message(), key, "download");
+  store.attachmentTrace.finish(id, "error", { failure: { kind: "PRIVATE", status: 200, code: "https://SECRET", requestId: "bad\nID", message: "FILE-CONTENT", cause: "TOKEN" } } as never);
+  assert.deepEqual(store.attachmentTrace.list(message()).items[0].failure, { kind: "unknown" });
+  store.close();
 });
 
 test("attachment stages persist exact byte hashes without body or arbitrary error payload", () => {

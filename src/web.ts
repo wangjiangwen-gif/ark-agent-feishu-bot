@@ -169,7 +169,7 @@ function renderAttachmentRows(items){
     const tr=document.createElement('tr');
     const values=[new Date(x.startedAt).toLocaleString()+' / '+(x.durationMs==null?'耗时未知':x.durationMs+' ms'),
       x.messageId+' / '+x.conversationId+' / '+(x.threadId||'非话题')+' / 租户 '+x.tenantId,
-      x.attachmentKey+' / '+(stages[x.stage]||'未知阶段'),states[x.status]||'未知状态',
+      x.attachmentKey+' / '+(stages[x.stage]||'未知阶段'),(states[x.status]||'未知状态')+(x.failure?' / '+[x.failure.kind,x.failure.status,x.failure.code,x.failure.requestId?'request ID: '+x.failure.requestId:''].filter(Boolean).join(' / '):''),
       (x.fileId||'未记录 File ID')+' / '+(x.sessionId||'未记录 Session ID'),
       (x.mountPath||'未记录路径')+' / '+(x.bytes==null?'大小未知':x.bytes+' B')+' / '+(x.sha256||'未记录 Hash')];
     values.forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td)});return tr;

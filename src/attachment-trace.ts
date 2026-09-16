@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { sanitizeFailure, type FailureDiagnostic } from "./ark-errors.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { ChannelMessage } from "./channel.ts";
 import { validMountQuery, type FileMountProof } from "./mount-inspection.ts";
 import { newUploadName, validUploadName, validUploadQuery, type FileUploadProof } from "./upload-inspection.ts";
 
 export type AttachmentStage = "download" | "upload" | "upload_check" | "mount" | "mount_check" | "inline" | "cache";
-export type AttachmentStageDetails = { bytes?: number; sha256?: string; fileId?: string; mountPath?: string; sessionId?: string; resourceId?: string; checkedAt?: number; rejected?: true; uploadName?: string };
+export type AttachmentStageDetails = { bytes?: number; sha256?: string; fileId?: string; mountPath?: string; sessionId?: string; resourceId?: string; checkedAt?: number; rejected?: true; uploadName?: string; failure?: FailureDiagnostic };
 export type AttachmentStageReceipt = AttachmentStageDetails & {
   id: string; sequence: number; attachmentKey: string; stage: AttachmentStage;
   status: "pending" | "succeeded" | "error"; startedAt: number; finishedAt?: number; durationMs?: number;
@@ -15,6 +16,7 @@ export type AttachmentDiagnostic = AttachmentStageReceipt & { tenantId: string; 
 
 function details(value: AttachmentStageDetails): AttachmentStageDetails {
   const result: AttachmentStageDetails = {};
+  if (value.failure !== undefined) result.failure = sanitizeFailure(value.failure);
   if (value.bytes !== undefined) {
     if (!Number.isSafeInteger(value.bytes) || value.bytes < 0) throw new Error("附件大小无效");
     result.bytes = value.bytes;

@@ -1,15 +1,9 @@
 import { createHash } from "node:crypto";
+import { ArkHttpError, ArkNetworkError, safeErrorCode, safeRequestId } from "./ark-errors.ts";
+export { ArkHttpError } from "./ark-errors.ts";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
 import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
 import { inspectUploadedFile, validUploadName, type FileUploadQuery, type FileUploadInspection } from "./upload-inspection.ts";
-
-export class ArkHttpError extends Error {
-  status: number;
-  code?: string;
-  constructor(message: string, status: number, code?: string) {
-    super(message); this.name = "ArkHttpError"; this.status = status; this.code = code;
-  }
-}
 
 export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; processed_at?: string };
 
@@ -139,6 +133,7 @@ export class ArkClient {
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
     const method = init.method || "GET";
+    const signal = init.signal || AbortSignal.timeout(30_000);
     let response: Response;
     try {
       response = await this.fetcher(`${this.baseUrl}${path}`, {
@@ -149,20 +144,26 @@ export class ArkClient {
           ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
           ...init.headers
         },
-        signal: init.signal || AbortSignal.timeout(30_000)
+        signal
       });
     } catch (error) {
-      throw new Error(`方舟网络请求失败（${method} ${path}）：${networkErrorDetail(error)}`, { cause: error });
+      const operation = `${method} ${path.split("?")[0]}`.replaceAll(this.apiKey, "[redacted]");
+      throw new ArkNetworkError(operation, signal.aborted ? signal.reason : error);
     }
     if (!response.ok) {
-      const requestId = response.headers.get("x-request-id");
-      const body = await response.text();
+      const redactKnownSecret = (value: string | undefined): string | undefined => value && !value.includes(this.apiKey) ? value : undefined;
+      const requestId = redactKnownSecret(safeRequestId(response.headers.get("x-request-id")));
       let code: string | undefined;
+      let hint = "";
       try {
+        const body = await boundedHistoryBody(response, 64 * 1024,
+          AbortSignal.any([signal, AbortSignal.timeout(Math.min(5_000, this.options.inspectionTimeoutMs))]));
+        // 兼容旧版纯文本格式错误，只提取固定提示，绝不复制上下文或据此认定可重试。
+        if (path === "/files" && response.status === 400 && /file type not supported/i.test(body)) hint = ": file type not supported";
         const parsed = JSON.parse(body);
-        if (typeof parsed?.error?.code === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(parsed.error.code)) code = parsed.error.code;
-      } catch { /* 非JSON错误不提供结构化拒绝证明。 */ }
-      throw new ArkHttpError(`方舟请求失败 ${response.status}${requestId ? ` (${requestId})` : ""}: ${body.slice(0, 300)}`, response.status, code);
+        code = redactKnownSecret(safeErrorCode(parsed?.error?.code));
+      } catch { /* 不完整、超限或非JSON响应不提供结构化拒绝证明。 */ }
+      throw new ArkHttpError(`方舟请求失败 ${response.status}${code ? ` ${code}` : ""}${requestId ? ` (${requestId})` : ""}${hint}`, response.status, code, requestId);
     }
     return response;
   }
@@ -705,6 +706,9 @@ async function boundedHistoryBody(response: Response, maxBytes: number, signal?:
     }
     parts.push(decoder.decode());
     return parts.join("");
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
   } finally {
     signal?.removeEventListener("abort", abort);
     reader.releaseLock();
@@ -769,12 +773,6 @@ function validateSessionCreateRequest(request: SessionCreateRequest): void {
   if (hasEnvironment === hasEnvironmentId) {
     throw new Error("environment 与 environment_id 必须且只能传一个");
   }
-}
-
-function networkErrorDetail(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  const cause = error.cause instanceof Error ? error.cause.message : typeof error.cause === "string" ? error.cause : "";
-  return [error.message, cause].filter(Boolean).join("；").slice(0, 180);
 }
 
 function waitFor(ms: number, signal: AbortSignal): Promise<void> {

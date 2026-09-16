@@ -185,6 +185,23 @@ async function pageScript(base: string) {
   return { context, select };
 }
 
+test("attachment HTTP diagnostics and actual UI script expose safe request identifiers without raw errors", async () => {
+  await withWeb(async (store, base) => {
+    const id = store.attachmentTrace.begin(message, key, "upload");
+    store.attachmentTrace.finish(id, "error", { failure: { kind: "permission", status: 403, code: "AccessDenied", requestId: "request-123", message: "SECRET" } } as never);
+    const response = await fetch(base + "/api/employees/agent/attachments", { headers });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.doesNotMatch(JSON.stringify(payload), /SECRET|PRIVATE-CONTENT/);
+    const { context, select } = await pageScript(base);
+    context.items = payload.items;
+    runInContext("renderAttachmentRows(items)", context);
+    const status = select("#attachment-body").children[0].children[3].textContent;
+    assert.match(status, /不代表远端未写入/);
+    assert.match(status, /permission.*403.*AccessDenied.*request ID: request-123/);
+  });
+});
+
 test("actual UI script renders hostile resource values as text and never equates mounts with understanding", async () => {
   await withWeb(async (store, base) => {
     const malicious = '<img src=x onerror="throw 1">';
