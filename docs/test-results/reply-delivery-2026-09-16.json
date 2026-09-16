@@ -1,0 +1,41 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "2937dcc",
+  "scope": "本地回复投递检查点及进程退出恢复增量，不是完整外部端到端验收",
+  "newTests": 16,
+  "redEvidence": "首批10项中7项失败：缺少planReply/recordReplyDelivery、未等待检查点、Gateway崩溃窗口无送达证明；随后实现并扩展测试",
+  "fullSuite": {
+    "command": "npm test",
+    "passed": 496,
+    "failed": 0,
+    "skipped": 0,
+    "durationMs": 2486.772542,
+    "environmentNote": "普通沙箱仅WebUI监听127.0.0.1触发EPERM；允许本机监听后完整通过，不访问真实MA/飞书"
+  },
+  "gates": { "syntaxCheck": "passed", "build": "passed", "gitDiffCheck": "passed", "fullTypeCheck": "未执行，现有check仅语法检查" },
+  "integration": {
+    "realComponents": ["Gateway", "LarkChannelAdapter", "SQLite", "加密存储", "Node子进程退出和重新打开数据库"],
+    "simulatedComponents": ["MA执行与只读inspectRun", "飞书CardKit创建/发送/正文/settings"],
+    "crash": "适配层completed检查点保存后、Gateway confirmMessageReply之前exit(77)",
+    "recovery": "启动时旧任务仍dispatched；一次原运行核查后completed；不创建Session、不重放MA、不发送回复",
+    "negativeCases": ["正文业务错误", "settings业务错误", "producer失败", "占位卡片", "授权提示", "正文与最终意图不同", "序号和ID不合法", "重复begin", "检查点失败先于外部写", "授权恢复后旧dispatchId回调", "SDK回退无最终确认"]
+  },
+  "benchmark": {
+    "command": "node --experimental-strip-types scripts/probe-reply-checkpoints.mjs",
+    "mode": "local_sqlite_mock_cardkit",
+    "samplesPerMode": 30,
+    "chars": 1800,
+    "mockRenderIntervalMs": 1,
+    "withoutCheckpoint": { "p50Ms": 14.259583, "p95Ms": 14.963625 },
+    "withCheckpoint": { "p50Ms": 17.692042, "p95Ms": 21.268458 },
+    "synchronousCheckpoint": { "p50Ms": 3.370955, "p95Ms": 6.545665 },
+    "mockWritesPerReply": 13,
+    "additionalExternalWrites": 0,
+    "interpretation": "模拟P95增加约6.3ms/42%，无网络/模型，不等于默认80ms渲染或真实用户性能；整体性能门槛未完成"
+  },
+  "sdkEvidence": "@larksuite/channel 0.4.1 dist/index.mjs MarkdownStreamControllerImpl.completeTerminal捕获收尾异常、run仅返回首条messageId；不能当最终送达证明",
+  "remaining": ["响应丢失的远程消息和卡片核查/补偿", "SDK流式回退的可靠投递路径", "准备阶段资源写入核查", "未知任务用户处理入口", "CLI默认启用前完整迁移/回退", "真实飞书与MA端到端", "全部场景真实性能对照", "其余完整方案未完成项"],
+  "externalMutations": false,
+  "published": false,
+  "deployed": false
+}

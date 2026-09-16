@@ -8,7 +8,8 @@ import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
 import { loadSessionConfiguration } from "./session-config.ts";
 import { startChannelAfterRecovery } from "./channel-startup.ts";
-import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource, ChannelInspectReaction } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource, ChannelInspectReaction, ReplyDeliveryObserver } from "./channel.ts";
+import { replyContentFingerprint } from "./reply-delivery.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -103,7 +104,7 @@ async function runEmployee(): Promise<void> {
     }
   );
   closeAuthorization = () => auth.close();
-  gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
+  gateway = new Gateway(store, ark, (message, outbound, observer) => channel.reply(message, outbound, observer), {
     appId: config.feishuAppId, sessionConfiguration,
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
@@ -198,7 +199,7 @@ async function run(): Promise<void> {
     await refreshing;
   };
   const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
-  const gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
+  const gateway = new Gateway(store, ark, (message, outbound, observer) => channel.reply(message, outbound, observer), {
     appId: config.feishuAppId, sessionConfiguration,
     agentId: config.arkAgentId,
     environmentId: config.arkEnvironmentId,
@@ -227,8 +228,8 @@ type FeishuRuntime = {
   transport: "channel" | "legacy";
   start(handler: (message: ChannelMessage) => void): Promise<void>;
   stop(): Promise<void>;
-  reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void>;
-  streamReply?: (message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
+  reply(message: ChannelMessage, outbound: ChannelOutbound, observer?: ReplyDeliveryObserver): Promise<void>;
+  streamReply?: (message: ChannelMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>, observer?: ReplyDeliveryObserver) => Promise<void>;
   addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
   inspectReaction?: ChannelInspectReaction;
@@ -247,8 +248,8 @@ async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (m
       transport,
       start: handler => adapter.start(handler),
       stop: () => adapter.stop(),
-      reply: (message, outbound) => adapter.reply(message, outbound),
-      streamReply: (message, producer) => adapter.streamReply(message, producer),
+      reply: (message, outbound, observer) => adapter.reply(message, outbound, observer),
+      streamReply: (message, producer, observer) => adapter.streamReply(message, producer, observer),
       addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
       removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
       inspectReaction: (message, query, signal) => adapter.inspectReaction?.(message, query, signal) || Promise.resolve({ status: "unknown" }),
@@ -267,11 +268,15 @@ async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (m
     transport,
     start: handler => startLegacyFeishuChannel({ appId, appSecret, onMessage: handler }),
     stop: async () => undefined,
-    reply: async (message, outbound) => {
+    reply: async (message, outbound, observer) => {
       const msgType = outbound.type === "card" ? "interactive" : "text";
       const content = outbound.type === "card" ? JSON.stringify(outbound.card) : JSON.stringify({ text: outbound.type === "markdown" ? outbound.markdown : outbound.text });
+      await observer?.({ type: "begin", mode: "message" });
+      await observer?.({ type: "sending" });
       const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: message.conversationId, msg_type: msgType, content } });
       assertLarkResponse(response, outbound.type === "card" ? "发送授权卡片" : "发送文本消息");
+      await observer?.({ type: "sent", messageIds: response.data?.message_id ? [response.data.message_id] : [] });
+      await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(outbound.type === "text" ? outbound.text : outbound.type === "markdown" ? outbound.markdown : JSON.stringify(outbound.card)) });
       if (response.data?.message_id) onSent?.(message, response.data.message_id);
     },
     loadRecentHistory: message => loadLarkRecentHistory(client, message),

@@ -1,5 +1,6 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
-import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource, ReplyDeliveryObserver } from "./channel.ts";
+import { replyContentFingerprint } from "./reply-delivery.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
 import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
 import type { ReactionQuery, ReactionObservation } from "./channel.ts";
@@ -118,9 +119,13 @@ export class LarkChannelAdapter implements ChannelAdapter {
     return this.channel.disconnect();
   }
 
-  async reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void> {
+  async reply(message: ChannelMessage, outbound: ChannelOutbound, observer?: ReplyDeliveryObserver): Promise<void> {
     const input = toLarkSendInput(outbound);
+    await observer?.({ type: "begin", mode: "message" });
+    await observer?.({ type: "sending" });
     const sent = await this.channel.send(message.conversationId, input, replyOptions(message));
+    await observer?.({ type: "sent", messageIds: [sent.messageId, ...(sent.chunkIds || [])].filter(Boolean) });
+    await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(outbound.type === "text" ? outbound.text : outbound.type === "markdown" ? outbound.markdown : JSON.stringify(outbound.card)) });
     for (const id of [sent.messageId, ...(sent.chunkIds || [])]) if (id) this.onSent?.(message, id);
   }
 
@@ -130,40 +135,55 @@ export class LarkChannelAdapter implements ChannelAdapter {
 
   async streamReply(
     message: ChannelMessage,
-    producer: (update: (snapshot: string) => Promise<void>) => Promise<void>
+    producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
+    observer?: ReplyDeliveryObserver
   ): Promise<void> {
     const cardkit = this.channel.rawClient?.cardkit?.v1;
     if (cardkit?.cardElement?.content && cardkit.card?.settings && typeof this.channel.createCard === "function") {
-      await this.streamNativeCardKit(message, producer, cardkit as Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>);
+      await this.streamNativeCardKit(message, producer, cardkit as Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>, observer);
       return;
     }
+    await observer?.({ type: "begin", mode: "sdk_stream" });
+    await observer?.({ type: "sending" });
     const sent = await this.channel.stream(message.conversationId, {
       markdown: async controller => progressivelyWriteMarkdown({
         append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
         setContent: controller.setContent.bind(controller)
       }, producer, this.streaming)
     }, replyOptions(message));
+    await observer?.({ type: "sent", messageIds: sent.messageId ? [sent.messageId] : [] });
+    // SDK 0.4.1会吞掉部分流式更新/收尾错误，只返回首条messageId；此回退不能提供最终送达证明。
+    // 无observer保持原行为；实验持久队列会保留未核实投递，不把SDK resolve当成原生接口确认。
     if (sent.messageId) this.onSent?.(message, sent.messageId);
   }
 
   private async streamNativeCardKit(
     message: ChannelMessage,
     producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
-    cardkit: Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>
+    cardkit: Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>,
+    observer?: ReplyDeliveryObserver
   ): Promise<void> {
     const elementId = "arkagent_stream_md";
+    await observer?.({ type: "begin", mode: "native_card" });
     const { cardId } = await this.channel.createCard(buildNativeStreamingCard(elementId, this.streaming));
+    await observer?.({ type: "card_created", cardId, elementId });
+    await observer?.({ type: "sending" });
     const sent = await this.channel.send(message.conversationId, { cardId }, replyOptions(message));
+    await observer?.({ type: "sent", messageIds: sent.messageId ? [sent.messageId] : [] });
     if (sent.messageId) this.onSent?.(message, sent.messageId);
     let sequence = 0;
     let content = "";
     let lastChunkChars = 0;
     const push = async (): Promise<void> => {
+      const contentFingerprint = replyContentFingerprint(content || STREAMING_PLACEHOLDER);
+      sequence++;
+      await observer?.({ type: "content_pending", sequence, contentFingerprint });
       const response = await cardkit.cardElement.content({
         path: { card_id: cardId, element_id: elementId },
-        data: { content: content || STREAMING_PLACEHOLDER, sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
+        data: { content: content || STREAMING_PLACEHOLDER, sequence, uuid: `c_${cardId}_${sequence}` }
       });
       assertCardKitSuccess(response, "content");
+      await observer?.({ type: "content_confirmed", sequence, contentFingerprint });
     };
 
     try {
@@ -185,6 +205,8 @@ export class LarkChannelAdapter implements ChannelAdapter {
           + this.streaming.settlePaddingMs;
         await wait(settleMs);
       }
+      sequence++;
+      await observer?.({ type: "finalizing", sequence });
       const response = await cardkit.card.settings({
         path: { card_id: cardId },
         data: {
@@ -192,12 +214,15 @@ export class LarkChannelAdapter implements ChannelAdapter {
             streaming_mode: false,
             summary: { content: summarizeCard(content) }
           } }),
-          sequence: ++sequence,
+          sequence,
           uuid: `s_${cardId}_${sequence}`
         }
       });
       assertCardKitSuccess(response, "settings");
+      await observer?.({ type: "finalized", sequence });
     }
+    // producer、正文更新或关闭流式任一失败，均不能到达最终送达确认。
+    await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(content || STREAMING_PLACEHOLDER) });
   }
 
   async addReaction(message: ChannelMessage, emojiType: string): Promise<string> {

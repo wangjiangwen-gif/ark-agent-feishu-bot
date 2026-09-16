@@ -1,7 +1,7 @@
 import type {
   ArkClient, RunInspection, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, SessionStats, UserAuthorizationRequired
 } from "./ark.ts";
-import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelInspectReaction, ReactionObservation } from "./channel.ts";
+import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelInspectReaction, ReactionObservation, ReplyDeliveryObserver } from "./channel.ts";
 import { buildConversationTurn, resolveReplyContext } from "./conversation-context.ts";
 import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, mergeSessionRequest, requestEnvironmentId, selectSessionRequest, validateSessionConfiguration, type SessionConfiguration, type SessionScope } from "./session-config.ts";
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
@@ -28,7 +28,7 @@ type SessionHandoff = { sourceSessionId: string; summary: string; source: "agent
 
 export type IncomingMessage = ChannelMessage;
 
-export type Reply = (message: IncomingMessage, outbound: ChannelOutbound) => Promise<void>;
+export type Reply = (message: IncomingMessage, outbound: ChannelOutbound, observer?: ReplyDeliveryObserver) => Promise<void>;
 
 export class KeyedQueue {
   private scopes = new Map<string, { running: boolean; paused: boolean; tasks: { run: () => Promise<void>; control: boolean }[]; priority: (() => Promise<void>)[] }>();
@@ -777,15 +777,21 @@ export class Gateway {
       // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result
       // 转成“执行进度：xxx”消息刷屏。
       let result: RunResult | undefined;
-      if (inboxId) this.store.dispatchMessage(inboxId, sessionId, createHash("sha256").update(input).digest("hex"));
+      let dispatchId: string | undefined;
+      if (inboxId) dispatchId = this.store.dispatchMessage(inboxId, sessionId, createHash("sha256").update(input).digest("hex")).dispatchId;
       else this.store.touchEvent(message, true);
       const withNotices = (text: string) => appendAttachmentNotices(text, notices);
+      const deliveryObserver: ReplyDeliveryObserver | undefined = inboxId ? async event => { this.store.inbox.recordReplyDelivery(inboxId, event, dispatchId); } : undefined;
       if (this.options.streamReply) {
         await this.options.streamReply(message, async update => {
           result = await this.ark.run(sessionId, input, this.options.timeoutMs, undefined, update);
           if (result.authorizationRequired) await update("此请求需要用户身份，正在准备授权会话…");
-          else await update(withNotices(resultToReply(result)));
-        });
+          else {
+            const text = withNotices(resultToReply(result));
+            if (inboxId) this.store.inbox.planReply(inboxId, result, text, dispatchId);
+            await update(text);
+          }
+        }, deliveryObserver);
       } else {
         result = await this.ark.run(sessionId, input, this.options.timeoutMs);
       }
@@ -805,8 +811,11 @@ export class Gateway {
       const finalReply = withNotices(resultToReply(result));
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
-      if (!this.options.streamReply) await this.replyText(message, finalReply);
-      if (inboxId) this.store.confirmMessageReply(inboxId, result);
+      if (!this.options.streamReply) {
+        if (inboxId) this.store.inbox.planReply(inboxId, result, finalReply, dispatchId);
+        await this.replyText(message, finalReply, deliveryObserver);
+      }
+      if (inboxId) this.store.confirmMessageReply(inboxId, result, dispatchId);
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
@@ -964,8 +973,8 @@ export class Gateway {
     });
   }
 
-  private replyText(message: IncomingMessage, text: string): Promise<void> {
-    return this.reply(message, { type: "text", text });
+  private replyText(message: IncomingMessage, text: string, observer?: ReplyDeliveryObserver): Promise<void> {
+    return this.reply(message, { type: "text", text }, observer);
   }
 
   private recentAuditHistory(message: IncomingMessage): ChannelHistoryMessage[] {
@@ -1218,7 +1227,7 @@ export type GatewayOptions = {
   sessionRotation?: false | { maxEvents?: number; maxInputTokens?: number };
   sessionStatsCheckIntervalMs?: number;
   sessionStatsTimeoutMs?: number;
-  streamReply?: (message: IncomingMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>) => Promise<void>;
+  streamReply?: (message: IncomingMessage, producer: (update: (snapshot: string) => Promise<void>) => Promise<void>, observer?: ReplyDeliveryObserver) => Promise<void>;
   addReaction?: (message: IncomingMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
   inspectReaction?: ChannelInspectReaction;

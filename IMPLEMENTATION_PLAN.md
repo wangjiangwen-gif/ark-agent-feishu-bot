@@ -94,6 +94,11 @@
 验证：新增22项，全量480/480通过（2539.933875ms），零失败/跳过，check（语法）、build、diff通过。新查询测试先模块缺失失败，恢复接入6项先失败后实现通过。覆盖完整分页、用户/其他Bot、时间窗口、未知/缺字段、取消、CAS、并发核查合并和原生适配器→Gateway→SQLite链路“发送响应丢失→找到ID→删除响应丢失→查询不存在”仅一次DELETE。真实只读读取当前配置AppID的已有审计消息，Get/OnIt均code=0、items=[]、has_more=false，分别594ms/415ms；只证明空列表响应兼容，未新增/删除表情、未发消息、未调用MA，不作为完整真实恢复E2E。网页工具无法解析官方markdown，字段依据CLI官方schema与安装SDK，本次未声称网页正文读取成功。
 边界：无ID且始终无匹配仍需明确处理入口；缺时间旧数据不自动接管；SDK查询物理取消尚不支持；真实有表情/响应丢失恢复、消息卡片投递核查、其余平台能力与性能验收继续未完成。证据见`docs/test-results/reaction-inspection-2026-09-16.json`。
 
+回复投递检查点增量（2026-09-16，本地基线2937dcc）：新增逐次调用ReplyDeliveryObserver与加密Inbox投递状态。原生卡片创建/发送/正文更新/流式关闭在外部操作前记录意图、成功后记录确认；保存cardId、elementId、messageIds、sequence、正文与运行结果指纹，不把onSent占位卡片回调当最终回复。最终正文与MA结果关联并确认后即可持久化replyConfirmed，覆盖适配层已成功但Gateway尚未完成的进程退出窗口。非流式回复保留全部chunkIds；CLI两种模式和legacy接线，不改变durableQueue默认关闭。每次派发生成独立dispatchId，异步回调和最终确认绑定该次派发，授权恢复即使复用相同Session/输入也拒绝旧回调。
+验证：先新增目标用例7项失败，实现后扩展至16项；全量496/496通过（2486.772542ms），无失败/跳过，check（语法）、build、diff通过。真实Gateway子进程在原生卡片最终检查点保存后、Gateway confirm之前立即exit(77)，重启读取dispatched记录、一次只读MA核查后结束任务，不创建Session、不运行MA、不发送回复。另覆盖正文/收尾业务错误、占位/授权、正文不一致、异步保存屏障、重复投递/序号、DB和WAL无明文、授权派发隔离、SDK回退不造最终确认。外部CardKit/MA模拟，未作为真实飞书E2E；普通沙箱全量仅WebUI回环监听EPERM，允许本机监听后完整通过。
+性能观察：真实SQLite与模拟CardKit做30组交替对照，1800字符/10次正文更新，每轮13次模拟外部写入，启用检查点不增加外部写请求。无检查点P50/P95=14.260/14.964ms，有检查点=17.692/21.268ms，同步检查点自身P50/P95=3.371/6.546ms。1ms模拟渲染放大本地开销，P95约增加6.3ms（约42%），不能当默认80ms渲染或真实用户P95，不能宣称性能门槛已完成。脚本scripts/probe-reply-checkpoints.mjs可重跑。
+发现及边界：安装的Channel SDK 0.4.1流式completeTerminal吞掉部分更新/finishStreamingCard错误且仅返回首条messageId，因此SDK流式回退只记录已知ID，实验队列不接受其最终确认；无observer保持原行为。默认原生CardKit路径严格验证content/settings业务码。接口已生效但响应/本地确认丢失后的远程消息/卡片核查、准备阶段副作用、用户处理入口、CLI默认接入、真实外部E2E和性能继续未完成。没有发布或部署。证据见docs/test-results/reply-delivery-2026-09-16.json。
+
 ## Stage 4: 文件终态与平台扩展
 **Goal**: 附件阶段追踪、运行与交付状态区分、早停准确反馈；验证upgrade与动态MemoryStore契约后接入。
 **Success Criteria**: F01-F05、U01；未证实接口不伪实现；客户PDF问题未复现不关单。

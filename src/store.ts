@@ -330,9 +330,9 @@ export class GatewayStore {
     });
   }
 
-  confirmMessageReply(id: string, result: RunResult): InboxTask {
+  confirmMessageReply(id: string, result: RunResult, dispatchId?: string): InboxTask {
     return this.messageTransaction(() => {
-      const task = this.inbox.confirmReply(id, result);
+      const task = this.inbox.confirmReply(id, result, dispatchId);
       this.updateMessageEvent(task, "processing", true);
       return task;
     });

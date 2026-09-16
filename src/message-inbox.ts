@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { ChannelMessage } from "./channel.ts";
+import type { ChannelMessage, ReplyDeliveryEvent } from "./channel.ts";
+import { advanceReplyDelivery, replyContentFingerprint, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
 import type { CredentialStateStore } from "./credential-state.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
 
@@ -12,6 +13,9 @@ export type InboxTask = {
   interruptedAt?: "preparing" | "dispatched";
   replyConfirmed?: true;
   replyResultFingerprint?: string;
+  dispatchId?: string;
+  replyIntent?: { resultFingerprint: string; contentFingerprint: string };
+  delivery?: ReplyDeliveryState;
   inspection?: { checkedAt: number; observation: RunInspection };
 };
 type Row = Record<string, unknown>;
@@ -91,13 +95,37 @@ export class MessageInbox {
   dispatched(id: string, sessionId: string, requestFingerprint: string): InboxTask {
     const task = this.owned(id);
     if (task.state !== "preparing" || !sessionId || !requestFingerprint) throw new Error("任务状态不允许记录派发");
-    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, replyConfirmed: undefined, replyResultFingerprint: undefined, inspection: undefined });
+    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, inspection: undefined });
   }
 
-  confirmReply(id: string, result: RunResult): InboxTask {
+  planReply(id: string, result: RunResult, text: string, dispatchId?: string): InboxTask {
     const task = this.owned(id);
+    this.assertDispatch(task, dispatchId);
+    if (task.state !== "dispatched" || task.delivery?.phase === "completed") throw new Error("当前任务不能设置回复意图");
+    if (result?.authorizationRequired) throw new Error("授权提示不能作为最终回复意图");
+    if (typeof text !== "string") throw new Error("回复正文无效");
+    const replyIntent = { resultFingerprint: this.resultFingerprint(result), contentFingerprint: replyContentFingerprint(text) };
+    if (task.replyIntent && JSON.stringify(task.replyIntent) !== JSON.stringify(replyIntent)) throw new Error("最终回复意图不能被替换");
+    return this.save(task, { ...task, replyIntent });
+  }
+
+  recordReplyDelivery(id: string, event: ReplyDeliveryEvent, dispatchId?: string): InboxTask {
+    const task = this.owned(id);
+    this.assertDispatch(task, dispatchId);
+    if (task.state !== "dispatched") throw new Error("当前任务不能记录回复投递");
+    const delivery = advanceReplyDelivery(task.delivery, event);
+    const confirmed = delivery.phase === "completed" && task.replyIntent;
+    if (confirmed && task.replyIntent!.contentFingerprint !== delivery.contentFingerprint) throw new Error("实际投递正文与最终回复不一致");
+    return this.save(task, { ...task, delivery, ...(confirmed ? { replyConfirmed: true, replyResultFingerprint: task.replyIntent!.resultFingerprint } : {}) });
+  }
+
+  confirmReply(id: string, result: RunResult, dispatchId?: string): InboxTask {
+    const task = this.owned(id);
+    this.assertDispatch(task, dispatchId);
     if (task.state !== "dispatched") throw new Error("当前任务状态不能确认回复");
     if (result?.authorizationRequired) throw new Error("授权等待提示不是最终回复");
+    if (task.delivery && (task.delivery.phase !== "completed" || !task.replyIntent || task.delivery.contentFingerprint !== task.replyIntent.contentFingerprint
+      || this.resultFingerprint(result) !== task.replyIntent.resultFingerprint)) throw new Error("回复投递尚未完成或正文不一致");
     return this.save(task, { ...task, replyConfirmed: true, replyResultFingerprint: this.resultFingerprint(result) });
   }
 
@@ -135,6 +163,11 @@ export class MessageInbox {
   private resultFingerprint(result: RunResult): string {
     if (!result || !["idle", "failed"].includes(result.terminal) || !Array.isArray(result.messages) || result.messages.some(text => typeof text !== "string")) throw new Error("回复运行结果结构无效");
     return createHash("sha256").update(JSON.stringify({ terminal: result.terminal, messages: result.messages })).digest("hex");
+  }
+
+  private assertDispatch(task: InboxTask, expected?: string): void {
+    // 异步Channel回调必须绑定本次派发；授权恢复即使复用taskId和Session也属于下一次派发。
+    if (expected !== undefined && expected !== task.dispatchId) throw new Error("回复所属派发已变化，不能写入下一轮任务");
   }
 
   finish(id: string, outcome: "completed" | "failed" | "awaiting_authorization"): InboxTask {
@@ -207,7 +240,8 @@ export class MessageInbox {
   }
 
   private encode(task: InboxTask): string {
-    const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint, inspection: task.inspection };
+    const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint,
+      dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, inspection: task.inspection };
     return this.credentials.sealAuthorization(JSON.stringify(payload), this.context({ ...task,
       eventKey: this.eventKey(task.message), channelType: task.message.channelType, installationId: task.message.installationId }));
   }
@@ -222,7 +256,7 @@ export class MessageInbox {
     const cleartext = this.credentials.openAuthorization(String(row.secret), this.context({ ...metadata,
       eventKey: String(row.event_key), channelType: String(row.channel_type), installationId: String(row.installation_id) }));
     let message: ChannelMessage;
-    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "inspection"> = {};
+    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "inspection"> = {};
     try {
       const payload = JSON.parse(cleartext);
       // 旧密文仅包含ChannelMessage，首次状态更新时升级；不补造旧回复的送达证明。
@@ -230,7 +264,14 @@ export class MessageInbox {
         message = payload.message;
         if (payload.replyConfirmed !== undefined && payload.replyConfirmed !== true) throw new Error("invalid receipt");
         if (payload.replyConfirmed && !/^[a-f0-9]{64}$/.test(payload.replyResultFingerprint)) throw new Error("invalid receipt fingerprint");
-        checkpoint = { ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}) };
+        if (payload.delivery) validateReplyDelivery(payload.delivery);
+        if (payload.dispatchId !== undefined && (typeof payload.dispatchId !== "string" || !/^[a-f0-9-]{36}$/.test(payload.dispatchId))) throw new Error("invalid dispatch");
+        if (payload.replyIntent && (!validReplyFingerprint(payload.replyIntent.resultFingerprint) || !validReplyFingerprint(payload.replyIntent.contentFingerprint))) throw new Error("invalid intent");
+        if (payload.delivery && payload.replyConfirmed && (payload.delivery.phase !== "completed" || !payload.replyIntent
+          || payload.replyIntent.resultFingerprint !== payload.replyResultFingerprint || payload.delivery.contentFingerprint !== payload.replyIntent.contentFingerprint)) throw new Error("invalid delivery confirmation");
+        checkpoint = { ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}),
+          ...(payload.dispatchId ? { dispatchId: payload.dispatchId } : {}), ...(payload.replyIntent ? { replyIntent: payload.replyIntent } : {}),
+          ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}) };
       } else message = payload;
     }
     catch { throw new Error("持久化消息结构损坏，未恢复任务"); }

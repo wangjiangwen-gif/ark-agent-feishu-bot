@@ -30,6 +30,8 @@ export type {
   ChannelInspectReaction,
   ReactionQuery,
   ReactionObservation,
+  ReplyDeliveryEvent,
+  ReplyDeliveryObserver,
   ChannelOutbound,
   ChannelResource,
   ChannelType
