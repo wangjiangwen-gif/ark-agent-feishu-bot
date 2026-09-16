@@ -9,6 +9,7 @@ import { CredentialStateStore, type CredentialIdentity, type CredentialState } f
 import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
 import type { OAuthTokens } from "./oauth.ts";
 import type { RunEvidence } from "./run-evidence.ts";
+import { MessageInbox } from "./message-inbox.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -58,6 +59,7 @@ export type AuthorizationRecoveryState = "waiting" | "resuming" | "completed" | 
 export class GatewayStore {
   readonly credentials: CredentialStateStore;
   readonly authorizations: AuthorizationStateStore;
+  readonly inbox: MessageInbox;
   private db: DatabaseSync;
   private runtimeToken?: string;
   private closed = false;
@@ -159,6 +161,7 @@ export class GatewayStore {
     `);
     this.credentials = new CredentialStateStore(this.db, path);
     this.authorizations = new AuthorizationStateStore(this.db, this.credentials);
+    this.inbox = new MessageInbox(this.db, this.credentials, () => this.assertRuntimeLock());
     this.ensureColumn("authorization_recoveries", "evidence", "TEXT");
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
@@ -619,9 +622,10 @@ export class GatewayStore {
     }
   }
 
-  assertRuntimeLock(): void {
+  assertRuntimeLock(): string {
     const owner = this.db.prepare("SELECT token FROM gateway_runtime_lock WHERE id = 1").get() as { token: string } | undefined;
     if (!this.runtimeToken || owner?.token !== this.runtimeToken) throw new Error("恢复授权前必须持有Gateway数据库运行锁");
+    return this.runtimeToken;
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
