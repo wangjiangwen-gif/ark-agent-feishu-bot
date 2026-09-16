@@ -1,0 +1,33 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "aa5f011",
+  "scope": "Gateway原运行核查、确认回复检查点、受控解除暂停及CardKit业务错误检查",
+  "red": [
+    { "suite": "message-reconciliation", "failed": 10, "reason": "恢复检查点与Gateway核查未实现" },
+    { "suite": "lark-channel", "failed": 4, "reason": "原生CardKit业务错误或无效响应被当作成功" }
+  ],
+  "newTests": 23,
+  "regression": { "command": "npm test", "passed": 444, "failed": 0, "skipped": 0, "durationMs": 2882.463417 },
+  "checks": { "syntax": "passed", "build": "passed", "diffWhitespace": "passed", "fullTypecheck": "未执行，check仅检查语法" },
+  "coverage": [
+    "回复确认及运行结果指纹绑定，旧结果不释放队列",
+    "加密核查结果、CAS、接收日志与Inbox原子结束",
+    "真实Gateway子进程确认回复后退出，再经ArkClient GET历史恢复，只运行后一条消息",
+    "未知结果再次查询、重复查询合并、过期证据拒绝",
+    "查询前后Session与Agent配置核对、存储Agent变化拒绝",
+    "授权暂停不被其他恢复解除，OAuth再次派发清除旧送达证明",
+    "旧版加密输入读取且不伪造回复确认",
+    "CardKit HTTP成功但业务失败时抛错，Gateway不确认送达"
+  ],
+  "externalServices": "MA及飞书使用模拟传输；Gateway、SQLite、子进程退出及恢复解析器为真实实现。不是实际飞书/MA端到端验收。",
+  "runtimeImpact": "CLI默认未启用durableQueue；CardKit业务错误检查应用于原生流式适配器；未部署、未发布",
+  "migration": "Inbox密文升级为version=2，兼容读取旧原始消息密文；旧代码不支持新密文，回退必须配套备份",
+  "remaining": [
+    "回复结果不明确时的投递核查和补偿",
+    "残留表情恢复",
+    "准备阶段资源副作用核实",
+    "授权恢复衔接及面向管理员的明确处理入口",
+    "CLI默认恢复接入",
+    "真实外部端到端、性能对照及其余十二节目标"
+  ]
+}

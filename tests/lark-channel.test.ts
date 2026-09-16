@@ -396,8 +396,8 @@ test("Channel adapter waits for native CardKit typing before closing the stream"
     rawClient: {
       im: { messageResource: { get: async () => { throw new Error("unused"); } } },
       cardkit: { v1: {
-        cardElement: { content: async (payload: unknown) => { operations.push({ type: "content", value: payload }); } },
-        card: { settings: async (payload: unknown) => { operations.push({ type: "settings", value: payload }); } }
+        cardElement: { content: async (payload: unknown) => { operations.push({ type: "content", value: payload }); return { code: 0 }; } },
+        card: { settings: async (payload: unknown) => { operations.push({ type: "settings", value: payload }); return { code: 0 }; } }
       } }
     }
   } as unknown as LarkChannelPort;
@@ -426,6 +426,25 @@ test("Channel adapter waits for native CardKit typing before closing the stream"
   assert.equal(card.config.streaming_config.print_step.default, 10);
   assert.equal(card.body.elements[0].content, "Thinking...");
 });
+
+for (const [phase, response] of [["content", { code: 230001, msg: "secret-error-payload" }], ["settings", { code: 230002 }], ["content", {}], ["settings", undefined]] as const) {
+  test(`native CardKit rejects unsuccessful ${phase} response ${JSON.stringify(response)}`, async () => {
+    const port = { createCard: async () => ({ cardId: "card" }), send: async () => ({ messageId: "reply" }), rawClient: {
+      im: { messageResource: { get: async () => { throw new Error("unused"); } } },
+      cardkit: { v1: {
+        cardElement: { content: async () => phase === "content" ? response : { code: 0 } },
+        card: { settings: async () => phase === "settings" ? response : { code: 0 } }
+      } }
+    } } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "secret", channel: port,
+      streaming: { intervalMs: 1, printFrequencyMs: 1, printStep: 100, settlePaddingMs: 0 } });
+    await assert.rejects(() => adapter.streamReply(normalizeLarkChannelMessage(normalized(), "cli"), async update => update("reply")), error => {
+      assert.ok(error instanceof Error && error.message.includes("CardKit"));
+      assert.ok(!String(error).includes("secret-error-payload"));
+      return true;
+    });
+  });
+}
 
 test("Channel adapter enforces the attachment limit", async () => {
   const port = {

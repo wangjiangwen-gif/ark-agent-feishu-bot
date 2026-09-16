@@ -155,10 +155,11 @@ export class LarkChannelAdapter implements ChannelAdapter {
     let content = "";
     let lastChunkChars = 0;
     const push = async (): Promise<void> => {
-      await cardkit.cardElement.content({
+      const response = await cardkit.cardElement.content({
         path: { card_id: cardId, element_id: elementId },
         data: { content: content || STREAMING_PLACEHOLDER, sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
       });
+      assertCardKitSuccess(response, "content");
     };
 
     try {
@@ -180,7 +181,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
           + this.streaming.settlePaddingMs;
         await wait(settleMs);
       }
-      await cardkit.card.settings({
+      const response = await cardkit.card.settings({
         path: { card_id: cardId },
         data: {
           settings: JSON.stringify({ config: {
@@ -191,6 +192,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
           uuid: `s_${cardId}_${sequence}`
         }
       });
+      assertCardKitSuccess(response, "settings");
     }
   }
 
@@ -221,6 +223,12 @@ export class LarkChannelAdapter implements ChannelAdapter {
     if (bytes.byteLength > limit) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(limit)} 限制`);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
+}
+
+function assertCardKitSuccess(response: unknown, operation: "content" | "settings"): void {
+  const code = response && typeof response === "object" ? (response as { code?: unknown }).code : undefined;
+  // 原生SDK返回业务信封，HTTP 200并不保证更新成功；错误正文可能含敏感内容。
+  if (code !== 0) throw new Error(`飞书CardKit ${operation} 未确认成功（${typeof code === "number" && Number.isFinite(code) ? code : "invalid_response"}）`);
 }
 
 function buildNativeStreamingCard(elementId: string, options: Required<StreamingOptions>): object {

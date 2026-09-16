@@ -1,5 +1,5 @@
 import type {
-  ArkClient, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, SessionStats, UserAuthorizationRequired
+  ArkClient, RunInspection, RunResult, SessionCreateDefaults, SessionCreateRequest, SessionResource, SessionStats, UserAuthorizationRequired
 } from "./ark.ts";
 import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage } from "./channel.ts";
 import { buildConversationTurn, resolveReplyContext } from "./conversation-context.ts";
@@ -77,11 +77,13 @@ export class Gateway {
   private authorizationWaits = new Map<string, Set<string>>();
   private inboxScheduled = new Set<string>();
   private inboxBlockedScopes = new Set<string>();
+  private inboxReconciliations = new Map<string, Promise<void>>();
+  private inboxRecoveryBatches = new Map<string, Promise<void>>();
   private sessionStatsCheckedAt = new Map<string, number>();
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
-    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats" | "inspectCompaction"
+    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats" | "inspectCompaction" | "inspectRun"
   >>;
   private reply: Reply;
   private options: GatewayOptions;
@@ -89,7 +91,7 @@ export class Gateway {
   constructor(
     store: GatewayStore,
     ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
-      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats" | "inspectCompaction"
+      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats" | "inspectCompaction" | "inspectRun"
     >>,
     reply: Reply,
     options: GatewayOptions
@@ -184,6 +186,50 @@ export class Gateway {
       if (!this.store.settleAuthorizationMessage(task.message)) this.queue.pause(task.binding.scope);
     }
     for (const task of pending.queued) this.scheduleInboxTask(task);
+    const batchKey = JSON.stringify([channelType, installationId]);
+    if (this.ark.inspectRun && pending.interrupted.length && !this.inboxRecoveryBatches.has(batchKey)) {
+      // 恢复查询逐个执行，避免启动时对MA产生并发查询风暴；其他scope的正常业务不被暂停。
+      const batch = Promise.resolve().then(async () => {
+        for (const task of pending.interrupted) await this.reconcilePendingMessage(task.message);
+      }).finally(() => this.inboxRecoveryBatches.delete(batchKey));
+      this.inboxRecoveryBatches.set(batchKey, batch);
+      void batch.catch(() => console.warn("待恢复任务核查未完成，保留原Session与暂停状态"));
+    }
+  }
+
+  async reconcilePendingMessage(message: IncomingMessage): Promise<void> {
+    if (!this.options.durableQueue || !this.ark.inspectRun) return;
+    const task = this.store.inbox.findMessage(message);
+    if (!task || task.state !== "uncertain") return;
+    const previous = this.inboxReconciliations.get(task.id);
+    if (previous) return previous;
+    const operation = Promise.resolve().then(async () => {
+      this.blockInboxScope(task.binding.scope);
+      const matches = () => {
+        this.store.assertSessionAgent(this.conversationKey(task.message), this.options.agentId);
+        const binding = this.inboxBinding(task.message);
+        return binding.scope === task.binding.scope && binding.agentId === task.binding.agentId && binding.configFingerprint === task.binding.configFingerprint
+          && this.store.getSession(this.conversationKey(task.message)) === task.sessionId;
+      };
+      if (task.interruptedAt !== "dispatched" || !task.sessionId || !task.requestFingerprint || !matches()) return;
+      let observation: RunInspection;
+      try { observation = await this.ark.inspectRun!(task.sessionId, task.requestFingerprint); }
+      catch { observation = { status: "unknown", reason: "history_unavailable" }; }
+      // 查询期间可能发生显式重置或配置切换；不得用旧查询结果放行新绑定。
+      if (!matches()) return;
+      const inspected = this.store.recordMessageInspection(task, observation);
+      if (observation.status !== "ended" || !inspected.replyConfirmed || observation.result.authorizationRequired) return;
+      this.store.settleInspectedMessage(inspected);
+      if (!this.store.inbox.hasBlockingTasks(task.message, task.binding)) {
+        this.inboxBlockedScopes.delete(task.binding.scope);
+        if (!this.authorizationWaits.get(task.binding.scope)?.size) this.queue.resume(task.binding.scope);
+      }
+    }).catch(() => {
+      this.blockInboxScope(task.binding.scope);
+      console.warn("原运行核查或检查点保存失败，未重发任务或解除暂停");
+    }).finally(() => this.inboxReconciliations.delete(task.id));
+    this.inboxReconciliations.set(task.id, operation);
+    return operation;
   }
 
   private blockInboxScope(scope: string): void {
@@ -700,6 +746,7 @@ export class Gateway {
       if (progressTimer) clearTimeout(progressTimer);
       await progressReply;
       if (!this.options.streamReply) await this.replyText(message, finalReply);
+      if (inboxId) this.store.confirmMessageReply(inboxId, result);
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
         tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,

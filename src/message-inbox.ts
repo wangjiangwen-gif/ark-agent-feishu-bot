@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ChannelMessage } from "./channel.ts";
 import type { CredentialStateStore } from "./credential-state.ts";
+import type { RunInspection, RunResult } from "./ark.ts";
 
 export type InboxState = "queued" | "preparing" | "dispatched" | "awaiting_authorization" | "completed" | "failed" | "uncertain";
 export type InboxBinding = { scope: string; agentId: string; configFingerprint: string };
@@ -9,6 +10,9 @@ export type InboxTask = {
   id: string; sequence: number; revision: number; state: InboxState; owner: string;
   message: ChannelMessage; binding: InboxBinding; sessionId?: string; requestFingerprint?: string;
   interruptedAt?: "preparing" | "dispatched";
+  replyConfirmed?: true;
+  replyResultFingerprint?: string;
+  inspection?: { checkedAt: number; observation: RunInspection };
 };
 type Row = Record<string, unknown>;
 const states = new Set<InboxState>(["queued", "preparing", "dispatched", "awaiting_authorization", "completed", "failed", "uncertain"]);
@@ -87,7 +91,50 @@ export class MessageInbox {
   dispatched(id: string, sessionId: string, requestFingerprint: string): InboxTask {
     const task = this.owned(id);
     if (task.state !== "preparing" || !sessionId || !requestFingerprint) throw new Error("任务状态不允许记录派发");
-    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint });
+    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, replyConfirmed: undefined, replyResultFingerprint: undefined, inspection: undefined });
+  }
+
+  confirmReply(id: string, result: RunResult): InboxTask {
+    const task = this.owned(id);
+    if (task.state !== "dispatched") throw new Error("当前任务状态不能确认回复");
+    if (result?.authorizationRequired) throw new Error("授权等待提示不是最终回复");
+    return this.save(task, { ...task, replyConfirmed: true, replyResultFingerprint: this.resultFingerprint(result) });
+  }
+
+  recordInspection(expected: InboxTask, observation: RunInspection): InboxTask {
+    const task = this.expectedUncertain(expected);
+    if (task.interruptedAt !== "dispatched" || !task.sessionId || !task.requestFingerprint) throw new Error("任务没有可核查的派发绑定");
+    if (!["unknown", "running", "ended"].includes(observation?.status) || JSON.stringify(observation).length > 2 * 1024 * 1024) throw new Error("运行核查结果无效或超过大小上限");
+    return this.save(task, { ...task, owner: this.runtimeOwner(), inspection: { checkedAt: Date.now(), observation: structuredClone(observation) } });
+  }
+
+  settleInspection(expected: InboxTask): InboxTask {
+    const task = this.expectedUncertain(expected), inspection = task.inspection;
+    if (!inspection || inspection.observation.status !== "ended" || !task.replyConfirmed
+      || inspection.observation.result.authorizationRequired || Date.now() - inspection.checkedAt > 30_000
+      || task.replyResultFingerprint !== this.resultFingerprint(inspection.observation.result)) throw new Error("原运行核查、回复确认或授权状态不足以结束任务");
+    return this.save(task, { ...task, owner: this.runtimeOwner(), state: "completed" });
+  }
+
+  hasBlockingTasks(message: ChannelMessage, binding: InboxBinding): boolean {
+    this.runtimeOwner();
+    return Boolean(this.db.prepare(`SELECT 1 FROM gateway_message_inbox WHERE channel_type=? AND installation_id=? AND scope=?
+      AND state IN ('preparing', 'dispatched', 'uncertain', 'awaiting_authorization') LIMIT 1`).get(message.channelType, message.installationId, binding.scope));
+  }
+
+  private expectedUncertain(expected: InboxTask): InboxTask {
+    this.runtimeOwner();
+    const current = this.get(expected.id);
+    if (!current || current.state !== "uncertain" || current.revision !== expected.revision
+      || current.sessionId !== expected.sessionId || current.requestFingerprint !== expected.requestFingerprint
+      || current.binding.scope !== expected.binding.scope || current.binding.agentId !== expected.binding.agentId
+      || current.binding.configFingerprint !== expected.binding.configFingerprint) throw new Error("待核查任务版本或绑定已变化");
+    return current;
+  }
+
+  private resultFingerprint(result: RunResult): string {
+    if (!result || !["idle", "failed"].includes(result.terminal) || !Array.isArray(result.messages) || result.messages.some(text => typeof text !== "string")) throw new Error("回复运行结果结构无效");
+    return createHash("sha256").update(JSON.stringify({ terminal: result.terminal, messages: result.messages })).digest("hex");
   }
 
   finish(id: string, outcome: "completed" | "failed" | "awaiting_authorization"): InboxTask {
@@ -155,7 +202,8 @@ export class MessageInbox {
   }
 
   private encode(task: InboxTask): string {
-    return this.credentials.sealAuthorization(JSON.stringify(task.message), this.context({ ...task,
+    const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint, inspection: task.inspection };
+    return this.credentials.sealAuthorization(JSON.stringify(payload), this.context({ ...task,
       eventKey: this.eventKey(task.message), channelType: task.message.channelType, installationId: task.message.installationId }));
   }
 
@@ -169,12 +217,22 @@ export class MessageInbox {
     const cleartext = this.credentials.openAuthorization(String(row.secret), this.context({ ...metadata,
       eventKey: String(row.event_key), channelType: String(row.channel_type), installationId: String(row.installation_id) }));
     let message: ChannelMessage;
-    try { message = JSON.parse(cleartext); }
+    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "inspection"> = {};
+    try {
+      const payload = JSON.parse(cleartext);
+      // 旧密文仅包含ChannelMessage，首次状态更新时升级；不补造旧回复的送达证明。
+      if (payload.version === 2 && payload.message) {
+        message = payload.message;
+        if (payload.replyConfirmed !== undefined && payload.replyConfirmed !== true) throw new Error("invalid receipt");
+        if (payload.replyConfirmed && !/^[a-f0-9]{64}$/.test(payload.replyResultFingerprint)) throw new Error("invalid receipt fingerprint");
+        checkpoint = { ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}) };
+      } else message = payload;
+    }
     catch { throw new Error("持久化消息结构损坏，未恢复任务"); }
     this.validate(message, metadata.binding);
     if (!states.has(metadata.state) || this.eventKey(message) !== row.event_key || message.channelType !== row.channel_type
       || message.installationId !== row.installation_id) throw new Error("持久化消息身份或状态不一致");
-    return { ...metadata, message };
+    return { ...metadata, message, ...checkpoint };
   }
 
   private validate(message: ChannelMessage, binding: InboxBinding): void {

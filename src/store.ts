@@ -9,6 +9,7 @@ import { CredentialStateStore, type CredentialIdentity, type CredentialState } f
 import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
 import type { OAuthTokens } from "./oauth.ts";
 import type { RunEvidence } from "./run-evidence.ts";
+import type { RunInspection, RunResult } from "./ark.ts";
 import { MessageInbox, type InboxBinding, type InboxTask } from "./message-inbox.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
@@ -322,6 +323,30 @@ export class GatewayStore {
     return this.messageTransaction(() => {
       const task = this.inbox.finish(id, outcome);
       this.updateMessageEvent(task, task.state, Boolean(task.sessionId));
+      return task;
+    });
+  }
+
+  confirmMessageReply(id: string, result: RunResult): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.confirmReply(id, result);
+      this.updateMessageEvent(task, "processing", true);
+      return task;
+    });
+  }
+
+  recordMessageInspection(expected: InboxTask, observation: RunInspection): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.recordInspection(expected, observation);
+      this.updateMessageEvent(task, "uncertain", true, "uncertain");
+      return task;
+    });
+  }
+
+  settleInspectedMessage(expected: InboxTask): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.settleInspection(expected);
+      this.updateMessageEvent(task, "completed", true, "uncertain");
       return task;
     });
   }
