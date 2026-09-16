@@ -163,7 +163,7 @@ document.querySelector('#recovery-refresh').onclick=()=>loadRecovery().catch(sho
 function employeeBase(){return '/api/employees/'+encodeURIComponent(currentEmployee)}
 let attachmentNext=0,attachmentRequest=0;
 function renderAttachmentRows(items){
-  const stages={download:'从飞书下载',upload:'上传到 MA',mount:'挂载到 Session',inline:'准备纯文本',cache:'复用附件缓存'};
+  const stages={download:'从飞书下载',upload:'上传到 MA',mount:'挂载到 Session',mount_check:'核查远端挂载',inline:'准备纯文本',cache:'复用附件缓存'};
   const states={pending:'未记录结束（结果待核实）',succeeded:'此阶段已确认',error:'此阶段报错（不代表远端未写入）'};
   const rows=items.map(x=>{
     const tr=document.createElement('tr');

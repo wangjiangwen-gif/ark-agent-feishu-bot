@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { GatewayStore } from "../src/store.ts";
 import { Gateway, type IncomingMessage } from "../src/gateway.ts";
+import { ArkHttpError } from "../src/ark.ts";
 
 const key = "a".repeat(64);
 const message = (patch: Partial<IncomingMessage> = {}): IncomingMessage => ({
@@ -181,7 +182,7 @@ test("uploaded file cache survives reopen and is reused without another download
   const replies: string[] = [];
   const makeGateway = () => new Gateway(store, {
     createSession: async () => "session", uploadFile: async name => { uploads++; return { id: "file-id", name }; },
-    addSessionResource: async () => { mounts++; if (mounts === 1) throw new Error("mount failed"); },
+    addSessionResource: async () => { mounts++; if (mounts === 1) throw new ArkHttpError("mount rejected", 400, "InvalidParameter"); },
     run: async () => ({ terminal: "idle", messages: ["结果"] })
   }, async () => { replies.push("reply"); }, {
     agentId: "agent", environmentId: "env", vaultId: "vault", timeoutMs: 5000, platformAccess: true, sharedGroupSessions: true,

@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ChannelMessage } from "./channel.ts";
+import { validMountQuery, type FileMountProof } from "./mount-inspection.ts";
 
-export type AttachmentStage = "download" | "upload" | "mount" | "inline" | "cache";
-export type AttachmentStageDetails = { bytes?: number; sha256?: string; fileId?: string; mountPath?: string; sessionId?: string };
+export type AttachmentStage = "download" | "upload" | "mount" | "mount_check" | "inline" | "cache";
+export type AttachmentStageDetails = { bytes?: number; sha256?: string; fileId?: string; mountPath?: string; sessionId?: string; resourceId?: string; checkedAt?: number; rejected?: true };
 export type AttachmentStageReceipt = AttachmentStageDetails & {
   id: string; sequence: number; attachmentKey: string; stage: AttachmentStage;
   status: "pending" | "succeeded" | "error"; startedAt: number; finishedAt?: number; durationMs?: number;
@@ -21,7 +22,12 @@ function details(value: AttachmentStageDetails): AttachmentStageDetails {
     if (!/^[a-f0-9]{64}$/.test(value.sha256)) throw new Error("附件Hash无效");
     result.sha256 = value.sha256;
   }
-  for (const field of ["fileId", "sessionId", "mountPath"] as const) {
+  if (value.rejected === true) result.rejected = true;
+  if (value.checkedAt !== undefined) {
+    if (!Number.isSafeInteger(value.checkedAt) || value.checkedAt < 0) throw new Error("附件核查时间无效");
+    result.checkedAt = value.checkedAt;
+  }
+  for (const field of ["fileId", "sessionId", "mountPath", "resourceId"] as const) {
     if (value[field] === undefined) continue;
     if (typeof value[field] !== "string" || !value[field] || value[field]!.length > 4096) throw new Error("附件资源标识无效");
     result[field] = value[field];
@@ -49,11 +55,15 @@ export class AttachmentTraceStore {
     );
     CREATE INDEX IF NOT EXISTS attachment_stage_session ON attachment_stage_receipts(
       json_extract(scope, '$[0]'), json_extract(scope, '$[1]'), json_extract(details, '$.sessionId'), sequence
-    );`);
+    );
+    CREATE INDEX IF NOT EXISTS attachment_mount_lookup ON attachment_stage_receipts(
+      scope, attachment_key, json_extract(details, '$.sessionId'), sequence
+    ) WHERE stage='mount' OR (stage='mount_check' AND status='succeeded');
+    `);
   }
 
   begin(message: ChannelMessage, key: string, stage: AttachmentStage, value: AttachmentStageDetails = {}): string {
-    if (!/^[a-f0-9]{64}$/.test(key) || !["download", "upload", "mount", "inline", "cache"].includes(stage)) throw new Error("附件阶段无效");
+    if (!/^[a-f0-9]{64}$/.test(key) || !["download", "upload", "mount", "mount_check", "inline", "cache"].includes(stage)) throw new Error("附件阶段无效");
     const id = randomUUID();
     this.db.prepare(`INSERT INTO attachment_stage_receipts (id, scope, attachment_key, stage, status, started_at, details)
       VALUES (?, ?, ?, ?, 'pending', ?, ?)`)
@@ -108,6 +118,33 @@ export class AttachmentTraceStore {
     const value = details(JSON.parse(row.details));
     if (!value.fileId || value.bytes === undefined || !value.sha256) throw new Error("已确认附件上传记录不完整，不能自动重复上传");
     return value;
+  }
+
+  latestMount(message: ChannelMessage, key: string, sessionId: string): AttachmentStageReceipt | undefined {
+    const row = this.db.prepare(`SELECT * FROM attachment_stage_receipts WHERE scope=? AND attachment_key=?
+      AND json_extract(details, '$.sessionId')=? AND (stage='mount' OR (stage='mount_check' AND status='succeeded'))
+      ORDER BY sequence DESC LIMIT 1`).get(this.scope(message), key, sessionId);
+    return row ? receipt(row) : undefined;
+  }
+
+  confirmMount(message: ChannelMessage, key: string, expectedId: string, proof: FileMountProof, checkedAfter: number): void {
+    if (proof.status !== "confirmed" || !validMountQuery(proof) || !proof.resourceId || !Number.isSafeInteger(proof.checkedAt)
+      || proof.checkedAt < checkedAfter || proof.checkedAt > Date.now() || Date.now() - proof.checkedAt > 30_000) throw new Error("附件挂载核查证据无效");
+    this.db.exec("SAVEPOINT attachment_mount_confirmation");
+    try {
+      const previous = this.latestMount(message, key, proof.sessionId);
+      if (!previous || previous.id !== expectedId || previous.fileId !== proof.fileId || previous.mountPath !== proof.mountPath
+        || proof.checkedAt < previous.startedAt) throw new Error("附件挂载记录已变化");
+      const id = this.begin(message, key, "mount_check", {
+        bytes: previous.bytes, sha256: previous.sha256, sessionId: proof.sessionId, fileId: proof.fileId,
+        mountPath: proof.mountPath, resourceId: proof.resourceId, checkedAt: proof.checkedAt
+      });
+      this.finish(id, "succeeded");
+      this.db.exec("RELEASE attachment_mount_confirmation");
+    } catch (error) {
+      this.db.exec("ROLLBACK TO attachment_mount_confirmation; RELEASE attachment_mount_confirmation");
+      throw error;
+    }
   }
 
   private scope(message: ChannelMessage): string {

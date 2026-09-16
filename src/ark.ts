@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
+import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
+
+export class ArkHttpError extends Error {
+  status: number;
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
+    super(message); this.name = "ArkHttpError"; this.status = status; this.code = code;
+  }
+}
 
 export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; processed_at?: string };
 
@@ -147,7 +156,12 @@ export class ArkClient {
     if (!response.ok) {
       const requestId = response.headers.get("x-request-id");
       const body = await response.text();
-      throw new Error(`方舟请求失败 ${response.status}${requestId ? ` (${requestId})` : ""}: ${body.slice(0, 300)}`);
+      let code: string | undefined;
+      try {
+        const parsed = JSON.parse(body);
+        if (typeof parsed?.error?.code === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(parsed.error.code)) code = parsed.error.code;
+      } catch { /* 非JSON错误不提供结构化拒绝证明。 */ }
+      throw new ArkHttpError(`方舟请求失败 ${response.status}${requestId ? ` (${requestId})` : ""}: ${body.slice(0, 300)}`, response.status, code);
     }
     return response;
   }
@@ -368,6 +382,23 @@ export class ArkClient {
       method: "POST",
       body: JSON.stringify(resource)
     });
+  }
+
+  async inspectFileMount(query: FileMountQuery, signal?: AbortSignal): Promise<FileMountInspection> {
+    if (!validMountQuery(query)) return { status: "unknown", reason: "invalid_resources" };
+    const deadline = AbortSignal.timeout(this.options.inspectionTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    try {
+      combined.throwIfAborted();
+      // 此只读接口最多1000条、无分页；独立读取确保错误正文也不会无界读取或泄漏。
+      const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(query.sessionId)}/resources`, {
+        headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, signal: combined
+      });
+      if (!response.ok) { void response.body?.cancel().catch(() => {}); return { status: "unknown", reason: "resources_unavailable" }; }
+      const body = await boundedHistoryBody(response, 4 * 1024 * 1024, combined);
+      combined.throwIfAborted();
+      return inspectMountResources(JSON.parse(body), query);
+    } catch { return { status: "unknown", reason: "resources_unavailable" }; }
   }
 
   async sendMessage(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {

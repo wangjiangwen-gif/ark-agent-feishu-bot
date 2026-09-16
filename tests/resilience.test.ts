@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Gateway, toConversationKey, type IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
 import type { ChannelHistoryMessage } from "../src/channel.ts";
+import { ArkHttpError } from "../src/ark.ts";
 
 function message(id: string, overrides: Partial<IncomingMessage> = {}): IncomingMessage {
   return { channelType: "lark", installationId: "cli", tenantId: "tenant", conversationId: "chat", conversationType: "group",
@@ -132,10 +133,10 @@ test("unmentioned file is cached without execution and survives Gateway reconstr
   assert.match(restarted.inputs[0], /可能缺少离线期间/);
 });
 
-test("failed historical mount reuses uploaded File ID on next mention", async t => {
+test("explicitly rejected historical mount reuses uploaded File ID on next mention", async t => {
   let attempts = 0;
   const history = [{ messageId: "file-message", senderId: "user", senderType: "user", source: "chat", text: "附件", createTime: 10, resources: [{ id: "a", name: "资料.pdf", type: "file" }] }];
-  const h = harness({ ark: { addSessionResource: async () => { if (++attempts === 1) throw new Error("temporary mount error"); } }, options: { loadRecentHistory: async () => history } });
+  const h = harness({ ark: { addSessionResource: async () => { if (++attempts === 1) throw new ArkHttpError("mount rejected", 400, "InvalidParameter"); } }, options: { loadRecentHistory: async () => history } });
   t.after(() => h.store.close());
   h.gateway.accept(message("one")); await until(() => h.replies.length === 1);
   assert.match(h.replies[0], /附件提示/);

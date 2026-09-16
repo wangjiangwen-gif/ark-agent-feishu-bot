@@ -11,6 +11,7 @@ import { baselineCompaction, decideCompaction, startCompaction, finishCompaction
 import { authorizationContinuation, authorizationRecoveryDecision, type RunEvidence } from "./run-evidence.ts";
 import type { InboxBinding, InboxTask } from "./message-inbox.ts";
 import type { AttachmentStage, AttachmentStageDetails } from "./attachment-trace.ts";
+import { ArkHttpError } from "./ark.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -94,7 +95,7 @@ export class Gateway {
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
-    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats" | "inspectCompaction" | "inspectRun"
+    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "inspectFileMount" | "getSessionStats" | "inspectCompaction" | "inspectRun"
   >>;
   private reply: Reply;
   private options: GatewayOptions;
@@ -102,7 +103,7 @@ export class Gateway {
   constructor(
     store: GatewayStore,
     ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
-      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats" | "inspectCompaction" | "inspectRun"
+      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "inspectFileMount" | "getSessionStats" | "inspectCompaction" | "inspectRun"
     >>,
     reply: Reply,
     options: GatewayOptions
@@ -809,8 +810,7 @@ export class Gateway {
           const resourceKey = attachmentKeys.find(key => this.store.getAttachment(key)?.fileId === resource.file_id && this.store.getAttachment(key)?.mountPath === resource.mount_path);
           try {
             if (!resourceKey) throw new Error("附件挂载缺少来源记录");
-            await this.traceAttachment(message, resourceKey, "mount", () => this.addSessionResource(sessionId!, resource),
-              { ...this.store.getAttachment(resourceKey), sessionId });
+            await this.mountAttachment(message, resourceKey, sessionId, resource, this.store.getAttachment(resourceKey));
           }
           catch (error) {
             const failedKey = attachmentKeys.find(key => this.store.getAttachment(key)?.fileId === resource.file_id);
@@ -1166,6 +1166,28 @@ export class Gateway {
     throw new Error(`当前 Gateway 不支持向已有 Session 追加 ${resource.type} 资源`);
   }
 
+  private async mountAttachment(message: IncomingMessage, key: string, sessionId: string, resource: SessionResource, details: AttachmentStageDetails = {}): Promise<void> {
+    const previous = this.store.attachmentTrace.latestMount(message, key, sessionId);
+    if (previous) {
+      if (previous.fileId !== resource.file_id || previous.mountPath !== resource.mount_path) throw new Error("附件挂载结果待核实，未重复提交挂载请求");
+      if (previous.status === "succeeded") return;
+      // 只有明确InvalidParameter拒绝才能重新提交。超时、断线、5xx及旧错误均可能已经生效。
+      if (!(previous.status === "error" && previous.rejected)) {
+        if (!this.ark.inspectFileMount) throw new Error("附件挂载结果待核实，未重复提交挂载请求");
+        const boundSession = this.store.getSession(this.conversationKey(message));
+        const checkedAfter = Date.now();
+        const proof = await this.ark.inspectFileMount({ sessionId, fileId: String(resource.file_id), mountPath: String(resource.mount_path) });
+        if (this.store.getSession(this.conversationKey(message)) !== boundSession || proof.status !== "confirmed"
+          || proof.sessionId !== sessionId || proof.fileId !== resource.file_id || proof.mountPath !== resource.mount_path) {
+          throw new Error("附件挂载结果待核实，未重复提交挂载请求");
+        }
+        this.store.attachmentTrace.confirmMount(message, key, previous.id, proof, checkedAfter);
+        return;
+      }
+    }
+    await this.traceAttachment(message, key, "mount", () => this.addSessionResource(sessionId, resource), { ...details, sessionId });
+  }
+
   private async mountHistoryAttachments(
     sessionId: string,
     trigger: IncomingMessage,
@@ -1219,8 +1241,7 @@ export class Gateway {
           continue;
         }
         if (!this.store.isAttachmentMounted(sessionId, prepared.key)) {
-          await this.traceAttachment(sourceMessage, prepared.key, "mount", () => this.addSessionResource(sessionId, { type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath }),
-            { ...prepared, sessionId });
+          await this.mountAttachment(sourceMessage, prepared.key, sessionId, { type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath }, prepared);
           this.store.markAttachmentMounted(sessionId, prepared.key);
         }
         updated.set(item.messageId, {
@@ -1309,7 +1330,8 @@ export class Gateway {
     try { value = await operation(); }
     catch (error) {
       // 不保存上游原始错误，可能包含请求正文、下载URL或凭证。
-      this.store.attachmentTrace.finish(id, "error");
+      this.store.attachmentTrace.finish(id, "error", stage === "mount" && error instanceof ArkHttpError
+        && error.status === 400 && error.code === "InvalidParameter" ? { rejected: true } : {});
       throw error;
     }
     // 与远端调用分开：本地落盘失败不能伪装成远端明确失败。
@@ -1457,6 +1479,7 @@ function historyFingerprint(message: ChannelHistoryMessage): string {
 
 function attachmentError(error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
+  if (reason === "附件挂载结果待核实，未重复提交挂载请求") return reason;
   if (/file type not supported/i.test(reason)) return "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown";
   if (reason === "不是有效的 UTF-8 编码，请转为 UTF-8 后发送") return reason;
   if (/^单轮附件总量(?:达到|超过) 40 MB，请分批处理$/.test(reason)) return reason;
