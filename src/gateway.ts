@@ -8,6 +8,7 @@ import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
 import { createHash } from "node:crypto";
 import { baselineCompaction, decideCompaction, startCompaction, finishCompaction } from "./session-compaction.ts";
 import { authorizationContinuation, authorizationRecoveryDecision, type RunEvidence } from "./run-evidence.ts";
+import type { InboxBinding, InboxTask } from "./message-inbox.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -74,6 +75,8 @@ export class KeyedQueue {
 export class Gateway {
   private queue = new KeyedQueue();
   private authorizationWaits = new Map<string, Set<string>>();
+  private inboxScheduled = new Set<string>();
+  private inboxBlockedScopes = new Set<string>();
   private sessionStatsCheckedAt = new Map<string, number>();
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
@@ -96,11 +99,23 @@ export class Gateway {
     this.reply = reply;
     this.options = { ...options, sessionConfiguration: options.sessionConfiguration ? structuredClone(options.sessionConfiguration) : undefined };
     if (this.options.sessionConfiguration) validateSessionConfiguration(this.options.sessionConfiguration);
+    if (this.options.durableQueue) {
+      this.store.assertRuntimeLock();
+      if (this.options.perMessageSessions) throw new Error("持久化队列不支持旧per-message Session模式");
+    }
   }
 
   accept(message: IncomingMessage): boolean {
     if (this.options.platformAccess && message.conversationType === "group") this.store.cacheHistory(message, [historyFromMessage(message)]);
     if (!shouldHandleMessage(message)) return false;
+    const control = (message.text.trim() === "/auth status" && this.options.authorizationStatus)
+      || (message.conversationType === "direct" && message.text.trim() === "/auth cancel" && this.options.cancelAuthorization);
+    if (this.options.durableQueue && !control) {
+      const task = this.store.receiveMessage(message, this.inboxBinding(message));
+      if (!task) return false;
+      this.scheduleInboxTask(task);
+      return true;
+    }
     // 飞书可能为同一条消息重复投递不同 event_id；message_id 才是业务幂等键。
     if (!this.store.claimEvent(message.channelType, message.installationId, message.messageId)) return false;
     if (message.text.trim() === "/auth status" && this.options.authorizationStatus) {
@@ -156,6 +171,63 @@ export class Gateway {
     return true;
   }
 
+  private inboxBinding(message: IncomingMessage): InboxBinding {
+    return { scope: this.store.conversationKey(this.conversationKey(message)), agentId: this.options.agentId,
+      configFingerprint: this.configurationFingerprint(message) };
+  }
+
+  recoverPendingMessages(channelType: string, installationId: string): void {
+    if (!this.options.durableQueue) return;
+    const pending = this.store.recoverMessages(channelType, installationId);
+    for (const task of pending.interrupted) this.blockInboxScope(task.binding.scope);
+    for (const task of pending.awaitingAuthorization) {
+      if (!this.store.settleAuthorizationMessage(task.message)) this.queue.pause(task.binding.scope);
+    }
+    for (const task of pending.queued) this.scheduleInboxTask(task);
+  }
+
+  private blockInboxScope(scope: string): void {
+    this.inboxBlockedScopes.add(scope); this.queue.pause(scope);
+  }
+
+  private finishInboxProcessing(message: IncomingMessage, failed = false): void {
+    const task = this.store.inbox.findMessage(message);
+    if (!task) throw new Error("持久化任务丢失，已停止该会话自动执行");
+    if (task.state === "preparing" || task.state === "dispatched") this.store.finishMessage(task.id, failed ? "failed" : "completed");
+    else if (task.state === "awaiting_authorization") this.store.settleAuthorizationMessage(message);
+    const current = this.store.inbox.findMessage(message)!;
+    if (current.state === "uncertain") this.blockInboxScope(current.binding.scope);
+  }
+
+  private scheduleInboxTask(task: InboxTask): void {
+    if (this.inboxScheduled.has(task.id)) return;
+    this.inboxScheduled.add(task.id);
+    const message = task.message, key = this.conversationKey(message);
+    const resetControl = message.conversationType === "direct" && message.text.trim() === "/new" && Boolean(this.options.cancelAuthorization);
+    this.schedule(message, key, async () => {
+      let claimed = false;
+      try {
+        if (this.inboxBlockedScopes.has(task.binding.scope)) return;
+        if (resetControl) await this.options.cancelAuthorization!(message);
+        const received = this.store.inbox.claim(task.id, this.inboxBinding(message), resetControl);
+        if (!received) {
+          this.blockInboxScope(task.binding.scope);
+          await this.replyText(message, "此会话前序任务尚未核实完成，后续消息已保留，未再次投递。请检查原Session运行记录。");
+          return;
+        }
+        claimed = true;
+        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction, undefined, task.id));
+        this.finishInboxProcessing(message);
+      } catch {
+        try { if (claimed) this.finishInboxProcessing(message, true); }
+        catch { console.error("持久化执行检查点更新失败，已暂停该会话"); }
+        this.blockInboxScope(task.binding.scope);
+        try { await this.replyText(message, "任务执行或配置校验未完成。原Session和排队消息已保留；为避免重复操作，已暂停此会话自动投递，请检查运行记录。"); }
+        catch { console.warn("发送持久化任务异常提示失败"); }
+      } finally { this.inboxScheduled.delete(task.id); }
+    }, false, resetControl);
+  }
+
   async validateConfiguration(): Promise<void> {
     for (const scope of ["direct", "group", "thread"] as const) {
       const message: IncomingMessage = {
@@ -171,6 +243,7 @@ export class Gateway {
   }
 
   resume(message: IncomingMessage): void {
+    if (this.options.durableQueue) throw new Error("持久化任务必须使用受控授权续跑，不能直接重发原始消息");
     const key = this.conversationKey(message);
     this.schedule(message, key, async () => {
       try { await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction)); }
@@ -186,9 +259,11 @@ export class Gateway {
       if (active) {
         waits.add(flowId); this.authorizationWaits.set(key, waits); this.queue.pause(key);
       } else {
+        if (this.options.durableQueue) this.store.settleAuthorizationMessage(message);
         waits.delete(flowId);
         if (waits.size) continue;
-        this.authorizationWaits.delete(key); this.queue.resume(key);
+        this.authorizationWaits.delete(key);
+        if (!this.inboxBlockedScopes.has(key)) this.queue.resume(key);
       }
     }
   }
@@ -200,6 +275,7 @@ export class Gateway {
     const key = this.conversationKey(message);
     // 在入队前原子领取，重复回调或重启都不能再次投递；实际执行时重新核对会话。
     this.schedule(message, key, async () => {
+      let inboxTask: InboxTask | undefined;
       try {
         const sessionId = this.store.getSession(key);
         if (!sessionId || sessionId !== recovery.sessionId) {
@@ -228,16 +304,34 @@ export class Gateway {
           await this.replyText(message, `授权已更新，原 Session 已保留。${decision === "writes_present" ? "此前已有写入成功" : "此前执行结果无法完整确认"}，为避免重复创建或发送，未自动重放原任务。${resources.length ? `\n已完成资源：${resources.slice(0, 20).map(resource => `${resource.type}: ${resource.id}`).join("；")}` : ""}\n请确认已完成的部分和需要继续的步骤。`);
           return;
         }
-        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction, authorizationContinuation(recovery.evidence!)));
+        if (this.options.durableQueue) {
+          inboxTask = this.store.resumeAuthorizationMessage(message);
+          if (!inboxTask) throw new Error("授权续跑缺少持久化消息，未投递");
+        }
+        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction, authorizationContinuation(recovery.evidence!), inboxTask?.id));
+        if (inboxTask) this.finishInboxProcessing(message);
         this.store.finishAuthorizationRecovery(message, "completed");
       } catch (error) {
+        if (this.options.durableQueue && !inboxTask) {
+          // MA空闲状态未核实等前置失败也必须持久化为未知，不能仅结束OAuth就放行后续消息。
+          try { inboxTask = this.store.resumeAuthorizationMessage(message); }
+          catch { this.blockInboxScope(this.store.conversationKey(key)); }
+        }
         this.store.finishAuthorizationRecovery(message, "failed");
+        if (inboxTask) {
+          try { this.finishInboxProcessing(message, true); }
+          catch { console.error("授权续跑检查点更新失败"); }
+          this.blockInboxScope(inboxTask.binding.scope);
+        }
         await this.replyText(message, `授权恢复未完成：${error instanceof Error ? error.message.slice(0, 240) : "请检查运行记录"}`);
+      } finally {
+        if (this.options.durableQueue) this.store.settleAuthorizationMessage(message);
       }
     }, this.authorizationWaits.has(this.store.conversationKey(key)));
   }
 
   resumeWithHandoff(message: IncomingMessage): void {
+    if (this.options.durableQueue) throw new Error("持久化会话不允许隐式handoff，请明确选择新会话");
     const key = this.conversationKey(message);
     this.schedule(message, key, async () => {
       try {
@@ -349,7 +443,7 @@ export class Gateway {
     });
   }
 
-  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff, hasReaction = false, continuation?: string): Promise<void> {
+  private async process(message: IncomingMessage, key: ConversationKey, handoff?: SessionHandoff, hasReaction = false, continuation?: string, inboxId?: string): Promise<void> {
     if (!this.options.platformAccess && message.senderId !== this.options.authorizedUserId) {
       await this.replyText(message, "当前用户未授权。这个版本仅支持 init 时扫码授权的用户，请由该用户私聊或重新运行 init。");
       return;
@@ -577,7 +671,8 @@ export class Gateway {
       // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result
       // 转成“执行进度：xxx”消息刷屏。
       let result: RunResult | undefined;
-      this.store.touchEvent(message, true);
+      if (inboxId) this.store.dispatchMessage(inboxId, sessionId, createHash("sha256").update(input).digest("hex"));
+      else this.store.touchEvent(message, true);
       const withNotices = (text: string) => appendAttachmentNotices(text, notices);
       if (this.options.streamReply) {
         await this.options.streamReply(message, async update => {
@@ -598,7 +693,7 @@ export class Gateway {
       if (result.authorizationRequired) {
         if (progressTimer) clearTimeout(progressTimer);
         await progressReply;
-        await this.handleAuthorizationRequired(message, sessionId, startedAt, result.authorizationRequired, result.evidence);
+        await this.handleAuthorizationRequired(message, sessionId, startedAt, result.authorizationRequired, result.evidence, inboxId);
         return;
       }
       const finalReply = withNotices(resultToReply(result));
@@ -631,7 +726,8 @@ export class Gateway {
     sessionId: string,
     startedAt: number,
     request: UserAuthorizationRequired,
-    evidence?: RunEvidence
+    evidence?: RunEvidence,
+    inboxId?: string
   ): Promise<void> {
     if (this.usesBotOnlyIdentity(message)) {
       throw new Error("群聊场景仅使用 Bot 身份，不能挂载或申请个人用户凭证；请改用 Bot 可访问的群级能力，或私聊数字员工完成需要个人身份的操作");
@@ -640,6 +736,7 @@ export class Gateway {
     if (!this.store.startAuthorizationRecovery(message, sessionId, evidence)) {
       throw new Error("授权后仍未获得用户凭证，请重新授权或联系管理员检查用户 Vault");
     }
+    if (inboxId) this.store.finishMessage(inboxId, "awaiting_authorization");
     this.store.addAuditLog({
       channelType: message.channelType, installationId: message.installationId,
       tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
@@ -1026,6 +1123,8 @@ export type GatewayOptions = {
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   perMessageSessions?: boolean;
   sharedGroupSessions?: boolean;
+  // 启动恢复、投递核查与真实端到端验证闭环前，仅通过显式选项接入，不改变现有CLI默认值。
+  durableQueue?: boolean;
   loadRecentHistory?: (message: IncomingMessage) => Promise<ChannelHistoryMessage[]>;
   readMessage?: ChannelReadMessage;
   appId?: string;

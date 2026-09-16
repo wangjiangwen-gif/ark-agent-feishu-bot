@@ -245,3 +245,37 @@ test("recovery preserves authorization waiting and never reads another installat
     assert.throws(() => f.store.recoverMessages("lark", "other"), /接收记录/);
   } finally { f.close(); }
 });
+
+test("authorization continuation and cancellation cannot split inbox and event checkpoints on storage failure", () => {
+  const f = fixture();
+  try {
+    const incoming = message(), task = f.store.receiveMessage(incoming, binding)!;
+    f.store.inbox.claim(task.id, binding); f.store.dispatchMessage(task.id, "session", "hash");
+    f.store.startAuthorizationRecovery(incoming, "session"); f.store.finishMessage(task.id, "awaiting_authorization");
+    f.store.claimAuthorizationRecovery(incoming);
+    f.db.exec("CREATE TRIGGER fail_event BEFORE UPDATE ON processed_events BEGIN SELECT RAISE(ABORT, 'event-injected'); END");
+    assert.throws(() => f.store.resumeAuthorizationMessage(incoming), /event-injected/);
+    assert.equal(f.store.inbox.findMessage(incoming)!.state, "awaiting_authorization");
+    f.store.finishAuthorizationRecovery(incoming, "cancelled");
+    assert.throws(() => f.store.settleAuthorizationMessage(incoming), /event-injected/);
+    assert.equal(f.store.inbox.findMessage(incoming)!.state, "awaiting_authorization");
+    f.db.exec("DROP TRIGGER fail_event");
+    assert.equal(f.store.settleAuthorizationMessage(incoming), true);
+    assert.equal(f.store.inbox.findMessage(incoming)!.state, "failed");
+  } finally { f.close(); }
+});
+
+test("authorization transition requires matching original Session and claimed recovery, never just an OAuth callback", () => {
+  const f = fixture();
+  try {
+    const incoming = message(), task = f.store.receiveMessage(incoming, binding)!;
+    f.store.inbox.claim(task.id, binding); f.store.dispatchMessage(task.id, "session", "hash");
+    f.store.finishMessage(task.id, "awaiting_authorization");
+    assert.throws(() => f.store.resumeAuthorizationMessage(incoming), /绑定/);
+    assert.equal(f.store.settleAuthorizationMessage(incoming), false);
+    f.store.startAuthorizationRecovery(incoming, "wrong-session"); f.store.claimAuthorizationRecovery(incoming);
+    assert.throws(() => f.store.resumeAuthorizationMessage(incoming), /绑定/);
+    assert.throws(() => f.store.resumeAuthorizationMessage({ ...incoming, senderId: "other" }), /身份/);
+    assert.equal(f.store.inbox.findMessage(incoming)!.state, "awaiting_authorization");
+  } finally { f.close(); }
+});

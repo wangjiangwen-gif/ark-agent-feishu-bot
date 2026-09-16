@@ -51,8 +51,10 @@ test("reset control preserves ordinary FIFO when there is no authorization pause
   assert.deepEqual(calls, ["first", "second", "reset"]);
 });
 
-test("OAuth wait pauses only its direct scope, removes Get and recovers before already queued messages", async t => {
+for (const durableQueue of [false, true]) {
+test(`OAuth wait pauses only its direct scope, removes Get and recovers before already queued messages (durable=${durableQueue})`, async t => {
   const store = new GatewayStore(":memory:"); const poll = deferred<OAuthTokens>();
+  if (durableQueue) store.acquireRuntimeLock();
   const runs: string[] = [], reactions: string[] = [], replies: string[] = [];
   let gateway: Gateway, calls = 0;
   const auth = new EmployeeAuthorizationManager(store, {
@@ -70,7 +72,7 @@ test("OAuth wait pauses only its direct scope, removes Get and recovers before a
       return { terminal: "idle", messages: ["done"], ...(text === "first" && runs.filter(s => s === "first").length === 1 ? { authorizationRequired: request, evidence: readOnlyEvidence() } : {}) };
     }
   }, async (_m, outbound) => { if (outbound.type === "text") replies.push(outbound.text); }, {
-    agentId: "agent", environmentId: "env", vaultId: "bot-vault", timeoutMs: 1000, platformAccess: true, dualIdentity: true,
+    agentId: "agent", environmentId: "env", vaultId: "bot-vault", timeoutMs: 1000, platformAccess: true, dualIdentity: true, durableQueue,
     getUserVaultIds: async m => m.senderId === "user" ? auth.vaultIds(m) : [],
     ensureAuthorization: (m, r) => auth.ensure(m, r), cancelAuthorization: m => auth.cancel(m),
     addReaction: async (m, emoji) => { reactions.push(`add:${m.messageId}:${emoji}`); return m.messageId; },
@@ -90,6 +92,7 @@ test("OAuth wait pauses only its direct scope, removes Get and recovers before a
   assert.doesNotMatch(runs[2], /first/);
   assert.equal(calls, 2);
 });
+}
 
 test("terminal authorization states release queued messages and stale completion cannot release a replacement", async () => {
   const store = new GatewayStore(":memory:"); const runs: string[] = [];

@@ -62,19 +62,26 @@ export class MessageInbox {
     return original;
   }
 
-  claim(id: string, expectedBinding: InboxBinding): InboxTask | undefined {
+  claim(id: string, expectedBinding: InboxBinding, resetControl = false): InboxTask | undefined {
     const owner = this.runtimeOwner();
     return this.transaction(() => {
       const task = this.get(id);
       if (!task || task.state !== "queued") return undefined;
       if (!expectedBinding || task.binding.scope !== expectedBinding.scope || task.binding.agentId !== expectedBinding.agentId
         || task.binding.configFingerprint !== expectedBinding.configFingerprint) throw new Error("排队任务配置已变化，请明确处理原配置任务，不能隐式换Agent或身份范围");
+      if (resetControl && (task.message.conversationType !== "direct" || task.message.text.trim() !== "/new")) throw new Error("只有单聊显式重置可走控制领取");
       const blocker = this.db.prepare(`SELECT 1 FROM gateway_message_inbox WHERE channel_type=? AND installation_id=? AND scope=?
-        AND id<>? AND (state IN ('preparing', 'dispatched', 'uncertain', 'awaiting_authorization') OR (state='queued' AND sequence<?)) LIMIT 1`)
-        .get(task.message.channelType, task.message.installationId, task.binding.scope, task.id, task.sequence);
+        AND id<>? AND (state IN ('preparing', 'dispatched', 'uncertain', 'awaiting_authorization') OR (state='queued' AND sequence<? AND ?=0)) LIMIT 1`)
+        .get(task.message.channelType, task.message.installationId, task.binding.scope, task.id, task.sequence, resetControl ? 1 : 0);
       if (blocker) return undefined;
       return this.save(task, { ...task, state: "preparing", owner });
     });
+  }
+
+  transitionAuthorization(id: string, state: "preparing" | "failed"): InboxTask {
+    const owner = this.runtimeOwner(), task = this.get(id);
+    if (!task || task.state !== "awaiting_authorization") throw new Error("任务不在授权等待状态");
+    return this.save(task, { ...task, owner, state });
   }
 
   dispatched(id: string, sessionId: string, requestFingerprint: string): InboxTask {

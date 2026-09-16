@@ -345,11 +345,35 @@ export class GatewayStore {
     });
   }
 
-  private updateMessageEvent(task: InboxTask, status: string, dispatched: boolean): void {
+  resumeAuthorizationMessage(message: ChannelMessage): InboxTask | undefined {
+    return this.messageTransaction(() => {
+      const task = this.inbox.findMessage(message);
+      if (!task) return undefined;
+      const recovery = this.getAuthorizationRecovery(message);
+      if (recovery?.state !== "resuming" || recovery.sessionId !== task.sessionId) throw new Error("授权续跑与持久化任务绑定不一致");
+      const resumed = this.inbox.transitionAuthorization(task.id, "preparing");
+      this.updateMessageEvent(resumed, "processing", true, "awaiting_authorization");
+      return resumed;
+    });
+  }
+
+  settleAuthorizationMessage(message: ChannelMessage): boolean {
+    return this.messageTransaction(() => {
+      const task = this.inbox.findMessage(message);
+      if (!task || task.state !== "awaiting_authorization") return false;
+      const recovery = this.getAuthorizationRecovery(message);
+      if (!recovery || recovery.sessionId !== task.sessionId || ["waiting", "resuming", "completed"].includes(recovery.state)) return false;
+      const settled = this.inbox.transitionAuthorization(task.id, "failed");
+      this.updateMessageEvent(settled, "failed", true, "awaiting_authorization");
+      return true;
+    });
+  }
+
+  private updateMessageEvent(task: InboxTask, status: string, dispatched: boolean, previous = "processing"): void {
     const message = task.message;
     const result = this.db.prepare(`UPDATE processed_events SET status = ?, dispatched = MAX(dispatched, ?), updated_at = ?
-      WHERE event_id = ? AND status = 'processing'`)
-      .run(status, dispatched ? 1 : 0, new Date().toISOString(), this.eventKey(message.channelType, message.installationId, message.messageId));
+      WHERE event_id = ? AND status = ?`)
+      .run(status, dispatched ? 1 : 0, new Date().toISOString(), this.eventKey(message.channelType, message.installationId, message.messageId), previous);
     if (Number(result.changes) !== 1) throw new Error("消息接收记录缺失或状态已变化，不能更新执行检查点");
   }
 
