@@ -12,13 +12,17 @@ export type CredentialProvisioningArk = Pick<ArkClient,
 
 // 调用者必须持有完整用户身份的维护租约。本函数只确认预置资源，不能恢复原业务消息。
 export async function provisionUserCredential(store: GatewayStore, ark: CredentialProvisioningArk,
-  identity: CredentialIdentity, assertActive: () => void): Promise<{ vaultId: string; credentialId: string }> {
+  identity: CredentialIdentity, assertActive: () => void, expectedOperationId?: string): Promise<{ vaultId: string; credentialId: string }> {
   const journal = store.credentialProvisioning;
   const checked = async <T>(operation: () => Promise<T>): Promise<T> => {
     assertActive(); const result = await operation(); assertActive(); return result;
   };
   try {
+    assertActive();
+    if (expectedOperationId !== undefined && (typeof expectedOperationId !== "string"
+      || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(expectedOperationId))) throw unconfirmed();
     let record = journal.get(identity);
+    if (record && expectedOperationId !== undefined && record.operationId !== expectedOperationId) throw unconfirmed();
     let vaultVerified = false, credentialVerified = false;
     if (!record) {
       const externalUserId = createHash("sha256").update(credentialIdentityKey(identity)).digest("hex");
@@ -26,7 +30,7 @@ export async function provisionUserCredential(store: GatewayStore, ark: Credenti
       const vaults = await checked(() => ark.listVaults());
       // 没有原操作记录的远端资源可能含有已授权Token；名称相同不能证明归属。
       if (!Array.isArray(vaults) || vaults.some(v => v.displayName === name || v.metadata?.external_user_id === externalUserId)) throw unconfirmed();
-      record = journal.begin(identity);
+      record = journal.begin(identity, expectedOperationId);
       const id = await checked(() => ark.createVault(record!.vaultName, provisioningMetadata(record!, "vault")));
       record = journal.confirmVault(record, id);
       vaultVerified = true;

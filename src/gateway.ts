@@ -16,7 +16,8 @@ import { ArkHttpError } from "./ark.ts";
 import { ArkRunError, failureDiagnostic } from "./ark-errors.ts";
 import { isFailureNoticeDelivered } from "./failure-notice.ts";
 import { PreparationRunner, PreparationCheckpointError } from "./preparation-runner.ts";
-import { validatePreparedAuthorization, type PreparedAuthorization, type UserCredentialLifecycle } from "./prepared-authorization.ts";
+import { validatePreparedAuthorization, validateUserCredentialPreparationIntent, type PreparedAuthorization,
+  type UserCredentialPreparationIntent, type UserCredentialLifecycle } from "./prepared-authorization.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -251,6 +252,9 @@ export class Gateway {
       const binding = this.inboxBinding(task.message);
       const authorization = this.preparedUserAuthorization(task);
       if (authorization && !this.userAuthorizationMatches(task.message, authorization)) return false;
+      const credentialStep = task.preparationPlan?.steps.find(step => step.id === "user-credential");
+      if (credentialStep?.state === "pending" && credentialStep.authorizationIntent !== undefined
+        && !this.userCredentialIntentMatches(task.message, credentialStep.authorizationIntent)) return false;
       if (task.preparation && task.message.conversationType === "direct" && this.options.userCredentialLifecycle && !authorization) return false;
       if (task.preparationPlan) {
         const actual = this.store.getSession(this.conversationKey(task.message));
@@ -273,6 +277,30 @@ export class Gateway {
     if (proof === undefined) return undefined;
     validatePreparedAuthorization(proof);
     return proof;
+  }
+
+  private userCredentialIntentMatches(message: IncomingMessage, intent: UserCredentialPreparationIntent): boolean {
+    try {
+      validateUserCredentialPreparationIntent(intent);
+      const lifecycle = this.options.userCredentialLifecycle;
+      if (message.conversationType !== "direct" || !lifecycle?.capture || !lifecycle.recover || !lifecycle.matchesIntent
+        || intent.identity.channelType !== message.channelType || intent.identity.installationId !== message.installationId
+        || intent.identity.tenantId !== message.tenantId || intent.identity.openId !== message.senderId) return false;
+      const matched: unknown = lifecycle.matchesIntent(structuredClone(message), structuredClone(intent));
+      if (matched !== true) {
+        if (matched && (typeof matched === "object" || typeof matched === "function") && typeof (matched as { then?: unknown }).then === "function") {
+          void Promise.resolve(matched).catch(() => {});
+        }
+        return false;
+      }
+      return intent.kind !== "bound" || this.userAuthorizationMatches(message, intent.authorization);
+    } catch { return false; }
+  }
+
+  private hasRecoverableUserCredential(task: InboxTask): boolean {
+    const step = task.preparationPlan?.steps.find(item => item.id === "user-credential");
+    return Boolean(step?.state === "pending" && step.kind === "hook" && step.authorizationIntent
+      && this.userCredentialIntentMatches(task.message, step.authorizationIntent));
   }
 
   private userAuthorizationMatches(message: IncomingMessage, proof: PreparedAuthorization, forDispatch = false): boolean {
@@ -388,7 +416,8 @@ export class Gateway {
 
   private async resumePreparedMessage(task: InboxTask): Promise<void> {
     if ((!task.preparation && !task.preparationPlan) || !this.recoveryBindingMatches(task)) return;
-    if (task.preparationPlan?.steps.some(step => step.state === "pending" && !["attachment", "mount", "creation"].includes(step.kind))) return;
+    if (task.preparationPlan?.steps.some(step => step.state === "pending" && !["attachment", "mount", "creation"].includes(step.kind)
+      && !(step.id === "user-credential" && this.hasRecoverableUserCredential(task)))) return;
     if (task.preparationPlan && !this.options.sessionConfigurationRevision) {
       const completed = (id: string) => task.preparationPlan!.steps.some(step => step.id === id && step.state === "completed");
       const creating = !task.preparationPlan.target.sessionId;
@@ -397,9 +426,9 @@ export class Gateway {
         || (creating && !this.usesBotOnlyIdentity(task.message) && this.options.getUserVaultIds && !completed("user-vaults"))
         || (creating && (this.options.sessionEnvironment || this.options.buildSessionRequest) && !completed("session-request"))) return;
     }
-    // 旧任务没有授权代次时不补造证明；专用维护接口不意味着任意hook可重跑。
+    // 仅专用原始意图可恢复未完成的用户准备，旧任务不能事后补造授权证明。
     if (task.message.conversationType === "direct" && (this.options.dualIdentity || this.options.userCredentialLifecycle)
-      && !this.preparedUserAuthorization(task)) return;
+      && !this.preparedUserAuthorization(task) && !this.hasRecoverableUserCredential(task)) return;
     // 恢复必须穿过本任务造成的暂停，但仍由同一scope队列串行，不并发修改Session。
     await new Promise<void>((resolve, reject) => this.queue.enqueue(task.binding.scope, async () => {
       let claimed = false;
@@ -914,9 +943,22 @@ export class Gateway {
         if (!this.userAuthorizationMatches(message, existing)) throw new PreparationCheckpointError("用户授权绑定已变化，未恢复旧任务");
         await userLifecycle.refresh(structuredClone(message), structuredClone(existing));
       }
-      userAuthorization = prepared ? existing : preparing
-        ? await preparing.step("user-credential", "hook", { message, revision: userLifecycle.revision }, () => userLifecycle.prepare(structuredClone(message)))
-        : await userLifecycle.prepare(structuredClone(message));
+      if (prepared) userAuthorization = existing;
+      else if (preparing && userLifecycle.capture && userLifecycle.recover && userLifecycle.matchesIntent) {
+        userAuthorization = await preparing.userCredential({ message, revision: userLifecycle.revision },
+          () => userLifecycle.capture!(structuredClone(message)), async (intent, recovering) => {
+            if (!this.userCredentialIntentMatches(message, intent)) throw new PreparationCheckpointError("原用户授权准备意图已失效，未继续执行");
+            return recovering ? userLifecycle.recover!(structuredClone(message), structuredClone(intent))
+              : userLifecycle.prepare(structuredClone(message), structuredClone(intent));
+          });
+      } else {
+        if (preparing && (userLifecycle.capture || userLifecycle.recover || userLifecycle.matchesIntent)) {
+          throw new PreparationCheckpointError("用户凭证准备恢复接口配置不完整，未继续执行");
+        }
+        userAuthorization = preparing
+          ? await preparing.step("user-credential", "hook", { message, revision: userLifecycle.revision }, () => userLifecycle.prepare(structuredClone(message)))
+          : await userLifecycle.prepare(structuredClone(message));
+      }
       if (userAuthorization) userAuthorization = structuredClone(userAuthorization);
       if (!userAuthorization || !this.userAuthorizationMatches(message, userAuthorization, true)) {
         throw new PreparationCheckpointError("用户授权尚未就绪或绑定已变化，未派发任务");

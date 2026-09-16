@@ -6,7 +6,8 @@ import type { CredentialStateStore } from "./credential-state.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
 import { createPreparationPlan, startPreparationStep, finishPreparationStep, preparationPlansEqual, validatePreparationPlan,
   type PreparationJson, type PreparationPlan, type PreparationStepInput, type PreparationTarget } from "./preparation-plan.ts";
-import { validatePreparedAuthorization, type PreparedAuthorization } from "./prepared-authorization.ts";
+import { validatePreparedAuthorization, validateUserCredentialPreparationIntent, validateUserCredentialPreparationResult,
+  type PreparedAuthorization } from "./prepared-authorization.ts";
 
 export type InboxState = "queued" | "preparing" | "dispatched" | "awaiting_authorization" | "completed" | "failed" | "uncertain";
 export type InboxBinding = { scope: string; agentId: string; configFingerprint: string };
@@ -136,6 +137,8 @@ export class MessageInbox {
     return this.transaction(() => {
       const task = this.expectedPreparing(expected, planId);
       const plan = startPreparationStep(task.preparationPlan!, input);
+      const intent = plan.steps.find(step => step.id === input.id)?.authorizationIntent;
+      if (intent !== undefined) validateAuthorizationIntentBinding(task.message, intent);
       return plan === task.preparationPlan ? task : this.save(task, { ...task, preparationPlan: plan });
     });
   }
@@ -143,7 +146,14 @@ export class MessageInbox {
   completePreparationStep(expected: InboxTask, planId: string, id: string, output: PreparationJson): InboxTask {
     return this.transaction(() => {
       const task = this.expectedPreparing(expected, planId);
-      if (id === "user-credential") validateAuthorizationBinding(task.message, output);
+      if (id === "user-credential") {
+        validateAuthorizationBinding(task.message, output);
+        const intent = task.preparationPlan!.steps.find(step => step.id === id)?.authorizationIntent;
+        if (intent !== undefined) {
+          validateAuthorizationIntentBinding(task.message, intent);
+          validateUserCredentialPreparationResult(intent, output);
+        }
+      }
       const plan = finishPreparationStep(task.preparationPlan!, id, output);
       return plan === task.preparationPlan ? task : this.save(task, { ...task, preparationPlan: plan });
     });
@@ -428,6 +438,7 @@ export class MessageInbox {
         if (payload.preparationPlan !== undefined) {
           validatePreparationPlan(payload.preparationPlan);
           const credential = payload.preparationPlan.steps.find(step => step.id === "user-credential");
+          if (credential?.authorizationIntent !== undefined) validateAuthorizationIntentBinding(message, credential.authorizationIntent);
           if (credential?.state === "completed") validateAuthorizationBinding(message, credential.output);
           if (payload.version !== 3 || payload.preparation !== undefined
             || !((metadata.state === "preparing" && metadata.interruptedAt === undefined)
@@ -543,4 +554,11 @@ function validateAuthorizationBinding(message: ChannelMessage, proof: unknown): 
   if (message.conversationType !== "direct" || proof.identity.channelType !== message.channelType
     || proof.identity.installationId !== message.installationId || proof.identity.tenantId !== message.tenantId
     || proof.identity.openId !== message.senderId) throw new Error("用户授权准备证明与原消息身份不一致");
+}
+
+function validateAuthorizationIntentBinding(message: ChannelMessage, intent: unknown): void {
+  validateUserCredentialPreparationIntent(intent);
+  if (message.conversationType !== "direct" || intent.identity.channelType !== message.channelType
+    || intent.identity.installationId !== message.installationId || intent.identity.tenantId !== message.tenantId
+    || intent.identity.openId !== message.senderId) throw new Error("用户凭证准备意图与原消息身份不一致");
 }

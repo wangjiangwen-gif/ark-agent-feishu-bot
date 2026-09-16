@@ -11,6 +11,7 @@ export type CredentialProvisioningRecord = {
   version: 1; identity: CredentialIdentity; operationId: string; revision: number; phase: CredentialProvisioningPhase;
   createdAt: number; credentialRequestedAt?: number; vaultName: string; credentialName: string;
   vaultId?: string; credentialId?: string;
+  initialAuthorizationGeneration?: string;
 };
 
 const revisions: Record<CredentialProvisioningPhase, number> = {
@@ -51,12 +52,15 @@ export class CredentialProvisioningStore {
     return row ? this.decode(row) : undefined;
   }
 
-  begin(identity: CredentialIdentity): CredentialProvisioningRecord {
+  begin(identity: CredentialIdentity, operationId?: string): CredentialProvisioningRecord {
     validateIdentity(identity);
+    if (operationId !== undefined && (typeof operationId !== "string" || !uuid.test(operationId))) {
+      throw new Error("用户凭证预置操作标识无效");
+    }
     return this.transaction(() => {
       if (this.credentials.get(identity)) throw new Error("该用户已有凭证绑定，不能重新预置");
       if (this.get(identity)) throw new Error("用户凭证预置已有记录，必须核查原操作，不能重复创建");
-      const record: CredentialProvisioningRecord = { version: 1, identity: structuredClone(identity), operationId: randomUUID(),
+      const record: CredentialProvisioningRecord = { version: 1, identity: structuredClone(identity), operationId: operationId ?? randomUUID(),
         revision: 1, phase: "vault_pending", createdAt: Date.now(), vaultName: vaultName(identity),
         credentialName: PROVISIONING_CREDENTIAL_NAME };
       validateRecord(record);
@@ -108,9 +112,18 @@ export class CredentialProvisioningStore {
         return current;
       }
       // 已有相同绑定可能已经OAuth成功，必须保留Token、状态和授权代次。
-      if (!binding) this.credentials.save(current.identity, { vaultId: current.vaultId!, credentialId: current.credentialId!,
-        status: "binding", expiresAt: 0, scopes: [] }, 0);
-      return this.save(current, { ...current, phase: "completed", revision: current.revision + 1 });
+      let initialAuthorizationGeneration: string | undefined;
+      if (!binding) {
+        const created = this.credentials.save(current.identity, { vaultId: current.vaultId!, credentialId: current.credentialId!,
+          status: "binding", expiresAt: 0, scopes: [] }, 0);
+        initialAuthorizationGeneration = created.authorizationGeneration;
+        if (typeof initialAuthorizationGeneration !== "string" || !uuid.test(initialAuthorizationGeneration)) {
+          throw new Error("首次凭证绑定缺少有效授权代次，未完成原预置操作");
+        }
+      }
+      // 仅记录本事务新建占位绑定的代次，不能把既有授权回填成原任务的初始证明。
+      return this.save(current, { ...current, phase: "completed", revision: current.revision + 1,
+        ...(initialAuthorizationGeneration === undefined ? {} : { initialAuthorizationGeneration }) });
     });
   }
 
@@ -192,7 +205,8 @@ function validateRecord(value: unknown): asserts value is CredentialProvisioning
   if (typeof phase !== "string" || !Object.hasOwn(revisions, phase)) throw new Error("用户凭证预置记录阶段无效");
   const keys = [...commonKeys, ...(phase !== "vault_pending" ? ["vaultId"] : []),
     ...(["credential_pending", "ready", "completed"].includes(phase) ? ["credentialRequestedAt"] : []),
-    ...(["ready", "completed"].includes(phase) ? ["credentialId"] : [])];
+    ...(["ready", "completed"].includes(phase) ? ["credentialId"] : []),
+    ...(phase === "completed" && Object.hasOwn(value, "initialAuthorizationGeneration") ? ["initialAuthorizationGeneration"] : [])];
   if (!exact(value, keys)) throw new Error("用户凭证预置记录字段组合无效");
   validateIdentity(value.identity);
   if (value.version !== 1 || typeof value.operationId !== "string" || !uuid.test(value.operationId)
@@ -203,5 +217,7 @@ function validateRecord(value: unknown): asserts value is CredentialProvisioning
     || (["credential_pending", "ready", "completed"].includes(phase) && (!Number.isSafeInteger(value.credentialRequestedAt)
       || Number(value.credentialRequestedAt) < Number(value.createdAt) || Number(value.credentialRequestedAt) > Date.now()))
     || (["ready", "completed"].includes(phase) && !identifier(value.credentialId))
+    || (Object.hasOwn(value, "initialAuthorizationGeneration") && (typeof value.initialAuthorizationGeneration !== "string"
+      || !uuid.test(value.initialAuthorizationGeneration)))
     || Buffer.byteLength(JSON.stringify(value), "utf8") > 16384) throw new Error("用户凭证预置记录结构或大小无效");
 }

@@ -12,6 +12,7 @@ import * as provisioningState from "../src/credential-provisioning-state.ts";
 
 const identity = { channelType: "lark", installationId: "cli-provision", tenantId: "tenant", openId: "alice" };
 const other = { ...identity, openId: "bob" };
+const fixedOperationId = "11111111-1111-4111-8111-111111111111";
 const known = { vaultId: "vault", credentialId: "credential", status: "ready" as const,
   scopes: ["calendar:read"], expiresAt: 10000, refreshToken: "existing-private-refresh" };
 function memory(t: { after: (callback: () => void) => void }) {
@@ -47,6 +48,23 @@ test("already bound credentials cannot start a new provisioning operation", t =>
   const store = memory(t); store.credentials.save(identity, known, 0);
   assert.throws(() => store.credentialProvisioning.begin(identity), /绑定|预置/);
   assert.equal(store.credentialProvisioning.get(identity), undefined);
+});
+
+test("a caller can persist a fixed original provisioning operation without changing its identity", t => {
+  const store = memory(t), record = store.credentialProvisioning.begin(identity, fixedOperationId);
+  assert.equal(record.operationId, fixedOperationId);
+  assert.equal(provisioningMetadata(record, "vault").arkagent_provision_operation, fixedOperationId);
+  assert.throws(() => store.credentialProvisioning.begin(other, fixedOperationId));
+  assert.equal(store.credentialProvisioning.get(other), undefined);
+  assert.deepEqual(store.credentialProvisioning.get(identity), record);
+});
+
+for (const operationId of ["", "not-a-uuid", fixedOperationId.toUpperCase().replace("1", "A"), "11111111-1111-1111-8111-111111111111", null, 1])
+test(`an invalid fixed provisioning operation is rejected before writing a journal: ${JSON.stringify(operationId)}`, t => {
+  const store = memory(t);
+  assert.throws(() => store.credentialProvisioning.begin(identity, operationId as string));
+  assert.equal(store.credentialProvisioning.get(identity), undefined);
+  assert.equal(store.credentials.get(identity), undefined);
 });
 
 test("Vault preflight can derive the original name without creating a provisioning intent", t => {
@@ -92,6 +110,7 @@ test("each resource phase has a durable receipt and completing installs only the
   assert.equal(binding.status, "binding"); assert.equal(binding.expiresAt, 0); assert.deepEqual(binding.scopes, []);
   assert.equal(binding.refreshToken, undefined); assert.equal(binding.pendingAccessToken, undefined);
   assert.match(binding.authorizationGeneration!, /^[a-f0-9-]{36}$/);
+  assert.equal(completed.initialAuthorizationGeneration, binding.authorizationGeneration);
   assert.deepEqual(store.credentialProvisioning.complete(completed), completed);
   assert.deepEqual(store.credentials.get(identity), binding);
 });
@@ -107,6 +126,7 @@ test(`${phase} provisioning survives closing and reopening the encrypted databas
   store.close();
   assert.equal(readFileSync(path).includes(Buffer.from(record.vaultName)), false);
   assert.equal(readFileSync(path).includes(Buffer.from(record.credentialName)), false);
+  if (record.initialAuthorizationGeneration) assert.equal(readFileSync(path).includes(Buffer.from(record.initialAuthorizationGeneration)), false);
   const reopened = new GatewayStore(path); t.after(() => reopened.close());
   assert.deepEqual(reopened.credentialProvisioning.get(identity), record);
 });
@@ -160,8 +180,89 @@ test("an existing authorized binding is preserved byte-for-byte when the same op
   const store = memory(t), ready = reachReady(store);
   store.credentials.save(identity, known, 0);
   const before = store.credentials.get(identity);
-  store.credentialProvisioning.complete(ready);
+  const completed = store.credentialProvisioning.complete(ready);
+  assert.equal(Object.hasOwn(completed, "initialAuthorizationGeneration"), false);
+  assert.deepEqual(store.credentialProvisioning.complete(completed), completed);
   assert.deepEqual(store.credentials.get(identity), before);
+});
+
+test("an existing placeholder binding is not relabeled as created by the provisioning transaction", t => {
+  const store = memory(t), ready = reachReady(store);
+  store.credentials.save(identity, { vaultId: "vault", credentialId: "credential", status: "binding", scopes: [], expiresAt: 0 }, 0);
+  const before = store.credentials.get(identity), completed = store.credentialProvisioning.complete(ready);
+  assert.equal(Object.hasOwn(completed, "initialAuthorizationGeneration"), false);
+  assert.deepEqual(store.credentials.get(identity), before);
+});
+
+test("completed provisioning cannot replace or remove its original authorization generation receipt", t => {
+  const store = memory(t), completed = store.credentialProvisioning.complete(reachReady(store));
+  assert.ok(completed.initialAuthorizationGeneration);
+  assert.throws(() => store.credentialProvisioning.complete({ ...completed, initialAuthorizationGeneration: fixedOperationId }));
+  const { initialAuthorizationGeneration: _ignored, ...withoutReceipt } = completed;
+  assert.throws(() => store.credentialProvisioning.complete(withoutReceipt));
+  assert.deepEqual(store.credentialProvisioning.get(identity), completed);
+});
+
+test("deleting and recreating the same resource binding does not change its old provisioning generation receipt", t => {
+  const { store, path } = disk(t), completed = store.credentialProvisioning.complete(reachReady(store));
+  const original = store.credentials.get(identity)!;
+  const db = new DatabaseSync(path); t.after(() => db.close());
+  db.prepare("DELETE FROM employee_credentials WHERE identity_key = ?").run(credentialIdentityKey(identity));
+  const replacement = store.credentials.save(identity, { vaultId: "vault", credentialId: "credential", status: "binding", scopes: [], expiresAt: 0 }, 0);
+  assert.equal(completed.initialAuthorizationGeneration, original.authorizationGeneration);
+  assert.notEqual(completed.initialAuthorizationGeneration, replacement.authorizationGeneration);
+  assert.deepEqual(store.credentialProvisioning.complete(completed), completed);
+});
+
+test("an old completed journal without a generation remains readable and cannot manufacture one", t => {
+  const { store, path } = disk(t), completed = store.credentialProvisioning.complete(reachReady(store));
+  const db = new DatabaseSync(path); t.after(() => db.close());
+  const row = db.prepare("SELECT * FROM employee_credential_provisioning").get()!;
+  const context = JSON.stringify(["credential-provisioning", row.identity_key, row.operation_id, row.revision]);
+  const legacy = { ...completed }; delete legacy.initialAuthorizationGeneration;
+  db.prepare("UPDATE employee_credential_provisioning SET secret = ?").run(store.credentials.sealAuthorization(JSON.stringify(legacy), context));
+  assert.deepEqual(store.credentialProvisioning.get(identity), legacy);
+  assert.deepEqual(store.credentialProvisioning.complete(legacy), legacy);
+  assert.equal(Object.hasOwn(store.credentialProvisioning.get(identity)!, "initialAuthorizationGeneration"), false);
+});
+
+test("an invalid authenticated initial generation is rejected when the journal is read back", t => {
+  const { store, path } = disk(t);
+  const completed = store.credentialProvisioning.complete(reachReady(store));
+  const db = new DatabaseSync(path); t.after(() => db.close());
+  const row = db.prepare("SELECT * FROM employee_credential_provisioning").get()!;
+  const context = JSON.stringify(["credential-provisioning", row.identity_key, row.operation_id, row.revision]);
+  db.prepare("UPDATE employee_credential_provisioning SET secret = ?").run(store.credentials.sealAuthorization(
+    JSON.stringify({ ...completed, initialAuthorizationGeneration: "invalid-generation" }), context));
+  assert.throws(() => store.credentialProvisioning.get(identity), /结构|预置/);
+});
+
+test("a missing generation returned by binding creation rolls back the entire provisioning completion", t => {
+  const store = memory(t), ready = reachReady(store), save = store.credentials.save.bind(store.credentials);
+  store.credentials.save = (...args) => ({ ...save(...args), authorizationGeneration: undefined });
+  assert.throws(() => store.credentialProvisioning.complete(ready), /代次/);
+  assert.equal(store.credentials.get(identity), undefined);
+  assert.deepEqual(store.credentialProvisioning.get(identity), ready);
+  store.credentials.save = save;
+  const completed = store.credentialProvisioning.complete(ready);
+  assert.equal(completed.initialAuthorizationGeneration, store.credentials.get(identity)?.authorizationGeneration);
+});
+
+for (const phase of ["vault_pending", "vault_confirmed", "credential_pending", "ready"] as const)
+test(`${phase} cannot carry a premature initial authorization generation`, t => {
+  const store = memory(t);
+  let record = store.credentialProvisioning.begin(identity);
+  if (phase !== "vault_pending") record = store.credentialProvisioning.confirmVault(record, "vault");
+  if (phase === "credential_pending" || phase === "ready") record = store.credentialProvisioning.beginCredential(record);
+  if (phase === "ready") record = store.credentialProvisioning.confirmCredential(record, "credential");
+  assert.throws(() => provisioningMetadata({ ...record, initialAuthorizationGeneration: fixedOperationId }, "vault"));
+  assert.deepEqual(store.credentialProvisioning.get(identity), record);
+});
+
+for (const generation of [undefined, null, "", "invalid", 1])
+test(`an invalid initial authorization generation fails encrypted journal validation: ${String(generation)}`, t => {
+  const store = memory(t), completed = store.credentialProvisioning.complete(reachReady(store));
+  assert.throws(() => provisioningMetadata({ ...completed, initialAuthorizationGeneration: generation } as CredentialProvisioningRecord, "vault"));
 });
 
 test("another binding for the same identity prevents completion without overwriting its credentials", t => {
@@ -217,7 +318,9 @@ test(`a ${target} write failure rolls back both the binding and completed journa
   assert.equal(store.credentials.get(identity), undefined);
   assert.deepEqual(store.credentialProvisioning.get(identity), ready);
   db.exec(target === "employee_credentials" ? "DROP TRIGGER fail_binding" : "DROP TRIGGER fail_provision");
-  assert.equal(store.credentialProvisioning.complete(ready).phase, "completed");
+  const completed = store.credentialProvisioning.complete(ready);
+  assert.equal(completed.phase, "completed");
+  assert.equal(completed.initialAuthorizationGeneration, store.credentials.get(identity)?.authorizationGeneration);
 });
 
 test("association metadata stays stable for each exact request and changes for different operations", t => {

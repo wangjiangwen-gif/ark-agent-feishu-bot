@@ -286,6 +286,34 @@ Session升级协议层增量（2026-09-16，本地基线34ecfa5）：上一轮�
 
 ### 首次用户凭证预置恢复（2026-09-17，基线924b40f）
 
+## 本轮增量：用户凭证准备中断后恢复原消息（2026-09-17）
+
+### Stage R1: 持久化原授权准备意图
+**Goal**: 在用户凭证操作前，将完整身份、原授权流程/代次或固定预置操作ID与pending步骤原子保存。
+**Success Criteria**: 不在重启时补造证明；初始占位绑定的授权代次与资源完成回执同事务保存；普通hook不开放重跑。
+**Tests**: 意图严格校验、加密重开、CAS/事务回滚、旧记录兼容、不同操作/身份/代次拒绝。
+**Status**: Complete
+
+### Stage R2: Gateway接回原Inbox任务
+**Goal**: 专用生命周期按原意图核查和续办，完成后沿原准备计划、队列和dispatch门禁执行原消息。
+**Success Criteria**: 不重读已冻结上下文、不重复创建、不采纳后来的OAuth；同scope FIFO、跨scope独立；CLI实验队列仍默认关闭。
+**Tests**: Vault/Credential多个退出断点、初始binding已保存断点、Token轮换/同步、身份与流程变化、重复启动恢复。
+**Status**: Complete
+
+### Stage R3: 完整回归与证据
+**Goal**: 单元测试、真实子进程/SQLite与模拟HTTP端到端、构建、自审和性能复查。
+**Success Criteria**: 明确区分模拟外部接口与真实平台验收，保留Stage 1–5剩余工作；不部署或发布。
+**Tests**: 全量自动化、check/build/diff、普通路径调用数与耗时对照。
+**Status**: Complete
+
+实现与验证：专用用户准备步骤在任何远端调用前，把原完整身份、flow与授权代次/固定operationId和pending状态原子加密保存。首次占位binding的generation与预置完成回执同事务写入，不从后来的同ID授权补造原证明。重启只调用专用recover，核查原资源后接回原Inbox；既有上下文、plan和intent不换，普通开发者hook仍不能重跑。已有绑定只维护原Credential；generation、flow、Session、配置或生命周期revision变化都会停止。CLI接线版本为employee-credentials-v2，实验队列仍默认关闭。
+
+新增141项，最终全量1677/1677通过，零失败/取消/跳过（17178.648792ms）；29项仅手动压缩回归通过，语法check、build、benchmark语法和diff检查通过。主接口最初29项全红；首轮全量的10项失败源于新E2E把ChannelOutbound对象当字符串，修正夹具按真实接口提取text后全绿，没有放宽产品校验。35项真实子进程测试覆盖Vault POST/确认、Credential POST/确认、binding完成五个退出点，父进程仅recoverPendingMessages自动完成原消息，资源各创建1次、原消息业务POST/最终回复各1次，第二次重开也不重复。A1/A2 FIFO及Alice查询挂起时Bob独立恢复通过；引用原文、准备plan/intent保持不变。Token落盘后恢复同步不重复交换，未知刷新/远端证据不全/新OAuth甚至取消/异步门禁/旧普通hook均暂停。真实产品Gateway、Manager、ArkClient与SQLite运行，HTTP/OAuth/飞书为合成边界，不是线上E2E。
+
+性能：新增可复跑脚本benchmark-user-preparation-recovery.mjs，以84537a6独立导出源码为基线、真实文件SQLite、模拟远端，同进程交替每场景200与500组。500组默认首次/已绑定P95分别3.693→3.009ms、3.671→3.592ms；P50增加约0.04–0.05ms。第一组默认已绑定P95曾上升，扩大样本后未持续，保留两次结果，不宣称真实提速。实验队列首次/已绑定P95=7.627→8.790ms、7.553→8.642ms，约增加1.1ms本地验证/加密成本；前后外部调用数完全一致，无新增核查。证据见docs/test-results/pending-user-preparation-2026-09-17.json。
+
+剩余边界：实验队列冻结意图后若刷新确认失效会换代，原任务保守暂停；默认非durable新消息仍保留Bot降级并按工具错误发起OAuth的旧体验。旧pending缺intent、已pending但缺远端证明、普通未知回调与缺失下载内容仍需人工处理方案；不能绕过身份、重试未知写入或启用生产实验队列。原Stage 1–5的真实飞书/完整性能验收、CLI启用/迁移回退、部分写入受控续跑、upgrade网关闭环、Memory/TOS组合、客户PDF与原生compact真实契约仍未完成。本轮未部署或发布，开发机保持稳定版，完整目标继续active。
+
 ## Stage V1: 创建意图与查询契约
 **Goal**: 为用户Vault/Credential创建保存加密阶段日志，补全官方分页查询和元信息校验。
 **Success Criteria**: 请求前落盘、结果未知不重POST；本地已确认绑定不增加远程查询；缺密钥不能重建。

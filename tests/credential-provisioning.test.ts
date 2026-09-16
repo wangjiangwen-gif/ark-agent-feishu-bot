@@ -6,9 +6,11 @@ import { GatewayStore } from "../src/store.ts";
 import { credentialIdentityKey } from "../src/credential-state.ts";
 import type { IncomingMessage } from "../src/gateway.ts";
 import type { VaultMetadata, CredentialMetadata } from "../src/ark.ts";
+import { provisionUserCredential } from "../src/credential-provisioning.ts";
 
 const identity = { channelType: "lark", installationId: "cli", tenantId: "tenant", openId: "alice" };
 const vaultName = `ark-employee-user-${createHash("sha256").update(credentialIdentityKey(identity)).digest("hex").slice(0, 40)}`;
+const fixedOperationId = "11111111-1111-4111-8111-111111111111";
 const message: IncomingMessage = { ...identity, senderId: identity.openId, conversationType: "direct",
   conversationId: "direct", eventId: "event", messageId: "message", text: "hello", resources: [],
   mentionedBot: false, threadId: "", rootMessageId: "", parentMessageId: "", createTime: 1 };
@@ -52,6 +54,68 @@ function fixture(t: TestContext) {
   t.after(() => { auth.close(); store.close(); });
   return { store, auth, ark, vaults, credentials, calls };
 }
+
+async function provision(f: ReturnType<typeof fixture>, operationId: string, assertActive: () => void = () => {}) {
+  const lease = f.store.credentials.acquire(identity);
+  try { return await provisionUserCredential(f.store, f.ark, identity, assertActive, operationId); }
+  finally { f.store.credentials.release(identity, lease); }
+}
+
+test("fresh provisioning uses the operation frozen before the hook started", async t => {
+  const f = fixture(t);
+  assert.deepEqual(await provision(f, fixedOperationId), { vaultId: "vault", credentialId: "credential" });
+  const record = f.store.credentialProvisioning.get(identity)!;
+  assert.equal(record.operationId, fixedOperationId);
+  assert.equal(record.initialAuthorizationGeneration, f.store.credentials.get(identity)?.authorizationGeneration);
+  assert.equal(f.vaults[0].metadata?.arkagent_provision_operation, fixedOperationId);
+  assert.equal(f.credentials[0].metadata?.arkagent_provision_operation, fixedOperationId);
+});
+
+test("recovery confirms only the exact original provisioning operation", async t => {
+  const f = fixture(t), create = f.ark.createEnvironmentVariableCredential;
+  f.ark.createEnvironmentVariableCredential = async (...args) => { await create(...args); throw new Error("lost"); };
+  await assert.rejects(provision(f, fixedOperationId));
+  const original = f.store.credentialProvisioning.get(identity)!;
+  assert.equal(original.operationId, fixedOperationId);
+  assert.deepEqual(await provision(f, fixedOperationId), { vaultId: "vault", credentialId: "credential" });
+  assert.equal(f.calls.filter(c => c === "vault-create").length, 1);
+  assert.equal(f.calls.filter(c => c === "credential-create").length, 1);
+  assert.equal(f.store.credentialProvisioning.get(identity)?.operationId, original.operationId);
+});
+
+for (const phase of ["vault_pending", "vault_confirmed", "credential_pending", "ready", "completed"] as const)
+test(`a different expected operation in ${phase} makes no remote call or local write`, async t => {
+  const f = fixture(t);
+  let record = f.store.credentialProvisioning.begin(identity);
+  if (phase !== "vault_pending") record = f.store.credentialProvisioning.confirmVault(record, "vault");
+  if (["credential_pending", "ready", "completed"].includes(phase)) record = f.store.credentialProvisioning.beginCredential(record);
+  if (["ready", "completed"].includes(phase)) record = f.store.credentialProvisioning.confirmCredential(record, "credential");
+  if (phase === "completed") record = f.store.credentialProvisioning.complete(record);
+  const binding = f.store.credentials.get(identity);
+  await assert.rejects(provision(f, fixedOperationId));
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.store.credentialProvisioning.get(identity), record);
+  assert.deepEqual(f.store.credentials.get(identity), binding);
+});
+
+for (const operation of ["", "invalid", "11111111-1111-1111-8111-111111111111", null, 1])
+test(`an invalid expected operation prevents preflight and provisioning: ${String(operation)}`, async t => {
+  const f = fixture(t);
+  await assert.rejects(provision(f, operation as string));
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.store.credentialProvisioning.get(identity), undefined);
+});
+
+for (const boundary of ["vault-list", "vault-create", "credential-list", "credential-create"] as const)
+test(`authorization becoming inactive after ${boundary} stops the fixed operation before its next effect`, async t => {
+  const f = fixture(t);
+  await assert.rejects(provision(f, fixedOperationId, () => {
+    if (f.calls.includes(boundary)) throw new Error("inactive");
+  }));
+  const sequence = ["vault-list", "vault-create", "credential-list", "credential-create"];
+  assert.deepEqual(f.calls, sequence.slice(0, sequence.indexOf(boundary) + 1));
+  assert.equal(f.store.credentials.get(identity), undefined);
+});
 
 test("fresh provisioning journals each POST and reuses a confirmed binding without extra API calls", async t => {
   const f = fixture(t);

@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { configFingerprint } from "./session-config.ts";
+import { validateUserCredentialPreparationIntent, validateUserCredentialPreparationResult,
+  type UserCredentialPreparationIntent } from "./prepared-authorization.ts";
 
 export type PreparationJson = null | boolean | number | string | PreparationJson[] | { [key: string]: PreparationJson };
 export type PreparationTarget = { sessionId?: string; reusable: boolean };
 export type PreparationStepKind = "observation" | "hook" | "attachment" | "mount" | "creation" | "snapshot";
-export type PreparationStepInput = { id: string; kind: PreparationStepKind; inputFingerprint: string };
+export type PreparationStepInput = { id: string; kind: PreparationStepKind; inputFingerprint: string;
+  authorizationIntent?: UserCredentialPreparationIntent };
 export type PreparationStep = PreparationStepInput & (
   | { state: "pending"; output?: never }
   | { state: "completed"; output: PreparationJson }
@@ -26,11 +29,14 @@ export function startPreparationStep(plan: PreparationPlan, input: PreparationSt
   validatePreparationPlan(plan); validateStepInput(input);
   const existing = plan.steps.find(step => step.id === input.id);
   if (existing) {
-    if (existing.kind !== input.kind || existing.inputFingerprint !== input.inputFingerprint) throw new Error("准备步骤名称已绑定其他输入或类型，不能替换");
+    if (existing.kind !== input.kind || existing.inputFingerprint !== input.inputFingerprint
+      || configFingerprint(existing.authorizationIntent ?? null) !== configFingerprint(input.authorizationIntent ?? null)) {
+      throw new Error("准备步骤名称已绑定其他输入、类型或授权意图，不能替换");
+    }
     return plan;
   }
   if (plan.steps.length >= MAX_PREPARATION_STEPS) throw new Error("准备步骤数量超过上限");
-  const next: PreparationPlan = { ...plan, steps: [...plan.steps, { ...input, state: "pending" }] };
+  const next: PreparationPlan = { ...plan, steps: [...plan.steps, { ...structuredClone(input), state: "pending" }] };
   validatePreparationPlan(next);
   return next;
 }
@@ -66,13 +72,18 @@ export function validatePreparationPlan(value: unknown): asserts value is Prepar
   const seen = new Set<string>();
   for (const step of value.steps) {
     if (!plain(step) || !["pending", "completed"].includes(String(step.state))
-      || !exact(step, ["id", "kind", "inputFingerprint", "state", ...(step.state === "completed" ? ["output"] : [])])) {
+      || !exact(step, ["id", "kind", "inputFingerprint", "state", ...(Object.hasOwn(step, "authorizationIntent") ? ["authorizationIntent"] : []),
+        ...(step.state === "completed" ? ["output"] : [])])) {
       throw new Error("准备步骤结构或状态无效");
     }
-    validateStepInput({ id: step.id, kind: step.kind, inputFingerprint: step.inputFingerprint });
+    validateStepInput({ id: step.id, kind: step.kind, inputFingerprint: step.inputFingerprint,
+      ...(Object.hasOwn(step, "authorizationIntent") ? { authorizationIntent: step.authorizationIntent } : {}) });
     if (seen.has(String(step.id))) throw new Error("准备步骤名称重复");
     seen.add(String(step.id));
-    if (step.state === "completed") validatePreparationOutput(step.output);
+    if (step.state === "completed") {
+      validatePreparationOutput(step.output);
+      if (step.authorizationIntent !== undefined) validateUserCredentialPreparationResult(step.authorizationIntent as UserCredentialPreparationIntent, step.output);
+    }
   }
 }
 
@@ -89,10 +100,14 @@ function validateTarget(value: unknown): asserts value is PreparationTarget {
 }
 
 function validateStepInput(value: unknown): asserts value is PreparationStepInput {
-  strictJson(value, 2048, 2, 8);
-  if (!exact(value, ["id", "kind", "inputFingerprint"]) || !identifier(value.id)
+  strictJson(value, 8192, 5, 64);
+  if (!exact(value, ["id", "kind", "inputFingerprint", ...(plain(value) && Object.hasOwn(value, "authorizationIntent") ? ["authorizationIntent"] : [])]) || !identifier(value.id)
     || !kinds.has(value.kind as PreparationStepKind) || typeof value.inputFingerprint !== "string"
     || !/^[a-f0-9]{64}$/.test(value.inputFingerprint)) throw new Error("准备步骤标识、类型或输入指纹无效");
+  if (Object.hasOwn(value, "authorizationIntent")) {
+    if (value.id !== "user-credential" || value.kind !== "hook") throw new Error("仅用户凭证准备步骤可以保存授权意图");
+    validateUserCredentialPreparationIntent(value.authorizationIntent);
+  }
 }
 
 function identifier(value: unknown): value is string {

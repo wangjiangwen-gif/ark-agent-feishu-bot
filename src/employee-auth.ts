@@ -6,7 +6,9 @@ import type { GatewayStore } from "./store.ts";
 import { credentialIdentityKey, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
 import { provisionUserCredential, type CredentialProvisioningArk } from "./credential-provisioning.ts";
 import { isAuthorizationTerminal, type AuthorizationFlow } from "./authorization-state.ts";
-import { validatePreparedAuthorization, type PreparedAuthorization } from "./prepared-authorization.ts";
+import { randomUUID } from "node:crypto";
+import { validatePreparedAuthorization, validateUserCredentialPreparationIntent,
+  type PreparedAuthorization, type UserCredentialPreparationIntent } from "./prepared-authorization.ts";
 
 export const EMPLOYEE_CALENDAR_USER_SCOPES = ["offline_access", "auth:user.id:read", "calendar:calendar:read", "calendar:calendar.event:read", "calendar:calendar.free_busy:read"];
 
@@ -43,7 +45,80 @@ export class EmployeeAuthorizationManager {
     return [(await this.ensureUserCredentialBinding(message)).vaultId];
   }
 
-  async prepareUserTurn(message: IncomingMessage): Promise<PreparedAuthorization> {
+  // 仅为新准备步骤捕获本地状态；必须由调用方先持久化，再执行有副作用的prepare。
+  captureUserTurn(message: IncomingMessage): UserCredentialPreparationIntent {
+    this.assertOpen();
+    if (message.conversationType !== "direct") throw new Error("群聊不能准备个人授权身份");
+    const identity = this.identity(message);
+    this.assertNoActiveFlow(identity);
+    const lease = this.store.credentials.acquire(identity);
+    try {
+      let state = this.store.migrateEmployeeCredential(identity);
+      // 旧绑定只允许在新消息的明确准备动作中补代次，恢复入口绝不补写。
+      if (state && !state.authorizationGeneration) state = this.store.credentials.save(identity, state, state.revision);
+      const flowId = this.store.authorizations.get(identity)?.id ?? null;
+      const intent: UserCredentialPreparationIntent = state
+        ? { version: 1, identity, flowId, kind: "bound", authorization: { version: 1, identity,
+          flowId, generation: state.authorizationGeneration!, vaultId: state.vaultId, credentialId: state.credentialId } }
+        : { version: 1, identity, flowId, kind: "provisioning",
+          operationId: this.store.credentialProvisioning.get(identity)?.operationId ?? randomUUID() };
+      validateUserCredentialPreparationIntent(intent);
+      if (!this.matchesUserTurnIntent(message, intent)) throw new Error("用户授权准备状态不明确，未生成替代意图");
+      return intent;
+    } finally { this.store.credentials.release(identity, lease); }
+  }
+
+  matchesUserTurnIntent(message: IncomingMessage, intent: UserCredentialPreparationIntent): boolean {
+    try {
+      this.assertOpen();
+      validateUserCredentialPreparationIntent(intent);
+      if (message.conversationType !== "direct") return false;
+      const identity = this.identity(message);
+      if (credentialIdentityKey(identity) !== credentialIdentityKey(intent.identity)) return false;
+      const flow = this.store.authorizations.get(identity);
+      if ((flow && !isAuthorizationTerminal(flow.phase)) || (flow?.id ?? null) !== intent.flowId) return false;
+      if (intent.kind === "bound") return this.matchesPreparedAuthorization(message, intent.authorization);
+      const journal = this.store.credentialProvisioning.get(identity);
+      if (journal && journal.operationId !== intent.operationId) return false;
+      const state = this.store.credentials.get(identity);
+      if (!state) return journal?.phase !== "completed";
+      // 已完成预置只能接回本次原始占位绑定，不能接受后来的同ID授权或重建绑定。
+      return Boolean(journal?.phase === "completed" && journal.initialAuthorizationGeneration
+        && journal.initialAuthorizationGeneration === state.authorizationGeneration
+        && journal.vaultId === state.vaultId && journal.credentialId === state.credentialId
+        && state.status === "binding" && state.scopes.length === 0 && state.expiresAt === 0
+        && !state.refreshToken && !state.pendingAccessToken);
+    } catch { return false; }
+  }
+
+  async recoverUserTurn(message: IncomingMessage, intent: UserCredentialPreparationIntent): Promise<PreparedAuthorization> {
+    validateUserCredentialPreparationIntent(intent);
+    const expected = structuredClone(intent), incoming = structuredClone(message);
+    const assertOriginal = () => {
+      if (!this.matchesUserTurnIntent(incoming, expected)) throw new Error("用户授权准备绑定已变化或证据不完整，未恢复旧任务");
+    };
+    assertOriginal();
+    if (expected.kind === "bound") {
+      await this.refreshPreparedAuthorization(incoming, expected.authorization);
+      return structuredClone(expected.authorization);
+    }
+    return this.exclusive(expected.identity, async () => {
+      assertOriginal();
+      if (!this.store.credentials.get(expected.identity)) {
+        await provisionUserCredential(this.store, this.ark, expected.identity, assertOriginal, expected.operationId);
+      }
+      assertOriginal();
+      const state = this.store.credentials.get(expected.identity)!;
+      const proof: PreparedAuthorization = { version: 1, identity: expected.identity, flowId: expected.flowId,
+        generation: state.authorizationGeneration!, vaultId: state.vaultId, credentialId: state.credentialId };
+      validatePreparedAuthorization(proof);
+      if (!this.matchesPreparedAuthorization(incoming, proof, true)) throw new Error("原用户凭证尚未就绪，未恢复旧任务");
+      return proof;
+    });
+  }
+
+  async prepareUserTurn(message: IncomingMessage, intent?: UserCredentialPreparationIntent): Promise<PreparedAuthorization> {
+    if (intent !== undefined) return this.recoverUserTurn(message, intent);
     this.assertOpen();
     if (message.conversationType !== "direct") throw new Error("群聊不能准备个人授权身份");
     const identity = this.identity(message);

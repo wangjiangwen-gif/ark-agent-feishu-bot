@@ -118,8 +118,15 @@ async function runEmployee(): Promise<void> {
     authorizationStatus: message => auth.status(message),
     getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
     userCredentialLifecycle: {
-      revision: "employee-credentials-v1",
-      prepare: message => auth.prepareUserTurn(message),
+      revision: "employee-credentials-v2",
+      capture: message => auth.captureUserTurn(message),
+      prepare: (message, intent) => auth.prepareUserTurn(message, intent),
+      recover: async (message, intent) => {
+        if (!auth.matchesUserTurnIntent(message, intent)) throw new Error("原用户授权准备意图已变化，未恢复旧任务");
+        await ensureBotToken(false);
+        return auth.recoverUserTurn(message, intent);
+      },
+      matchesIntent: (message, intent) => auth.matchesUserTurnIntent(message, intent),
       refresh: async (message, expected) => {
         if (!auth.matchesPreparedAuthorization(message, expected)) throw new Error("用户授权已变化，未恢复旧任务");
         await ensureBotToken(false);
