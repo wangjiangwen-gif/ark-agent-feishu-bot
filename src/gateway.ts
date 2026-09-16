@@ -44,7 +44,6 @@ export class KeyedQueue {
 export class Gateway {
   private queue = new KeyedQueue();
   private sessionStatsCheckedAt = new Map<string, number>();
-  private authorizationRetries = new Set<string>();
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
@@ -114,16 +113,36 @@ export class Gateway {
   }
 
   resumeAfterAuthorization(message: IncomingMessage, userVaultId: string): void {
+    if (message.conversationType !== "direct") return;
+    const recovery = this.store.getAuthorizationRecovery(message);
+    if (!recovery || !this.store.claimAuthorizationRecovery(message)) return;
     const key = this.conversationKey(message);
-    const sessionId = this.store.getSession(key);
-    if (!sessionId || this.store.getSessionVaultIds(key)?.includes(userVaultId)) {
-      this.resume(message);
-      return;
-    }
-    // 升级前创建的 Session 没有记录已挂载的 Vault，且 MA 不支持给运行中的
-    // Session 追加 Vault。仅这类遗留会话执行一次交接；新版会话均原地恢复。
-    console.info(`Session ${sessionId} 缺少用户 Vault 挂载记录，将执行一次兼容性交接`);
-    this.resumeWithHandoff(message);
+    // 在入队前原子领取，重复回调或重启都不能再次投递；实际执行时重新核对会话。
+    this.schedule(message, key, async () => {
+      try {
+        const sessionId = this.store.getSession(key);
+        if (!sessionId || sessionId !== recovery.sessionId) {
+          this.store.finishAuthorizationRecovery(message, "blocked");
+          await this.replyText(message, "授权已更新，但原会话已重置或替换，未自动重放旧任务。请在当前会话重新确认需要执行的操作。");
+          return;
+        }
+        if (!this.store.getSessionVaultIds(key)?.includes(userVaultId)) {
+          this.store.finishAuthorizationRecovery(message, "blocked");
+          await this.replyText(message, "授权已更新，但这个旧 Session 未挂载对应用户 Vault；已保留原 Session，没有自动迁移。可继续使用原会话的 Bot 能力，或明确发送 /new 后重新提出任务；新会话中旧文件不会迁移，请先保存需要的文件。");
+          return;
+        }
+        this.store.assertSessionAgent(key, this.options.agentId);
+        if (this.ark.getSessionStats) {
+          const stats = await this.ark.getSessionStats(sessionId, AbortSignal.timeout(this.options.sessionStatsTimeoutMs ?? 2_000));
+          if (stats.status !== "idle") throw new Error("原Session尚未确认空闲，未提交授权恢复任务；请检查运行状态，不能重复投递");
+        }
+        await this.withReaction(message, hasReaction => this.process(message, key, undefined, hasReaction));
+        this.store.finishAuthorizationRecovery(message, "completed");
+      } catch (error) {
+        this.store.finishAuthorizationRecovery(message, "failed");
+        await this.replyText(message, `授权恢复未完成：${error instanceof Error ? error.message.slice(0, 240) : "请检查运行记录"}`);
+      }
+    });
   }
 
   resumeWithHandoff(message: IncomingMessage): void {
@@ -385,7 +404,7 @@ export class Gateway {
       if (!sessionId) {
         // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
         // 用户凭证只允许进入按发送者隔离的单聊 Session。
-        const extraVaultIds = message.conversationType === "group" && this.options.sharedGroupSessions
+        const extraVaultIds = this.usesBotOnlyIdentity(message)
           ? []
           : await this.options.getUserVaultIds?.(message) || [];
         const vaultIds = [...new Set([this.options.vaultId, ...extraVaultIds])];
@@ -500,7 +519,6 @@ export class Gateway {
         durationMs: Date.now() - startedAt, summary: summarizeInput(message.text, message.resources.length),
         responseSummary: summarizeResponse(finalReply), messageCreateTime: message.createTime
       });
-      this.authorizationRetries.delete(this.authorizationRetryKey(message));
     } catch (error) {
       this.store.addAuditLog({
         channelType: message.channelType, installationId: message.installationId,
@@ -521,15 +539,13 @@ export class Gateway {
     startedAt: number,
     request: UserAuthorizationRequired
   ): Promise<void> {
-    if (message.conversationType === "group" && this.options.sharedGroupSessions) {
+    if (this.usesBotOnlyIdentity(message)) {
       throw new Error("群聊场景仅使用 Bot 身份，不能挂载或申请个人用户凭证；请改用 Bot 可访问的群级能力，或私聊数字员工完成需要个人身份的操作");
     }
-    const retryKey = this.authorizationRetryKey(message);
-    if (this.authorizationRetries.has(retryKey)) {
+    if (!this.options.ensureAuthorization) throw new Error("当前 Gateway 未配置用户授权处理器");
+    if (!this.store.startAuthorizationRecovery(message, sessionId)) {
       throw new Error("授权后仍未获得用户凭证，请重新授权或联系管理员检查用户 Vault");
     }
-    if (!this.options.ensureAuthorization) throw new Error("当前 Gateway 未配置用户授权处理器");
-    this.authorizationRetries.add(retryKey);
     this.store.addAuditLog({
       channelType: message.channelType, installationId: message.installationId,
       tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId,
@@ -537,13 +553,16 @@ export class Gateway {
       durationMs: Date.now() - startedAt, summary: `${request.domain || "unknown"}: ${request.errorType}/${request.subtype}`,
       messageCreateTime: message.createTime
     });
-    const ready = await this.options.ensureAuthorization(message, request);
-    if (!ready) return;
-    this.resume(message);
-  }
-
-  private authorizationRetryKey(message: IncomingMessage): string {
-    return [message.channelType, message.installationId, message.messageId].join(":");
+    try {
+      const ready = await this.options.ensureAuthorization(message, request);
+      if (!ready) return;
+      const vaultIds = await this.options.getUserVaultIds?.(message);
+      if (!vaultIds || vaultIds.length !== 1) throw new Error("无法确认授权后的用户Vault，未自动恢复任务");
+      this.resumeAfterAuthorization(message, vaultIds[0]);
+    } catch (error) {
+      this.store.finishAuthorizationRecovery(message, "failed");
+      throw error;
+    }
   }
 
   private async assertCompactionSettled(sessionId: string, refresh = false): Promise<void> {
@@ -713,7 +732,7 @@ export class Gateway {
     const purposes = this.options.sessionConfiguration?.vaultPurposes || {};
     return finalizeSessionRequest(request, {
       agentId: this.options.agentId, requiredVaultIds: vaultIds, mandatoryEnv: defaults.envOverrides!,
-      sharedGroup: Boolean(this.options.sharedGroupSessions && message.conversationType === "group"), appId: this.options.appId,
+      sharedGroup: this.usesBotOnlyIdentity(message), appId: this.options.appId,
       applicationVaultIds: Object.keys(purposes).filter(id => purposes[id] === "application"),
       knownUserVaultIds: [...this.store.knownUserVaultIds(), ...Object.keys(purposes).filter(id => purposes[id] === "user")],
       resources: initialResources
@@ -722,6 +741,10 @@ export class Gateway {
 
   private sessionScope(message: IncomingMessage): SessionScope {
     return message.conversationType === "direct" ? "direct" : message.threadId ? "thread" : "group";
+  }
+
+  private usesBotOnlyIdentity(message: IncomingMessage): boolean {
+    return message.conversationType === "group" && Boolean(this.options.platformAccess || this.options.sharedGroupSessions);
   }
 
   private configurationFingerprint(message: IncomingMessage): string {
@@ -860,17 +883,17 @@ export class Gateway {
   private defaultSessionEnvironment(message: IncomingMessage): Record<string, string> {
     if (message.channelType !== "lark") return {};
     return {
-      ...(message.conversationType === "group" && this.options.sharedGroupSessions ? {} : { FEISHU_USER_OPEN_ID: message.senderId }),
+      ...(this.usesBotOnlyIdentity(message) ? {} : { FEISHU_USER_OPEN_ID: message.senderId }),
       FEISHU_CONVERSATION_TYPE: message.conversationType,
       ...(this.options.platformAccess ? {
         FEISHU_CHAT_ID: message.conversationId,
         ...(message.threadId ? { FEISHU_THREAD_ID: message.threadId } : {}),
-        ...(message.conversationType === "group" && this.options.sharedGroupSessions ? {} : {
+        ...(this.usesBotOnlyIdentity(message) ? {} : {
           FEISHU_TRIGGER_MESSAGE_ID: message.messageId,
           FEISHU_TRIGGER_CREATE_TIME: String(message.createTime)
         })
       } : {}),
-      ...(message.conversationType === "group" && this.options.sharedGroupSessions
+      ...(this.usesBotOnlyIdentity(message)
         ? { FEISHU_IDENTITY_MODE: "bot_only", LARKSUITE_CLI_STRICT_MODE: "bot" }
         : this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}),
       LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",

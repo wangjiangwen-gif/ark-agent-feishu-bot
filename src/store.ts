@@ -50,6 +50,8 @@ export type EmployeeOAuth = {
   refreshToken: string; expiresAt: number; scopes: string[]; updatedAt: string;
 };
 
+export type AuthorizationRecoveryState = "waiting" | "resuming" | "completed" | "failed" | "blocked";
+
 export class GatewayStore {
   readonly credentials: CredentialStateStore;
   private db: DatabaseSync;
@@ -145,6 +147,10 @@ export class GatewayStore {
       );
       CREATE TABLE IF NOT EXISTS session_compaction (
         session_id TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS authorization_recoveries (
+        request_key TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+        state TEXT NOT NULL, updated_at TEXT NOT NULL
       );
     `);
     this.credentials = new CredentialStateStore(this.db, path);
@@ -477,6 +483,32 @@ export class GatewayStore {
   getEmployeeOAuth(tenantKey: string, openId: string): EmployeeOAuth | undefined {
     const row = this.db.prepare("SELECT * FROM employee_oauth WHERE tenant_key = ? AND open_id = ?").get(tenantKey, openId) as Record<string, unknown> | undefined;
     return row ? { tenantKey: String(row.tenant_key), openId: String(row.open_id), vaultId: String(row.vault_id), credentialId: String(row.credential_id), refreshToken: this.credentials.openLegacy(String(row.refresh_token), tenantKey, openId), expiresAt: Number(row.expires_at), scopes: JSON.parse(String(row.scopes)), updatedAt: String(row.updated_at) } : undefined;
+  }
+
+  private authorizationRequestKey(message: ChannelMessage): string {
+    return JSON.stringify([message.channelType, message.installationId, message.tenantId, message.conversationId,
+      message.threadId || "", message.senderId, message.messageId]);
+  }
+
+  startAuthorizationRecovery(message: ChannelMessage, sessionId: string): boolean {
+    return Number(this.db.prepare("INSERT OR IGNORE INTO authorization_recoveries VALUES (?, ?, 'waiting', ?)")
+      .run(this.authorizationRequestKey(message), sessionId, new Date().toISOString()).changes) === 1;
+  }
+
+  getAuthorizationRecovery(message: ChannelMessage): { sessionId: string; state: AuthorizationRecoveryState } | undefined {
+    const row = this.db.prepare("SELECT session_id, state FROM authorization_recoveries WHERE request_key = ?")
+      .get(this.authorizationRequestKey(message)) as { session_id: string; state: AuthorizationRecoveryState } | undefined;
+    return row ? { sessionId: row.session_id, state: row.state } : undefined;
+  }
+
+  claimAuthorizationRecovery(message: ChannelMessage): boolean {
+    return Number(this.db.prepare("UPDATE authorization_recoveries SET state = 'resuming', updated_at = ? WHERE request_key = ? AND state = 'waiting'")
+      .run(new Date().toISOString(), this.authorizationRequestKey(message)).changes) === 1;
+  }
+
+  finishAuthorizationRecovery(message: ChannelMessage, state: "completed" | "failed" | "blocked"): void {
+    this.db.prepare("UPDATE authorization_recoveries SET state = ?, updated_at = ? WHERE request_key = ? AND state IN ('waiting', 'resuming')")
+      .run(state, new Date().toISOString(), this.authorizationRequestKey(message));
   }
 
   saveEmployeeOAuth(value: Omit<EmployeeOAuth, "updatedAt">): EmployeeOAuth {

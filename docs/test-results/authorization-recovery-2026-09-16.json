@@ -1,0 +1,29 @@
+{
+  "date": "2026-09-16",
+  "baseCommit": "138bb10",
+  "packageVersion": "0.2.9",
+  "location": "local-source-development",
+  "published": false,
+  "command": "npm test",
+  "passed": 244,
+  "failed": 0,
+  "durationMs": 2288.388416,
+  "checks": ["npm run check (syntax only)", "npm run build", "git diff --check"],
+  "newTests": 7,
+  "covered": [
+    "recovery request identity and original Session survive database reopen",
+    "duplicate callbacks across Gateway instances claim one recovery",
+    "legacy Session lacking user Vault remains intact without automatic handoff",
+    "late completion after reset or replacement never creates or replays into a new Session",
+    "Session is rechecked after queue admission, including a preceding /new command",
+    "MA running, failed or unknown state prevents recovery submission",
+    "legacy per-message employee group mode skips UAT hooks and enforces Bot-only"
+  ],
+  "network": "mocked; full-suite WebUI test uses loopback HTTP",
+  "limitations": [
+    "OAuth wait task and card persistence/cancel/timeout are not complete",
+    "multi-step business recovery still needs operation evidence and safe continuation, not original-request replay",
+    "runtime inspection uses getSessionStats when available; test adapters may omit it",
+    "no real Feishu or developer-box end-to-end claim"
+  ]
+}

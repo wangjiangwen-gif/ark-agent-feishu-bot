@@ -190,8 +190,10 @@ test("per-message mode starts same-chat group requests concurrently in isolated 
   await delay(20);
 
   assert.deepEqual(started, ["session-1", "session-2"]);
-  assert.equal(created[0].env.FEISHU_USER_OPEN_ID, "ou-a");
-  assert.equal(created[1].env.FEISHU_USER_OPEN_ID, "ou-b");
+  assert.equal(created[0].env.FEISHU_USER_OPEN_ID, undefined);
+  assert.equal(created[1].env.FEISHU_USER_OPEN_ID, undefined);
+  assert.equal(created[0].env.LARKSUITE_CLI_STRICT_MODE, "bot");
+  assert.equal(created[1].env.LARKSUITE_CLI_STRICT_MODE, "bot");
   releases.get("session-2")?.();
   releases.get("session-1")?.();
   await delay(20);
@@ -262,14 +264,13 @@ test("per-message group Session receives bounded history and current channel ide
   assert.match(prompt, /"context_scope":"thread"/);
   assert.match(prompt, /张三.*下午改到四点/);
   assert.match(prompt, /<current_request>\n帮大家约一下/);
+  assert.match(prompt, /<current_actor open_id="ou-b"/);
   assert.deepEqual(sessionEnv, {
-    FEISHU_USER_OPEN_ID: "ou-b",
     FEISHU_CONVERSATION_TYPE: "group",
     FEISHU_CHAT_ID: "chat-1",
     FEISHU_THREAD_ID: "omt-one",
-    FEISHU_TRIGGER_MESSAGE_ID: "message-1",
-    FEISHU_TRIGGER_CREATE_TIME: "1700000000000",
-    LARKSUITE_CLI_STRICT_MODE: "off",
+    FEISHU_IDENTITY_MODE: "bot_only",
+    LARKSUITE_CLI_STRICT_MODE: "bot",
     LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
     LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
   });
@@ -471,7 +472,7 @@ test("successful group execution records the final reply for later context fallb
   store.close();
 });
 
-test("group token_missing suppresses the Agent error and retries in a new authorized Session", async () => {
+test("legacy per-message employee group mode cannot bypass Bot-only OAuth restrictions", async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
   let creates = 0;
@@ -492,11 +493,12 @@ test("group token_missing suppresses the Agent error and retries in a new author
   gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "看看今天的安排" }));
   await delay(80);
 
-  assert.equal(authorizationCalls, 1);
-  assert.equal(creates, 2);
-  assert.equal(runs, 2);
-  assert.deepEqual(replies, ["今天没有日程"]);
-  assert.deepEqual(store.listAuditLogs().map(item => item.action), ["message", "authorization_required"]);
+  assert.equal(authorizationCalls, 0);
+  assert.equal(creates, 1);
+  assert.equal(runs, 1);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /群聊场景仅使用 Bot 身份/);
+  assert.equal(store.listAuditLogs().some(item => item.action === "authorization_required"), false);
   store.close();
 });
 
@@ -536,10 +538,10 @@ test("repeated token_missing stops after one automatic authorization retry", asy
     })
   }, collectText(replies), {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
-    platformAccess: true, perMessageSessions: true, ensureAuthorization: async () => true
+    platformAccess: true, getUserVaultIds: async () => ["vlt-user"], ensureAuthorization: async () => true
   });
 
-  gateway.accept(message({ conversationType: "group", mentionedBot: true }));
+  gateway.accept(message({ text: "查询日程" }));
   await delay(80);
 
   assert.equal(replies.length, 1);
@@ -657,6 +659,7 @@ test("authorization resumes a Session in place when its user Vault was mounted a
   const incoming = message({ text: "查询今天日程" });
   const key = toConversationKey(incoming);
   store.saveSession(key, "session-current", "agent-1", undefined, ["vlt-bot", "vlt-user"]);
+  store.startAuthorizationRecovery(incoming, "session-current");
   const runs: string[] = [];
   let creates = 0;
   const gateway = new Gateway(store, {
@@ -680,21 +683,24 @@ test("authorization resumes a Session in place when its user Vault was mounted a
   store.close();
 });
 
-test("authorization performs one compatibility handoff for a legacy Session without Vault metadata", async () => {
+test("authorization asks before replacing a legacy Session without Vault metadata", async () => {
   const store = new GatewayStore(":memory:");
   const incoming = message({ text: "查询今天日程" });
   const key = toConversationKey(incoming);
   store.saveSession(key, "session-legacy", "agent-1");
+  store.startAuthorizationRecovery(incoming, "session-legacy");
   const runs: string[] = [];
+  const replies: string[] = [];
+  let creates = 0;
   const gateway = new Gateway(store, {
-    createSession: async () => "session-upgraded",
+    createSession: async () => { creates++; return "session-upgraded"; },
     run: async (sessionId, input) => {
       runs.push(sessionId);
       return sessionId === "session-legacy"
         ? { terminal: "idle" as const, messages: ["用户要查询今天日程"] }
         : { terminal: "idle" as const, messages: [input] };
     }
-  }, async () => undefined, {
+  }, collectText(replies), {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
     platformAccess: true, getUserVaultIds: async () => ["vlt-user"]
   });
@@ -702,10 +708,13 @@ test("authorization performs one compatibility handoff for a legacy Session with
   gateway.resumeAfterAuthorization(incoming, "vlt-user");
   await delay(40);
 
-  assert.deepEqual(runs, ["session-legacy", "session-upgraded"]);
-  assert.equal(store.getSession(key), "session-upgraded");
-  assert.deepEqual(store.getSessionVaultIds(key), ["vlt-bot", "vlt-user"]);
-  assert.equal(store.listAuditLogs().some(log => log.action === "session_handoff"), true);
+  assert.deepEqual(runs, []);
+  assert.equal(creates, 0);
+  assert.equal(store.getSession(key), "session-legacy");
+  assert.equal(store.getSessionVaultIds(key), undefined);
+  assert.equal(store.listAuditLogs().some(log => log.action === "session_handoff"), false);
+  assert.match(replies[0], /未挂载对应用户 Vault/);
+  assert.match(replies[0], /旧文件不会迁移/);
   store.close();
 });
 
