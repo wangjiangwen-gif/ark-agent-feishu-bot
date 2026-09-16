@@ -284,6 +284,34 @@ Session升级协议层增量（2026-09-16，本地基线34ecfa5）：上一轮�
 
 ## 验收编号与证据登记
 
+### 授权代次与准备恢复（2026-09-17，基线1070b63）
+
+## Stage Q1: 稳定授权代次
+**Goal**: Token刷新不改变授权代次；重新OAuth、权限集合或凭证绑定变化使旧准备任务失效。
+**Success Criteria**: 代次随凭证加密保存，旧记录不伪造旧任务证明，CAS失败无半更新。
+**Tests**: 刷新/同步、重新授权、scope重排、权限缩减、资源替换、重启与旧库兼容。
+**Status**: Complete
+
+## Stage Q2: 授权绑定的准备恢复
+**Goal**: 准备计划和ready输入绑定完整用户身份/授权代次；使用明确的用户凭证维护接口安全恢复。
+**Success Criteria**: 活跃OAuth、取消/新流程、未知刷新、缺证明和跨身份均不派发；已派发未知任务不重放；普通群聊保持Bot-only。
+**Tests**: 实际子进程中断、原Session恢复、凭证过期、等待期间换授权、流式初始化和MA历史查询中的竞态。
+**Status**: Complete
+
+## Stage Q3: 完整回归与边界审计
+**Goal**: 全量单元/进程测试、检查构建和性能调用数验证，明确与真实外部验收的差距。
+**Success Criteria**: 不减少原Stage1–5范围，不自动部署或发布，不把mock OAuth当真实授权验收。
+**Tests**: 完整测试集、check/build/diff、默认与持久化路径调用数。
+**Status**: Complete
+
+本增量结果：凭证密文保存稳定authorizationGeneration，普通Token刷新和同Credential同步不换代；重新OAuth、scope集合或Vault/Credential绑定变化、确认失效换代。准备步骤与ready输入保存Channel/App/租户/用户、原资源、generation和flowId证明；旧数据不现场补造。专用prepare/refresh/matches接口分开新准备与原绑定维护，重启后原Session/输入/凭证复用，未知刷新和未知hook仍暂停，不重新授权或预置。fresh确认失效并完成占位凭证同步后保留Bot能力，由实际工具权限错误触发OAuth；旧prepared任务不能采纳新授权。群聊和Thread保持Bot-only。
+
+测试与审查补齐两个竞态：卡片初始化或MA历史/SSE等待期间Session/授权变化，在实际POST前同步拒绝；ready恢复不再先执行可新建Bot Credential的普通维护hook，专用refresh只维护已确认的原Credential。新输入和未接入生命周期的旧用法保持原行为。新增135项，最终完整1355/1355通过，零失败/取消/跳过（14479.973417ms），check（语法）、build、diff通过。包含真实Node子进程退出/SQLite重开、127.0.0.1 HTTP/SSE门禁测试、跨身份/重启/取消与刷新并发；外部MA/OAuth/飞书均模拟，不是825真实授权验收。独立审查无剩余阻塞项。证据见docs/test-results/authorization-preparation-2026-09-17.json。
+
+性能：基线1070b63，128样本/16预热、默认与durable均衡交替，计时到成功终态落盘并独立SQLite复查。初测配对中位开销+0.623/+0.827ms，定位到重复领取凭证维护租约后合并为一次，最终+0.426/+0.655ms；正常每轮run/POST/send各1次、额外刷新/创建/核查0。保留初测、单租约优化后和最终门禁版本三轮，不将本地亚毫秒变化说成用户端性能优化或整体性能验收通过。
+
+范围边界：CLI实验队列仍关闭，初始Vault/Credential未知预置、未知hook/缺失二进制缓存的人工处理、真实飞书/OAuth与回退演练、Session升级网关闭环、Memory/TOS、客户PDF复现及原Stage1–5其他工作继续未完成。发送前门禁不撤销已被MA接收的任务，也不保证运行中工具与外部凭证更新原子隔离。开发机保持稳定npm0.2.9，未部署或发布；本轮有具体开发与验证进展，不属于阻塞轮。
+
 ### 准备过程恢复增量（2026-09-17）
 
 ## Stage P1: 冻结准备步骤

@@ -73,8 +73,9 @@ async function runEmployee(): Promise<void> {
   let botTokenExpiresAt = 0;
   let botTokenRefreshing: Promise<void> | undefined;
   let botTokenCredential = (await ark.listCredentials(config.arkVaultId)).find(item => item.secretName === "LARKSUITE_CLI_TENANT_ACCESS_TOKEN");
-  const ensureBotToken = async (): Promise<void> => {
+  const ensureBotToken = async (allowCreate = true): Promise<void> => {
     if (botTokenExpiresAt - Date.now() > 5 * 60_000) return;
+    if (!allowCreate && !botTokenCredential) throw new Error("原Bot凭证绑定尚未确认，不能在恢复旧任务时重新创建");
     if (!botTokenRefreshing) botTokenRefreshing = (async () => {
       const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -106,7 +107,7 @@ async function runEmployee(): Promise<void> {
   );
   closeAuthorization = () => auth.close();
   gateway = new Gateway(store, ark, (message, outbound, observer) => channel.reply(message, outbound, observer), {
-    appId: config.feishuAppId, sessionConfiguration,
+    appId: config.feishuAppId, sessionConfiguration, sessionConfigurationRevision: "employee-runtime-v1",
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
@@ -116,7 +117,16 @@ async function runEmployee(): Promise<void> {
     cancelAuthorization: message => auth.cancel(message),
     authorizationStatus: message => auth.status(message),
     getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
-    beforeDirectTurn: message => auth.ensureCredentialFresh(message),
+    userCredentialLifecycle: {
+      revision: "employee-credentials-v1",
+      prepare: message => auth.prepareUserTurn(message),
+      refresh: async (message, expected) => {
+        if (!auth.matchesPreparedAuthorization(message, expected)) throw new Error("用户授权已变化，未恢复旧任务");
+        await ensureBotToken(false);
+        await auth.refreshPreparedAuthorization(message, expected);
+      },
+      matches: (message, expected, forDispatch) => auth.matchesPreparedAuthorization(message, expected, forDispatch)
+    },
     beforeCreateSession: ensureBotToken, dualIdentity: true, sharedGroupSessions: true,
     sessionEnvironment: message => ({
       FEISHU_IDENTITY_MODE: message.conversationType === "group" ? "bot_only" : "bot_with_user_oauth",

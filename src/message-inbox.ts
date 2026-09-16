@@ -6,6 +6,7 @@ import type { CredentialStateStore } from "./credential-state.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
 import { createPreparationPlan, startPreparationStep, finishPreparationStep, preparationPlansEqual, validatePreparationPlan,
   type PreparationJson, type PreparationPlan, type PreparationStepInput, type PreparationTarget } from "./preparation-plan.ts";
+import { validatePreparedAuthorization, type PreparedAuthorization } from "./prepared-authorization.ts";
 
 export type InboxState = "queued" | "preparing" | "dispatched" | "awaiting_authorization" | "completed" | "failed" | "uncertain";
 export type InboxBinding = { scope: string; agentId: string; configFingerprint: string };
@@ -13,6 +14,7 @@ export type InboxPreparation = {
   sessionId: string; input: string; fingerprint: string; notices: string[];
   contextReceipts: Array<{ id: string; fingerprint: string }>; preparedAt: number;
   inlineDeliveryKeys?: string[];
+  userAuthorization?: PreparedAuthorization;
 };
 export type InboxTask = {
   id: string; sequence: number; revision: number; state: InboxState; owner: string;
@@ -108,8 +110,10 @@ export class MessageInbox {
     const preparation: InboxPreparation = { sessionId: value.sessionId, input: value.input,
       fingerprint: createHash("sha256").update(value.input).digest("hex"), notices: value.notices,
       contextReceipts: value.contextReceipts, preparedAt: task.preparation?.preparedAt ?? Date.now(),
-      ...(value.inlineDeliveryKeys !== undefined ? { inlineDeliveryKeys: value.inlineDeliveryKeys } : {}) };
+      ...(value.inlineDeliveryKeys !== undefined ? { inlineDeliveryKeys: value.inlineDeliveryKeys } : {}),
+      ...(value.userAuthorization !== undefined ? { userAuthorization: value.userAuthorization } : {}) };
     validatePreparation(preparation);
+    if (preparation.userAuthorization) validateAuthorizationBinding(task.message, preparation.userAuthorization);
     if (task.preparation) {
       if (JSON.stringify(task.preparation) !== JSON.stringify(preparation)) throw new Error("已保存的准备检查点不能被替换");
       return task;
@@ -139,6 +143,7 @@ export class MessageInbox {
   completePreparationStep(expected: InboxTask, planId: string, id: string, output: PreparationJson): InboxTask {
     return this.transaction(() => {
       const task = this.expectedPreparing(expected, planId);
+      if (id === "user-credential") validateAuthorizationBinding(task.message, output);
       const plan = finishPreparationStep(task.preparationPlan!, id, output);
       return plan === task.preparationPlan ? task : this.save(task, { ...task, preparationPlan: plan });
     });
@@ -422,6 +427,8 @@ export class MessageInbox {
         message = payload.message;
         if (payload.preparationPlan !== undefined) {
           validatePreparationPlan(payload.preparationPlan);
+          const credential = payload.preparationPlan.steps.find(step => step.id === "user-credential");
+          if (credential?.state === "completed") validateAuthorizationBinding(message, credential.output);
           if (payload.version !== 3 || payload.preparation !== undefined
             || !((metadata.state === "preparing" && metadata.interruptedAt === undefined)
               || (metadata.state === "uncertain" && metadata.interruptedAt === "preparing"))
@@ -431,6 +438,7 @@ export class MessageInbox {
         }
         if (payload.preparation !== undefined) {
           validatePreparation(payload.preparation);
+          if (payload.preparation.userAuthorization) validateAuthorizationBinding(message, payload.preparation.userAuthorization);
           if (!((metadata.state === "preparing" && metadata.interruptedAt === undefined)
               || (metadata.state === "uncertain" && metadata.interruptedAt === "preparing"))
             || hasDispatchEvidence({ ...payload, ...metadata }) || typeof message.text !== "string" || message.text.trim().startsWith("/")) {
@@ -523,8 +531,16 @@ function validatePreparation(value: unknown): asserts value is InboxPreparation 
       || new Set(value.inlineDeliveryKeys).size !== value.inlineDeliveryKeys.length))) {
     throw new Error("准备检查点结构无效或超过大小上限");
   }
+  if (value.userAuthorization !== undefined) validatePreparedAuthorization(value.userAuthorization);
 }
 
 function hasPreparationKeys(value: unknown, required: string[]): value is Record<string, unknown> {
-  return hasExactKeys(value, [...required, ...(value && typeof value === "object" && Object.hasOwn(value, "inlineDeliveryKeys") ? ["inlineDeliveryKeys"] : [])]);
+  return hasExactKeys(value, [...required, ...["inlineDeliveryKeys", "userAuthorization"].filter(key => value && typeof value === "object" && Object.hasOwn(value, key))]);
+}
+
+function validateAuthorizationBinding(message: ChannelMessage, proof: unknown): void {
+  validatePreparedAuthorization(proof);
+  if (message.conversationType !== "direct" || proof.identity.channelType !== message.channelType
+    || proof.identity.installationId !== message.installationId || proof.identity.tenantId !== message.tenantId
+    || proof.identity.openId !== message.senderId) throw new Error("用户授权准备证明与原消息身份不一致");
 }

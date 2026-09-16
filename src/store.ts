@@ -818,7 +818,7 @@ export class GatewayStore {
       if (!current || flow.phase !== "verifying") throw new Error("授权凭证绑定或身份校验阶段不正确");
       this.credentials.save(flow.identity, { ...current, status: "sync_pending", retryAfter: undefined,
         refreshToken: tokens.refreshToken, pendingAccessToken: tokens.accessToken, expiresAt: tokens.expiresAt,
-        scopes: tokens.scopes ?? defaultScopes }, current.revision);
+        scopes: tokens.scopes ?? defaultScopes }, current.revision, true);
       const updated = this.authorizations.save(flow.identity, flow, { phase: "sync_pending", tokens: undefined });
       this.db.exec("COMMIT");
       return updated;

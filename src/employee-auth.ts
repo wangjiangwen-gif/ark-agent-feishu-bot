@@ -6,6 +6,7 @@ import type { GatewayStore } from "./store.ts";
 import { credentialIdentityKey, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
 import { createHash } from "node:crypto";
 import { isAuthorizationTerminal, type AuthorizationFlow } from "./authorization-state.ts";
+import { validatePreparedAuthorization, type PreparedAuthorization } from "./prepared-authorization.ts";
 
 export const EMPLOYEE_CALENDAR_USER_SCOPES = ["offline_access", "auth:user.id:read", "calendar:calendar:read", "calendar:calendar.event:read", "calendar:calendar.free_busy:read"];
 
@@ -42,6 +43,78 @@ export class EmployeeAuthorizationManager {
     return [(await this.ensureUserCredentialBinding(message)).vaultId];
   }
 
+  async prepareUserTurn(message: IncomingMessage): Promise<PreparedAuthorization> {
+    this.assertOpen();
+    if (message.conversationType !== "direct") throw new Error("群聊不能准备个人授权身份");
+    const identity = this.identity(message);
+    this.assertNoActiveFlow(identity);
+    const originalFlowId = this.store.authorizations.get(identity)?.id ?? null;
+    const original = this.store.credentials.get(identity);
+    if (!original) await this.ensureUserCredentialBinding(message);
+    return this.exclusive(identity, async () => {
+      this.assertNoActiveFlow(identity);
+      const beforeRefresh = this.store.credentials.get(identity);
+      if ((this.store.authorizations.get(identity)?.id ?? null) !== originalFlowId
+        || (original?.authorizationGeneration && (beforeRefresh?.authorizationGeneration !== original.authorizationGeneration
+          || beforeRefresh.vaultId !== original.vaultId || beforeRefresh.credentialId !== original.credentialId))) {
+        throw new Error("用户授权在等待维护期间发生变化，未刷新替代凭证");
+      }
+      // 已绑定身份只领取一次维护租约；排队中的其他轮次会复用前一轮刷新结果。
+      await this.refreshCredential(identity);
+      this.assertNoActiveFlow(identity);
+      let state = this.store.credentials.get(identity);
+      if (!state) throw new Error("用户凭证绑定缺失，未继续执行");
+      // 新输入尚未冻结准备证明时，确认失效并已同步占位凭证可以降为Bot能力，
+      // 让实际工具错误继续触发OAuth；这不允许旧准备任务恢复或采纳新授予的权限。
+      const confirmedLoss = state.status === "reauth_required" && !state.refreshToken && !state.pendingAccessToken
+        && original?.vaultId === state.vaultId && original.credentialId === state.credentialId;
+      if ((this.store.authorizations.get(identity)?.id ?? null) !== originalFlowId
+        || (original?.authorizationGeneration && ((!confirmedLoss && state.authorizationGeneration !== original.authorizationGeneration)
+          || state.vaultId !== original.vaultId || state.credentialId !== original.credentialId))) {
+        throw new Error("用户授权在准备期间发生变化，未给旧任务生成新证明");
+      }
+      // 旧记录仅在本次明确准备时补写代次；不能替旧任务补造已保存的证明。
+      if (!state.authorizationGeneration) state = this.store.credentials.save(identity, state, state.revision);
+      const proof: PreparedAuthorization = { version: 1, identity, generation: state.authorizationGeneration!,
+        vaultId: state.vaultId, credentialId: state.credentialId, flowId: this.store.authorizations.get(identity)?.id ?? null };
+      validatePreparedAuthorization(proof);
+      if (!this.matchesPreparedAuthorization(message, proof, true)) throw new Error("用户授权状态未就绪，未继续执行");
+      return proof;
+    });
+  }
+
+  matchesPreparedAuthorization(message: IncomingMessage, proof: PreparedAuthorization, forDispatch = false): boolean {
+    try {
+      this.assertOpen();
+      if (message.conversationType !== "direct") return false;
+      validatePreparedAuthorization(proof);
+      const identity = this.identity(message);
+      if (credentialIdentityKey(identity) !== credentialIdentityKey(proof.identity)) return false;
+      const state = this.store.credentials.get(identity), flow = this.store.authorizations.get(identity);
+      if ((flow && !isAuthorizationTerminal(flow.phase)) || (flow?.id ?? null) !== proof.flowId) return false;
+      if (!state || state.authorizationGeneration !== proof.generation || state.vaultId !== proof.vaultId
+        || state.credentialId !== proof.credentialId || ["refreshing", "refresh_uncertain"].includes(state.status)) return false;
+      return !forDispatch || state.status === "binding" || state.status === "reauth_required"
+        || (state.status === "ready" && state.expiresAt > Date.now());
+    } catch { return false; }
+  }
+
+  async refreshPreparedAuthorization(message: IncomingMessage, proof: PreparedAuthorization): Promise<void> {
+    if (!this.matchesPreparedAuthorization(message, proof)) throw new Error("用户授权绑定已变化或结果未知，未恢复旧任务");
+    const expected = structuredClone(proof), identity = this.identity(message);
+    await this.exclusive(identity, async () => {
+      if (!this.matchesPreparedAuthorization(message, expected)) throw new Error("用户授权绑定已变化，未恢复旧任务");
+      // 已有绑定的维护不调用provisioning；未知Token交换不会重试，只允许已落盘Token的同Credential同步。
+      await this.refreshCredential(identity);
+      if (!this.matchesPreparedAuthorization(message, expected, true)) throw new Error("用户授权在维护期间发生变化，未恢复旧任务");
+    });
+  }
+
+  private assertNoActiveFlow(identity: CredentialIdentity): void {
+    const flow = this.store.authorizations.get(identity);
+    if (flow && !isAuthorizationTerminal(flow.phase)) throw new Error("当前用户仍有活跃授权流程，未准备其他单聊任务");
+  }
+
   async ensureCredentialFresh(message: IncomingMessage): Promise<void> {
     if (message.conversationType !== "direct") return;
     const identity = this.identity(message), key = credentialIdentityKey(identity);
@@ -73,7 +146,7 @@ export class EmployeeAuthorizationManager {
       this.assertOpen();
       if (error instanceof OAuthError && error.kind === "reauth_required") {
         state = this.store.credentials.save(identity, { ...state, status: "sync_pending", refreshToken: undefined,
-          pendingAccessToken: "ARKAGENT_USER_AUTH_PENDING", expiresAt: 0 }, state.revision);
+          pendingAccessToken: "ARKAGENT_USER_AUTH_PENDING", expiresAt: 0 }, state.revision, true);
         await this.syncCredential(identity, state); return;
       }
       const uncertain = !(error instanceof OAuthError) || error.outcome === "unknown";

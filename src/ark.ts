@@ -647,12 +647,14 @@ export class ArkClient {
     text: string,
     timeoutMs: number,
     onProgress?: (progress: string) => Promise<void>,
-    onDelta?: (snapshot: string) => Promise<void>
+    onDelta?: (snapshot: string) => Promise<void>,
+    assertBeforeSend?: () => void
   ): Promise<RunResult> {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
     let boundary: RunBoundary | undefined;
+    let dispatchGuardFailed = false;
     try {
       const previous = await this.readSessionEvents(sessionId, controller.signal);
       boundary = { startedAt, input: text, previousIds: new Set(previous.events.flatMap(event => event.id ? [event.id] : [])), anchored: false, page: previous.lastPage };
@@ -663,6 +665,22 @@ export class ArkClient {
         eventStream.then(() => undefined, () => undefined),
         waitFor(this.options.sseHeadStartMs, controller.signal)
       ]);
+      // 必须在全部准备等待之后同步校验；这里到实际 POST 之间不得增加 await。
+      if (assertBeforeSend) {
+        try {
+          const result: unknown = assertBeforeSend();
+          if (result !== null && (typeof result === "object" || typeof result === "function") &&
+            typeof (result as { then?: unknown }).then === "function") {
+            // 错误配置的异步门禁不能放行，也不能产生未处理的 Promise rejection。
+            void Promise.resolve(result).catch(() => {});
+            throw new Error();
+          }
+        } catch {
+          dispatchGuardFailed = true;
+          // 不转发回调错误，避免授权、配置或凭证详情进入消息和日志。
+          throw new Error("发送前校验未通过，已停止发送消息");
+        }
+      }
       await this.sendMessage(sessionId, text, controller.signal);
       let result = await Promise.any([
         this.consumeEventStream(eventStream, boundary, onProgress, onDelta),
@@ -684,7 +702,7 @@ export class ArkClient {
       controller.abort();
       return result;
     } catch (error) {
-      if (!controller.signal.aborted) throw error;
+      if (dispatchGuardFailed || !controller.signal.aborted) throw error;
       const recovered = boundary ? await this.recoverTimedOutRun(sessionId, boundary) : undefined;
       if (recovered) return this.redactRunFailure(recovered);
       throw new Error("Session 运行超时");

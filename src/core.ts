@@ -26,6 +26,7 @@ export {
   type Reply
 } from "./gateway.ts";
 export type { RecoveryTaskSummary, RecoveryTaskPage } from "./gateway.ts";
+export type { PreparedAuthorization, UserCredentialLifecycle } from "./prepared-authorization.ts";
 export type {
   ChannelAdapter,
   ChannelCapabilities,

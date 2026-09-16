@@ -9,8 +9,16 @@ export type CredentialState = {
   status: "binding" | "ready" | "refreshing" | "refresh_uncertain" | "sync_pending" | "reauth_required";
   refreshToken?: string; pendingAccessToken?: string;
   expiresAt: number; scopes: string[]; retryAfter?: number;
+  authorizationGeneration?: string;
   revision: number;
 };
+
+const authorizationGenerationPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+
+function scopeSet(scopes: string[]): string {
+  if (!Array.isArray(scopes) || scopes.some(scope => typeof scope !== "string")) throw new Error("用户凭证权限集合无效");
+  return JSON.stringify([...new Set(scopes)].sort());
+}
 
 export function credentialIdentityKey(identity: CredentialIdentity): string {
   const values = [identity.channelType, identity.installationId, identity.tenantId, identity.openId];
@@ -68,15 +76,29 @@ export class CredentialStateStore {
     const key = credentialIdentityKey(identity);
     const row = this.db.prepare("SELECT * FROM employee_credentials WHERE identity_key = ?").get(key) as Record<string, unknown> | undefined;
     if (!row) return undefined;
-    const secrets = JSON.parse(this.open(String(row.secret), key)) as Pick<CredentialState, "refreshToken" | "pendingAccessToken">;
+    const secrets = JSON.parse(this.open(String(row.secret), key)) as Pick<CredentialState, "refreshToken" | "pendingAccessToken" | "authorizationGeneration">;
+    // 旧版密文没有代次时只返回缺失，不把读取动作变成新的授权证明。
+    if (Object.hasOwn(secrets, "authorizationGeneration") && (typeof secrets.authorizationGeneration !== "string"
+      || !authorizationGenerationPattern.test(secrets.authorizationGeneration))) throw new Error("用户凭证授权代次无效，请核查加密记录");
     return { vaultId: String(row.vault_id), credentialId: String(row.credential_id), status: row.status as CredentialState["status"],
       ...secrets, expiresAt: Number(row.expires_at), scopes: JSON.parse(String(row.scopes)),
       retryAfter: row.retry_after === null ? undefined : Number(row.retry_after), revision: Number(row.revision) };
   }
 
-  save(identity: CredentialIdentity, value: Omit<CredentialState, "revision">, expectedRevision: number): CredentialState {
+  save(identity: CredentialIdentity, value: Omit<CredentialState, "revision">, expectedRevision: number, rotateAuthorization = false): CredentialState {
     const key = credentialIdentityKey(identity);
-    const secret = this.seal(JSON.stringify({ refreshToken: value.refreshToken, pendingAccessToken: value.pendingAccessToken }), key);
+    const current = this.get(identity);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || (current?.revision ?? 0) !== expectedRevision) {
+      throw new Error("用户凭证版本已变化，请重新读取后处理");
+    }
+    const scopes = scopeSet(value.scopes);
+    const changed = current && (current.vaultId !== value.vaultId || current.credentialId !== value.credentialId
+      || scopeSet(current.scopes) !== scopes);
+    // 代次由持久化状态决定，不能接受调用方带回的旧值；正常Token轮换不改变授权关系。
+    const authorizationGeneration = !current?.authorizationGeneration || rotateAuthorization || changed
+      ? randomUUID() : current.authorizationGeneration;
+    const secret = this.seal(JSON.stringify({ refreshToken: value.refreshToken, pendingAccessToken: value.pendingAccessToken,
+      authorizationGeneration }), key);
     const result = this.db.prepare(`INSERT INTO employee_credentials
       (identity_key, channel_type, installation_id, tenant_id, open_id, vault_id, credential_id, status, secret, expires_at, scopes, retry_after, revision, updated_at)
       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ? = 0 OR EXISTS (SELECT 1 FROM employee_credentials WHERE identity_key = ?)
@@ -88,7 +110,7 @@ export class CredentialStateStore {
       value.status, secret, value.expiresAt, JSON.stringify(value.scopes), value.retryAfter ?? null, expectedRevision + 1,
       new Date().toISOString(), expectedRevision, key, expectedRevision);
     if (Number(result.changes) !== 1) throw new Error("用户凭证版本已变化，请重新读取后处理");
-    return { ...value, revision: expectedRevision + 1 };
+    return { ...value, authorizationGeneration, revision: expectedRevision + 1 };
   }
 
   acquire(identity: CredentialIdentity): string {
