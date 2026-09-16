@@ -3,7 +3,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { NormalizedMessage } from "@larksuite/channel";
 import { Gateway } from "../src/gateway.ts";
-import { LarkChannelAdapter, normalizeLarkChannelMessage, toLarkSendInput, type LarkChannelPort } from "../src/lark-channel.ts";
+import { LarkChannelAdapter, normalizeLarkChannelMessage, readLarkMessage, toLarkSendInput, type LarkChannelPort } from "../src/lark-channel.ts";
 import { GatewayStore } from "../src/store.ts";
 
 function normalized(overrides: Partial<NormalizedMessage> = {}): NormalizedMessage {
@@ -15,6 +15,34 @@ function normalized(overrides: Partial<NormalizedMessage> = {}): NormalizedMessa
     ...overrides
   };
 }
+
+test("direct message lookup validates the exact chat and thread before exposing content", async () => {
+  const trigger = normalizeLarkChannelMessage(normalized({ createTime: 200 }), "cli");
+  const payloads: unknown[] = [];
+  let item = { message_id: "q", chat_id: "other", thread_id: "", msg_type: "text", create_time: "100", body: { content: JSON.stringify({ text: "secret" }) } };
+  const client = { im: { message: { list: async () => ({}), get: async payload => { payloads.push(payload); return { code: 0, data: { items: [item] } }; } } } } as any;
+  assert.equal((await readLarkMessage(client, trigger, "q", new AbortController().signal)).status, "unavailable");
+  item = { ...item, chat_id: trigger.conversationId, thread_id: "other" };
+  assert.equal((await readLarkMessage(client, trigger, "q", new AbortController().signal)).status, "unavailable");
+  item = { ...item, thread_id: "" };
+  const available = await readLarkMessage(client, trigger, "q", new AbortController().signal);
+  assert.equal(available.status, "available");
+  assert.deepEqual(payloads[0], { path: { message_id: "q" }, params: { user_id_type: "open_id", with_sender_name: true } });
+});
+
+test("direct lookup distinguishes deleted, missing, unavailable and transport failure", async () => {
+  const trigger = normalizeLarkChannelMessage(normalized({ createTime: 200 }), "cli");
+  const fixtures = [
+    [{ code: 0, data: { items: [{ message_id: "q", chat_id: "oc-1", create_time: "100", deleted: true }] } }, "deleted"],
+    [{ code: 0, data: { items: [] } }, "not_found"],
+    [{ code: 123, msg: "not accessible" }, "unavailable"]
+  ] as const;
+  for (const [response, status] of fixtures) {
+    const client = { im: { message: { get: async () => response } } } as any;
+    assert.equal((await readLarkMessage(client, trigger, "q", new AbortController().signal)).status, status);
+  }
+  assert.equal((await readLarkMessage({ im: { message: { get: async () => { throw new Error("network"); } } } } as any, trigger, "q", new AbortController().signal)).status, "failed");
+});
 
 test("Channel SDK message maps to the channel-neutral contract", () => {
   const result = normalizeLarkChannelMessage(normalized({

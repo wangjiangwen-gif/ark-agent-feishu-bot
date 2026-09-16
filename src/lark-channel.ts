@@ -1,5 +1,5 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
-import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource } from "./channel.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
 
 type RawLarkMessage = {
@@ -14,6 +14,7 @@ export type LarkChannelPort = Pick<LarkChannel,
 
 type LarkHistoryItem = {
   message_id?: string;
+  chat_id?: string;
   msg_type?: string;
   create_time?: string;
   update_time?: string;
@@ -33,7 +34,7 @@ type LarkMessageListResponse = {
 type LarkMessageList = (payload: unknown) => Promise<LarkMessageListResponse>;
 
 type FeishuCardStreamClient = FeishuResourceClient & {
-  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList } };
+  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList; get?: LarkMessageList } };
   cardkit?: { v1?: {
     cardElement?: { content(payload: unknown): Promise<unknown> };
     card?: { settings(payload: unknown): Promise<unknown> };
@@ -207,6 +208,12 @@ export class LarkChannelAdapter implements ChannelAdapter {
     return loadLarkRecentHistory(client, message);
   }
 
+  async readMessage(message: ChannelMessage, messageId: string, signal: AbortSignal): Promise<ChannelMessageLookup> {
+    const client = this.channel.rawClient;
+    if (!client) return { status: "unavailable" };
+    return readLarkMessage(client, message, messageId, signal);
+  }
+
   async download(resource: ChannelResource, message: ChannelMessage, remainingBytes = this.maxFileBytes): Promise<{ bytes: Uint8Array; mimeType: string }> {
     if (this.streamingDownloader) return this.streamingDownloader(resource, message, remainingBytes);
     const bytes = await this.channel.downloadResource(message.messageId, resource.id, resource.type);
@@ -330,6 +337,32 @@ export function normalizeLarkChannelMessage(message: NormalizedMessage, installa
       })),
     mentionedBot: message.mentionedBot
   };
+}
+
+export async function readLarkMessage(
+  client: Pick<FeishuCardStreamClient, "im">,
+  message: ChannelMessage,
+  messageId: string,
+  signal: AbortSignal
+): Promise<ChannelMessageLookup> {
+  const get = client.im.message?.get;
+  if (!get) return { status: "unavailable" };
+  if (signal.aborted) return { status: "timeout" };
+  try {
+    // node-sdk 的单次调用不暴露 AbortSignal；Gateway 限制等待时间，底层受 HTTP 超时约束。
+    const response = await get.call(client.im.message, { path: { message_id: messageId }, params: { user_id_type: "open_id", with_sender_name: true } });
+    if (signal.aborted) return { status: "timeout" };
+    if (response.code !== 0) return { status: "unavailable" };
+    const item = response.data?.items?.find(item => item.message_id === messageId);
+    if (!item) return { status: "not_found" };
+    if (item.chat_id !== message.conversationId || (item.thread_id && item.thread_id !== message.threadId)) return { status: "unavailable" };
+    if (!isEligibleHistoryItem(item, message)) return { status: "unavailable" };
+    if (item.deleted) return { status: "deleted" };
+    const normalized = normalizeHistoryItem(item, item.thread_id ? "thread" : "chat");
+    return normalized ? { status: "available", message: normalized } : { status: "unavailable" };
+  } catch {
+    return { status: signal.aborted ? "timeout" : "failed" };
+  }
 }
 
 export async function loadLarkRecentHistory(

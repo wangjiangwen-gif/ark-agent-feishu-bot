@@ -38,6 +38,51 @@ function harness(overrides: Record<string, any> = {}, store = new GatewayStore("
   return { gateway, store, inputs, replies, resources, uploads: () => uploads };
 }
 
+test("every shared-group turn carries its own actor without pinning the first user's environment", async t => {
+  const requests: any[] = [];
+  const h = harness({ ark: { createSession: async request => { requests.push(request); return "session"; } } });
+  t.after(() => h.store.close());
+  h.gateway.accept(message("a", { senderId: "user-a" })); await until(() => h.replies.length === 1);
+  h.gateway.accept(message("b", { senderId: "user-b", createTime: 200 })); await until(() => h.replies.length === 2);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].environment.config.env.FEISHU_USER_OPEN_ID, undefined);
+  assert.equal(requests[0].environment.config.env.FEISHU_TRIGGER_MESSAGE_ID, undefined);
+  assert.match(h.inputs[0], /<current_actor open_id="user-a"/);
+  assert.match(h.inputs[1], /<current_actor open_id="user-b"/);
+});
+
+test("quoted own reply remains visible on the next shared Session turn", async t => {
+  let history: ChannelHistoryMessage[] = [];
+  const h = harness({ options: { loadRecentHistory: async () => history } }); t.after(() => h.store.close());
+  const first = message("first"); h.gateway.accept(first); await until(() => h.replies.length === 1);
+  h.store.recordOutgoing(first, "question");
+  history = [{ messageId: "question", senderId: "bot", senderType: "app", source: "chat", text: "需要创建文档吗", createTime: 150 }];
+  h.gateway.accept(message("second", { parentMessageId: "question", text: "需要", createTime: 200 }));
+  await until(() => h.replies.length === 2);
+  assert.match(h.inputs[1], /<reply_context role="reference">/);
+  assert.match(h.inputs[1], /需要创建文档吗/);
+  assert.match(h.inputs[1], /<current_request>\n需要/);
+});
+
+test("quotation lookup on direct chat is wired even without recent-history loading", async t => {
+  let calls = 0;
+  const h = harness({ options: { loadRecentHistory: undefined, readMessage: async () => {
+    calls++; return { status: "available", message: { messageId: "q", senderId: "bot", senderType: "app", source: "chat", text: "需要摘要吗", createTime: 50 } };
+  } } }); t.after(() => h.store.close());
+  h.gateway.accept(message("direct", { conversationType: "direct", parentMessageId: "q", text: "需要" }));
+  await until(() => h.replies.length === 1);
+  assert.equal(calls, 1); assert.match(h.inputs[0], /需要摘要吗/);
+});
+
+test("quote cache is scoped by application, tenant, chat and thread", t => {
+  const store = new GatewayStore(":memory:"); t.after(() => store.close());
+  const trigger = message("now", { threadId: "current" });
+  const quote: ChannelHistoryMessage = { messageId: "q", senderId: "u", senderType: "user", source: "chat", createTime: 50, text: "private" };
+  for (const override of [{ installationId: "other" }, { tenantId: "other" }, { conversationId: "other" }]) store.cacheHistory({ ...trigger, ...override }, [quote]);
+  store.cacheHistory(trigger, [{ ...quote, source: "thread", threadId: "other" }]);
+  assert.equal(store.cachedMessage(trigger, "q"), undefined);
+});
+
 test("two same-name files are both mounted at different safe paths", async t => {
   const h = harness(); t.after(() => h.store.close());
   h.gateway.accept(message("files", { resources: [{ id: "a", name: "报告.pdf", type: "file" }, { id: "b", name: "报告.pdf", type: "file" }] }));

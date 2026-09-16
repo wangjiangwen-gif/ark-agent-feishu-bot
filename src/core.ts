@@ -24,6 +24,8 @@ export type {
   ChannelCapabilities,
   ChannelHistoryMessage,
   ChannelMessage,
+  ChannelMessageLookup,
+  ChannelReadMessage,
   ChannelOutbound,
   ChannelResource,
   ChannelType

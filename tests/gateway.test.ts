@@ -19,6 +19,14 @@ const collectText = (target: string[]) => async (_message: IncomingMessage, outb
 
 const withoutAttachmentNamespace = (value: string) => value.replace(/\/mnt\/data\/[a-f0-9]{24}\//g, "/mnt/data/");
 
+function requestText(input: string): string {
+  if (input === "/compact") return input;
+  assert.match(input, /<current_actor open_id="/);
+  const request = input.match(/<current_request>\n([\s\S]*?)\n<\/current_request>/);
+  assert.ok(request, "业务请求应包含完整的逐轮上下文结构");
+  return request[1];
+}
+
 test("group messages require an explicit bot mention", () => {
   assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: false })), false);
   assert.equal(shouldHandleMessage(message({ conversationType: "group", mentionedBot: true })), true);
@@ -48,8 +56,8 @@ test("shared group mode queues users in one Session and never mounts user Vaults
       return `session-${++creates}`;
     },
     run: async (sessionId, input) => {
-      started.push(`${sessionId}:${input}`);
-      if (input === "群任务 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      started.push(`${sessionId}:${requestText(input)}`);
+      if (requestText(input) === "群任务 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
       return { terminal: "idle" as const, messages: [`${input} 完成`] };
     }
   }, async () => undefined, {
@@ -95,7 +103,7 @@ test("shared group mode gives each thread its own reusable Session", async () =>
   const gateway = new Gateway(store, {
     createSession: async () => `session-${++creates}`,
     run: async (sessionId, input) => {
-      runs.push(`${sessionId}:${input}`);
+      runs.push(`${sessionId}:${requestText(input)}`);
       return { terminal: "idle" as const, messages: ["完成"] };
     }
   }, async () => undefined, {
@@ -124,8 +132,8 @@ test("queued group requests still execute when the OnIt reaction fails", async (
   const gateway = new Gateway(store, {
     createSession: async () => "session-group",
     run: async (_sessionId, input) => {
-      started.push(input);
-      if (input === "A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      started.push(requestText(input));
+      if (requestText(input) === "A") await new Promise<void>(resolve => { releaseFirst = resolve; });
       return { terminal: "idle" as const, messages: ["完成"] };
     }
   }, async () => undefined, {
@@ -199,8 +207,8 @@ test("per-message mode still queues direct messages and reuses one Session", asy
   const gateway = new Gateway(store, {
     createSession: async () => `session-${++creates}`,
     run: async (_sessionId, input) => {
-      started.push(input);
-      if (input === "私聊 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
+      started.push(requestText(input));
+      if (requestText(input) === "私聊 A") await new Promise<void>(resolve => { releaseFirst = resolve; });
       return { terminal: "idle" as const, messages: [`${input} 完成`] };
     }
   }, async () => undefined, {
@@ -746,7 +754,7 @@ test("automatic compaction keeps using the same Session when compact fails", asy
     getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
     createSession: async () => { creates++; return "session-new"; },
     run: async (sessionId, input) => {
-      operations.push(`${sessionId}:${input}`);
+      operations.push(`${sessionId}:${requestText(input)}`);
       if (input === "/compact") throw new Error("compact timeout");
       return { terminal: "idle" as const, messages: ["继续使用旧会话"] };
     }
@@ -781,7 +789,7 @@ test("gateway automatically compacts an oversized Session in place", async () =>
       return "session-new";
     },
     run: async (sessionId, input) => {
-      operations.push(`run:${sessionId}:${input}`);
+      operations.push(`run:${sessionId}:${requestText(input)}`);
       return { terminal: "idle" as const, messages: ["完成"] };
     }
   }, async () => undefined, {
@@ -834,7 +842,7 @@ test("gateway does not compact the same event range repeatedly", async () => {
     getSessionStats: async () => ({ eventCount: 196, latestInputTokens: 1_000 }),
     createSession: async () => "session-new",
     run: async (_sessionId, input) => {
-      inputs.push(input);
+      inputs.push(requestText(input));
       return { terminal: "idle" as const, messages: ["完成"] };
     }
   }, async () => undefined, {

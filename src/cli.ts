@@ -6,7 +6,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig, loadConfigFile } from "./config.ts";
 import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
-import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource } from "./channel.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -102,7 +102,8 @@ async function runEmployee(): Promise<void> {
       FEISHU_IDENTITY_MODE: message.conversationType === "group" ? "bot_only" : "bot_with_user_oauth",
       LARKSUITE_CLI_STRICT_MODE: message.conversationType === "group" ? "bot" : "off"
     }),
-    loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([])
+    loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([]),
+    readMessage: channel.readMessage
   });
   const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName });
   console.log("数字员工配置：");
@@ -172,6 +173,7 @@ async function run(): Promise<void> {
     addReaction: channel.addReaction,
     removeReaction: channel.removeReaction,
     beforeCreateSession: ensureCredentialFresh,
+    readMessage: channel.readMessage,
     timeoutMs: config.sessionTimeoutMs
   });
   console.log("Gateway 配置：");
@@ -192,6 +194,7 @@ type FeishuRuntime = {
   addReaction?: (message: ChannelMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: ChannelMessage, reactionId: string) => Promise<void>;
   loadRecentHistory?: (message: ChannelMessage) => Promise<ChannelHistoryMessage[]>;
+  readMessage?: ChannelReadMessage;
   download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;
 };
 
@@ -210,10 +213,11 @@ async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (m
       addReaction: (message, emojiType) => adapter.addReaction(message, emojiType),
       removeReaction: (message, reactionId) => adapter.removeReaction(message, reactionId),
       loadRecentHistory: message => adapter.loadRecentHistory?.(message) || Promise.resolve([]),
+      readMessage: (message, id, signal) => adapter.readMessage?.(message, id, signal) || Promise.resolve({ status: "unavailable" }),
       download: (resource, message, maxBytes) => adapter.download(resource, message, maxBytes)
     };
   }
-  const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, { loadLarkRecentHistory }, Lark] = await Promise.all([
+  const [{ startLegacyFeishuChannel, createFeishuResourceDownloader }, { loadLarkRecentHistory, readLarkMessage }, Lark] = await Promise.all([
     import("./feishu.ts"), import("./lark-channel.ts"), import("@larksuiteoapi/node-sdk")
   ]);
   const client = new Lark.Client({ appId, appSecret });
@@ -231,6 +235,7 @@ async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (m
       if (response.data?.message_id) onSent?.(message, response.data.message_id);
     },
     loadRecentHistory: message => loadLarkRecentHistory(client, message),
+    readMessage: (message, id, signal) => readLarkMessage(client, message, id, signal),
     download
   };
 }

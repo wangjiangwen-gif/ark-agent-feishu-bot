@@ -276,6 +276,13 @@ export class GatewayStore {
     return rows.map(row => JSON.parse(row.payload) as ChannelHistoryMessage).reverse();
   }
 
+  cachedMessage(message: ChannelMessage, messageId: string): ChannelHistoryMessage | undefined {
+    // 引用可在窗口外，但不能跨应用、租户、群或其他话题取缓存。
+    const row = this.db.prepare(`SELECT payload FROM channel_history WHERE scope = ? AND message_id = ? AND create_time <= ?
+      AND (thread_id = '' OR thread_id = ?)`).get(this.historyScope(message), messageId, message.createTime, message.threadId) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as ChannelHistoryMessage : undefined;
+  }
+
   contextFingerprint(sessionId: string, messageId: string): string | undefined {
     return (this.db.prepare("SELECT fingerprint FROM context_receipts WHERE session_id = ? AND message_id = ?").get(sessionId, messageId) as { fingerprint: string } | undefined)?.fingerprint;
   }

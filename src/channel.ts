@@ -41,6 +41,12 @@ export type ChannelHistoryMessage = {
   attachmentPending?: boolean;
 };
 
+export type ChannelMessageLookup =
+  | { status: "available"; message: ChannelHistoryMessage }
+  | { status: "deleted" | "not_found" | "unavailable" | "failed" | "timeout" };
+
+export type ChannelReadMessage = (message: ChannelMessage, messageId: string, signal: AbortSignal) => Promise<ChannelMessageLookup>;
+
 export type ChannelOutbound =
   | { type: "text"; text: string }
   | { type: "markdown"; markdown: string }
@@ -67,5 +73,6 @@ export interface ChannelAdapter {
   addReaction?(message: ChannelMessage, emojiType: string): Promise<string>;
   removeReaction?(message: ChannelMessage, reactionId: string): Promise<void>;
   loadRecentHistory?(message: ChannelMessage): Promise<ChannelHistoryMessage[]>;
+  readMessage?: ChannelReadMessage;
   download(resource: ChannelResource, message: ChannelMessage, maxBytes?: number): Promise<{ bytes: Uint8Array; mimeType: string }>;
 }
