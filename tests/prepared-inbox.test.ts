@@ -24,6 +24,22 @@ function claim(store: GatewayStore, id = "first"): InboxTask {
 function ready(store: GatewayStore, id = "first"): InboxTask {
   return store.inbox.prepare(claim(store, id).id, prepared());
 }
+
+test("prepared input preserves precise inline delivery keys and rejects invalid receipts", () => {
+  const store = memory();
+  try {
+    const task = claim(store), value = { ...prepared(), inlineDeliveryKeys: ["attachment-one", "attachment-two"] };
+    const saved = store.inbox.prepare(task.id, value);
+    assert.deepEqual(store.inbox.findTask(task.id)!.preparation!.inlineDeliveryKeys, value.inlineDeliveryKeys);
+    assert.throws(() => store.inbox.prepare(task.id, { ...value, inlineDeliveryKeys: ["replacement"] }), /检查点/);
+    assert.deepEqual(store.inbox.findTask(task.id), saved);
+  } finally { store.close(); }
+  for (const keys of [null, "key", ["same", "same"], [""], ["a\nb"], Array.from({ length: 257 }, (_, n) => `key-${n}`)]) {
+    const other = memory();
+    try { assert.throws(() => other.inbox.prepare(claim(other).id, { ...prepared(), inlineDeliveryKeys: keys as any }), /结构/); }
+    finally { other.close(); }
+  }
+});
 function interrupted(store: GatewayStore, id = "first"): InboxTask {
   return store.inbox.finish(ready(store, id).id, "failed");
 }

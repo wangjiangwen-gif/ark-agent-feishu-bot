@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import type { DatabaseSync } from "node:sqlite";
 import { GatewayStore } from "../src/store.ts";
-import { Gateway, type IncomingMessage } from "../src/gateway.ts";
+import { Gateway, toConversationKey, type IncomingMessage } from "../src/gateway.ts";
 import { ArkClient, ArkHttpError } from "../src/ark.ts";
 
 const key = "a".repeat(64);
@@ -41,12 +42,74 @@ for (const stage of ["upload", "mount", "create"] as const) test(`Gateway persis
   });
   await execute(gateway, stage === "mount" ? message({ conversationType: "group", mentionedBot: true }) : source, replies);
   store.close(); store = new GatewayStore(path);
-  const record = store.attachmentTrace.list(source).items.find(item => item.status === "error")!;
+  const record = store.attachmentTrace.list(source).items.find(item => item.status === (stage === "create" ? "pending" : "error"))!;
   assert.equal(record.stage, stage === "upload" ? "upload" : "mount");
   assert.deepEqual(record.failure, { kind: "rate_limit", status: 429, code: "APIAccountRpmRateLimitExceeded", requestId: "request-trace-123" });
   assert.equal(record.rejected, undefined); assert.equal(calls, 1);
   assert.doesNotMatch(JSON.stringify(record) + replies.join(""), /PRIVATE-KEY|FILE-CONTENT/);
   store.close();
+});
+
+test("pending failure annotations are sanitized and never end or promote the attachment stage", () => {
+  const store = new GatewayStore(":memory:");
+  try {
+    const id = store.attachmentTrace.begin(message(), key, "mount", { fileId: "file", mountPath: "a.pdf", bytes: 3 });
+    store.attachmentTrace.annotatePendingFailure(id, {
+      kind: "PRIVATE", status: 200, code: "https://SECRET", requestId: "bad\nID", message: "FILE-CONTENT", cause: "TOKEN"
+    } as never);
+    const record = store.attachmentTrace.list(message()).items[0];
+    assert.equal(record.status, "pending"); assert.equal(record.finishedAt, undefined);
+    assert.equal(record.durationMs, undefined); assert.equal(record.rejected, undefined);
+    assert.deepEqual(record.failure, { kind: "unknown" });
+    assert.equal(record.fileId, "file"); assert.equal(record.bytes, 3);
+    assert.doesNotMatch(JSON.stringify(record), /PRIVATE|SECRET|FILE-CONTENT|TOKEN/);
+    store.attachmentTrace.finish(id, "succeeded");
+    assert.throws(() => store.attachmentTrace.annotatePendingFailure(id, { kind: "network" }), /不存在|结束/);
+    assert.throws(() => store.attachmentTrace.annotatePendingFailure("missing", { kind: "network" }), /不存在|结束/);
+  } finally { store.close(); }
+});
+
+test("unknown Session creation can confirm after restart while preserving its safe pending failure evidence", t => {
+  const directory = mkdtempSync(join(tmpdir(), "ark-create-failure-")), path = join(directory, "gateway.db");
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  let store = new GatewayStore(path);
+  try {
+    const source = message(), conversation = toConversationKey(source);
+    const intent = store.beginSessionCreation({ message: source, key: conversation, agentId: "agent", configFingerprint: "config",
+      request: { agent: "agent", environment_id: "environment", resources: [{ type: "file", file_id: "file", mount_path: "a.pdf" }] },
+      reusable: true, mounts: [{ key, details: { name: "a.pdf", fileId: "file", mountPath: "a.pdf", bytes: 3, sha256: "b".repeat(64) } }] });
+    const diagnostic = { kind: "rate_limit" as const, status: 429, code: "RateLimited", requestId: "request-trace" };
+    store.attachmentTrace.annotatePendingFailure(intent.mounts[0].intentId!, diagnostic);
+    store.close(); store = new GatewayStore(path);
+    assert.equal(store.attachmentTrace.list(source).items[0].status, "pending");
+    assert.equal(store.attachmentTrace.list(source).items[0].finishedAt, undefined);
+    assert.deepEqual(store.attachmentTrace.list(source).items[0].failure, diagnostic);
+    assert.equal(store.getSession(conversation), undefined);
+    const pending = store.sessionCreations.pending(intent.scope)!;
+    assert.equal(store.confirmSessionCreation(pending, "recovered-session").state, "confirmed");
+    const confirmed = store.attachmentTrace.list(source).items[0];
+    assert.equal(confirmed.status, "succeeded");
+    assert.equal(confirmed.sessionId, "recovered-session");
+    assert.deepEqual(confirmed.failure, diagnostic);
+    assert.equal(store.isAttachmentMounted("recovered-session", key), true);
+  } finally { store.close(); }
+});
+
+for (const patch of [{ failure: { kind: "network", private: "SECRET" } }, { failure: { kind: "unknown" }, unrecognized: true }])
+test(`Session creation confirmation rejects noncanonical stage details ${Object.keys(patch).join("/")}`, () => {
+  const store = new GatewayStore(":memory:");
+  try {
+    const source = message(), intent = store.beginSessionCreation({ message: source, key: toConversationKey(source), agentId: "agent", configFingerprint: "config",
+      request: { agent: "agent", resources: [{ type: "file", file_id: "file", mount_path: "a.pdf" }] }, reusable: true,
+      mounts: [{ key, details: { fileId: "file", mountPath: "a.pdf", name: "a.pdf", bytes: 3 } }] });
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    const row = db.prepare("SELECT details FROM attachment_stage_receipts WHERE id=?").get(intent.mounts[0].intentId!)!;
+    db.prepare("UPDATE attachment_stage_receipts SET details=? WHERE id=?")
+      .run(JSON.stringify({ ...JSON.parse(String(row.details)), ...patch }), intent.mounts[0].intentId!);
+    assert.throws(() => store.confirmSessionCreation(intent, "session"), /附件意图/);
+    assert.equal(store.sessionCreations.pending(intent.scope)?.state, "pending");
+    assert.equal(store.getSession(toConversationKey(source)), undefined);
+  } finally { store.close(); }
 });
 
 test("attachment failure metadata drops unknown fields and invalid diagnostic values", () => {
@@ -209,7 +272,8 @@ for (const failedStage of ["download", "mount", "create"] as const) test(`record
   await execute(gateway, failedStage === "create" ? source : message({ conversationType: "group", mentionedBot: true }), replies);
   const records = store.attachmentTrace.list(source).items;
   assert.equal(records.at(-1)?.stage, failedStage === "download" ? "download" : "mount");
-  assert.equal(records.at(-1)?.status, "error");
+  assert.equal(records.at(-1)?.status, failedStage === "create" ? "pending" : "error");
+  if (failedStage === "create") assert.deepEqual(records.at(-1)?.failure, { kind: "unknown" });
   assert.equal(records.filter(item => item.stage === "mount" && item.status === "succeeded").length, 0);
   if (failedStage === "create") assert.equal(runCount, 0);
   store.close();

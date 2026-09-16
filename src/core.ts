@@ -6,6 +6,8 @@ export {
   type RunInspection,
   type SessionCreateDefaults,
   type SessionCreateRequest,
+  type SessionCreationQuery,
+  type SessionCreationInspection,
   type SessionResource,
   type SessionStats,
   type UserAuthorizationRequired

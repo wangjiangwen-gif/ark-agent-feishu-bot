@@ -29,7 +29,7 @@ function exitDuringPreparation(path: string, incoming = first, setup = "", phase
     if (${JSON.stringify(phase)} === 'before_ready') store.inbox.prepare = () => process.exit(77);
     let extra = {};
     ${setup}
-    const gateway = new Gateway(store, { createSession: async () => 'original-session',
+    const gateway = new Gateway(store, { createSession: async () => ${JSON.stringify(incoming.conversationId === first.conversationId ? "original-session" : `session-${incoming.conversationId}`)},
       uploadFile: async name => ({ id: 'uploaded-file', name }), addSessionFile: async () => {},
       run: async () => { throw new Error('不能提前派发'); } }, async () => {}, { ...${JSON.stringify(options)}, ...extra });
     gateway.accept(${JSON.stringify(incoming)});

@@ -115,14 +115,18 @@ async function prepareInChild(config, meta) {
     buildSessionCreateRequest: async defaults => { counts.configBuilds++; return client.buildSessionCreateRequest({ ...defaults, vaultIds: [] }); },
     createSession: async request => {
       counts.creates++; check(counts.creates === 1, "create_replayed");
-      request.vault_ids = [];
-      sessionId = await client.createSession({ ...request, title: `Prepared recovery probe ${meta.id}` });
+      check(request.vault_ids.length === 0, "probe_vault_not_empty");
+      sessionId = await client.createSession(request);
       check(safeSessionId(sessionId), "invalid_session_id");
       output(save("created")); return sessionId;
     },
     uploadFile: forbidden("upload"), addSessionResource: forbidden("resource_write"),
     run: forbidden("child_run")
   }, async () => { counts.replies++; }, gatewayOptions(config, false));
+  // 仅探针在创建意图冻结前清空Vault并加标题；不能在HTTP适配器内修改已持久化请求。
+  const buildProbeRequest = gateway.buildSessionCreateRequest.bind(gateway);
+  gateway.buildSessionCreateRequest = async (...args) => ({ ...(await buildProbeRequest(...args)),
+    vault_ids: [], title: `Prepared recovery probe ${meta.id}` });
   gateway.accept(incoming(meta));
   await delay(CHILD_TIMEOUT_MS);
   check(false, "child_preparation_timeout");

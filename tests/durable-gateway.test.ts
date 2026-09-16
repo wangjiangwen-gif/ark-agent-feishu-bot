@@ -64,7 +64,8 @@ test("durable Gateway preserves independent Thread and direct scopes and ignores
 
 test("unknown MA execution blocks followers but not other scopes or authorization status controls", async () => {
   const store = new GatewayStore(":memory:"); store.acquireRuntimeLock(); const runs: string[] = [], replies: string[] = [];
-  const gateway = new Gateway(store, { createSession: async () => "session", run: async (_id, input) => {
+  let creates = 0;
+  const gateway = new Gateway(store, { createSession: async () => `session-${++creates}`, run: async (_id, input) => {
     runs.push(text(input)); if (text(input) === "unknown") throw new Error("network after submission"); return done();
   } }, async (_m, reply) => { if (reply.type === "text") replies.push(reply.text); }, { ...options, authorizationStatus: () => "local-status" });
   try {

@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { hostname } from "node:os";
 import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
-import type { CompactionCheckpoint } from "./session-compaction.ts";
+import { baselineCompaction, type CompactionCheckpoint } from "./session-compaction.ts";
 import { CredentialStateStore, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
 import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
 import type { OAuthTokens } from "./oauth.ts";
@@ -13,6 +13,9 @@ import type { RunInspection, RunResult } from "./ark.ts";
 import { MessageInbox, type InboxBinding, type InboxTask } from "./message-inbox.ts";
 import { ReactionStateStore } from "./reaction-state.ts";
 import { AttachmentTraceStore } from "./attachment-trace.ts";
+import { SessionCreationStore, type SessionCreationInput, type SessionCreationRecord } from "./session-creation-state.ts";
+import { configFingerprint, requestEnvironmentId } from "./session-config.ts";
+import { sanitizeFailure, type FailureDiagnostic } from "./ark-errors.ts";
 import { parseStoredFileObservation, sanitizeFileObservation, type RunFileObservation } from "./run-file-observation.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number; sha256?: string };
@@ -67,6 +70,7 @@ export class GatewayStore {
   readonly inbox: MessageInbox;
   readonly reactions: ReactionStateStore;
   readonly attachmentTrace: AttachmentTraceStore;
+  readonly sessionCreations: SessionCreationStore;
   private db: DatabaseSync;
   private runtimeToken?: string;
   private closed = false;
@@ -150,6 +154,10 @@ export class GatewayStore {
         PRIMARY KEY (session_id, attachment_key)
       );
       CREATE TABLE IF NOT EXISTS inline_restore_pending (session_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS inline_restore_sources (
+        session_id TEXT NOT NULL, attachment_key TEXT NOT NULL,
+        PRIMARY KEY (session_id, attachment_key)
+      );
       CREATE TABLE IF NOT EXISTS session_configuration (
         session_id TEXT PRIMARY KEY, config_fingerprint TEXT NOT NULL,
         metadata TEXT NOT NULL, created_at TEXT NOT NULL
@@ -171,6 +179,8 @@ export class GatewayStore {
     this.inbox = new MessageInbox(this.db, this.credentials, () => this.assertRuntimeLock());
     this.reactions = new ReactionStateStore(this.db, this.credentials, this.inbox, () => this.assertRuntimeLock());
     this.attachmentTrace = new AttachmentTraceStore(this.db);
+    this.sessionCreations = new SessionCreationStore(this.db, this.credentials, this.attachmentTrace,
+      (key, reusable, messageId) => this.sessionCreationScope(key, reusable, messageId));
     this.ensureColumn("authorization_recoveries", "evidence", "TEXT");
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
@@ -188,6 +198,13 @@ export class GatewayStore {
 
   conversationKey(key: ConversationKey): string {
     return [key.channelType, key.installationId, key.tenantId, key.conversationId, key.threadId || "-", key.senderId || "-"].map(escapeKeyPart).join(":");
+  }
+
+  sessionCreationScope(key: ConversationKey, reusable: boolean, messageId: string): string {
+    if (typeof reusable !== "boolean" || typeof messageId !== "string" || !messageId.trim()) throw new Error("Session创建模式或消息标识无效");
+    const conversation = this.conversationKey(key);
+    // 独立消息各自持有创建回执；JSON数组边界避免消息标识与会话范围的拼接碰撞。
+    return reusable ? conversation : JSON.stringify(["isolated-session", conversation, messageId]);
   }
 
   getSession(key: ConversationKey): string | undefined {
@@ -258,6 +275,92 @@ export class GatewayStore {
         vault_ids = excluded.vault_ids,
         updated_at = excluded.updated_at
     `).run(this.conversationKey(key), sessionId, agentId, agentVersion || null, vaultIds ? JSON.stringify(vaultIds) : null, new Date().toISOString());
+  }
+
+  beginSessionCreation(value: SessionCreationInput): SessionCreationRecord {
+    return this.sessionCreations.begin(value);
+  }
+
+  confirmSessionCreation(expected: SessionCreationRecord, sessionId: string): SessionCreationRecord {
+    // 与默认非持久化队列入口兼容；唯一pending范围和CAS由SQLite保证，不依赖进程运行锁。
+    this.db.exec("SAVEPOINT gateway_session_creation_confirmation");
+    try {
+      const previous = this.sessionCreations.get(expected.operationId);
+      const confirmed = this.sessionCreations.confirm(expected, sessionId);
+      if (previous?.state !== "confirmed") {
+        const { key, request } = confirmed;
+        const agentVersion = typeof request.agent === "object" && request.agent.version !== undefined ? String(request.agent.version) : undefined;
+        if (confirmed.reusable) {
+          const existing = this.getSession(key);
+          if (existing && existing !== sessionId) throw new Error("当前会话已绑定其他Session，不能覆盖原会话");
+          this.assertSessionAgent(key, confirmed.agentId);
+          this.saveSession(key, sessionId, confirmed.agentId, agentVersion, request.vault_ids);
+        }
+        const metadata = { requestFingerprint: configFingerprint(request), environmentId: requestEnvironmentId(request),
+          agentVersion, vaultIds: request.vault_ids || [],
+          hasSystemOverride: typeof request.agent === "object" && Object.hasOwn(request.agent, "system") };
+        const configuration = this.getSessionConfiguration(sessionId);
+        if (configuration && (configuration.fingerprint !== confirmed.configFingerprint
+          || configFingerprint(configuration.metadata) !== configFingerprint(metadata))) throw new Error("Session创建配置与已有回执冲突");
+        this.saveSessionConfiguration(sessionId, confirmed.configFingerprint, metadata);
+        if (!this.getCompactionCheckpoint(sessionId)) this.saveCompactionCheckpoint(sessionId, baselineCompaction({ eventCount: 0 }));
+        for (const mount of confirmed.mounts) {
+          if (mount.intentId) {
+            this.assertPendingCreationMount(confirmed, mount);
+            this.attachmentTrace.finish(mount.intentId, "succeeded", { sessionId });
+            this.markAttachmentMounted(sessionId, mount.key);
+          }
+          // inline正文还没有发送给模型，创建成功不能充当“已提供原文”的回执。
+        }
+      }
+      this.db.exec("RELEASE gateway_session_creation_confirmation");
+      return confirmed;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO gateway_session_creation_confirmation; RELEASE gateway_session_creation_confirmation");
+      throw error;
+    }
+  }
+
+  rejectSessionCreation(expected: SessionCreationRecord, diagnostic: FailureDiagnostic): SessionCreationRecord {
+    this.db.exec("SAVEPOINT gateway_session_creation_rejection");
+    try {
+      const previous = this.sessionCreations.get(expected.operationId);
+      const rejected = this.sessionCreations.reject(expected, diagnostic);
+      if (previous?.state !== "rejected") for (const mount of rejected.mounts) {
+        if (!mount.intentId) continue;
+        this.assertPendingCreationMount(rejected, mount);
+        this.attachmentTrace.finish(mount.intentId, "error", { rejected: true, failure: rejected.failure });
+      }
+      this.db.exec("RELEASE gateway_session_creation_rejection");
+      return rejected;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO gateway_session_creation_rejection; RELEASE gateway_session_creation_rejection");
+      throw error;
+    }
+  }
+
+  private assertPendingCreationMount(record: SessionCreationRecord, mount: SessionCreationRecord["mounts"][number]): void {
+    const trace = this.db.prepare("SELECT scope, attachment_key, stage, status, details FROM attachment_stage_receipts WHERE id=?").get(mount.intentId!);
+    const message = record.message;
+    const expectedScope = JSON.stringify([message.channelType, message.installationId, message.tenantId,
+      message.conversationId, message.threadId, message.messageId]);
+    const expectedDetails = { bytes: mount.details.bytes, sha256: mount.details.sha256,
+      fileId: mount.details.fileId, mountPath: mount.details.mountPath };
+    let traceDetails: unknown;
+    try { traceDetails = trace ? JSON.parse(String(trace.details)) : undefined; }
+    catch { throw new Error("Session创建附件阶段回执损坏，不能确认挂载"); }
+    if (traceDetails && typeof traceDetails === "object" && !Array.isArray(traceDetails) && Object.hasOwn(traceDetails, "failure")) {
+      const { failure, ...bindingDetails } = traceDetails as Record<string, unknown>;
+      if (configFingerprint(failure) !== configFingerprint(sanitizeFailure(failure))) {
+        throw new Error("Session创建附件意图包含未净化的诊断，不能确认挂载");
+      }
+      // 未决请求的安全诊断不是绑定字段；保留在原阶段回执中，但不能放过其他额外字段。
+      traceDetails = bindingDetails;
+    }
+    if (!trace || trace.scope !== expectedScope || trace.attachment_key !== mount.key || trace.stage !== "mount"
+      || trace.status !== "pending" || configFingerprint(traceDetails) !== configFingerprint(expectedDetails)) {
+      throw new Error("Session创建附件意图与阶段回执不一致，不能确认挂载");
+    }
   }
 
   getConversationContextCursor(key: ConversationKey, sessionId: string): number | undefined {
@@ -530,14 +633,28 @@ export class GatewayStore {
     this.db.prepare("INSERT OR IGNORE INTO inline_restore_pending VALUES (?)").run(sessionId);
   }
 
-  pendingInlineSources(sessionId: string): StoredAttachment[] {
-    if (!this.db.prepare("SELECT 1 FROM inline_restore_pending WHERE session_id = ?").get(sessionId)) return [];
-    const rows = this.db.prepare("SELECT a.payload FROM attachments a JOIN attachment_mounts m ON a.attachment_key = m.attachment_key WHERE m.session_id = ? ORDER BY a.created_at DESC").all(sessionId) as { payload: string }[];
-    return rows.map(row => JSON.parse(row.payload) as StoredAttachment).filter(item => item.inlineText !== undefined);
+  pendingInlineSources(sessionId: string): Array<StoredAttachment & { key: string }> {
+    // 将整轮恢复请求展开为逐文件待办；本轮预算未容纳的原文留给下一轮。
+    if (this.db.prepare("SELECT 1 FROM inline_restore_pending WHERE session_id = ?").get(sessionId)) {
+      this.db.exec("SAVEPOINT inline_restore_expand");
+      try {
+        this.db.prepare(`INSERT OR IGNORE INTO inline_restore_sources (session_id, attachment_key)
+          SELECT m.session_id, m.attachment_key FROM attachment_mounts m JOIN attachments a ON a.attachment_key=m.attachment_key
+          WHERE m.session_id=? AND json_type(a.payload, '$.inlineText')='text'`).run(sessionId);
+        this.db.prepare("DELETE FROM inline_restore_pending WHERE session_id = ?").run(sessionId);
+        this.db.exec("RELEASE inline_restore_expand");
+      } catch (error) {
+        this.db.exec("ROLLBACK TO inline_restore_expand; RELEASE inline_restore_expand"); throw error;
+      }
+    }
+    const rows = this.db.prepare(`SELECT a.attachment_key, a.payload FROM attachments a JOIN inline_restore_sources r
+      ON a.attachment_key=r.attachment_key WHERE r.session_id=? ORDER BY a.created_at DESC, a.attachment_key`).all(sessionId) as { attachment_key: string; payload: string }[];
+    return rows.map(row => ({ ...JSON.parse(row.payload) as StoredAttachment, key: row.attachment_key })).filter(item => item.inlineText !== undefined);
   }
 
-  completeInlineRestore(sessionId: string): void {
-    this.db.prepare("DELETE FROM inline_restore_pending WHERE session_id = ?").run(sessionId);
+  completeInlineRestore(sessionId: string, deliveredKeys: readonly string[] = []): void {
+    const remove = this.db.prepare("DELETE FROM inline_restore_sources WHERE session_id=? AND attachment_key=?");
+    for (const key of new Set(deliveredKeys)) remove.run(sessionId, key);
   }
 
   observeEmployeeUser(tenantKey: string, openId: string): EmployeeUser {

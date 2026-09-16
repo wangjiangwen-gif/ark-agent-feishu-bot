@@ -10,6 +10,7 @@ export type InboxBinding = { scope: string; agentId: string; configFingerprint: 
 export type InboxPreparation = {
   sessionId: string; input: string; fingerprint: string; notices: string[];
   contextReceipts: Array<{ id: string; fingerprint: string }>; preparedAt: number;
+  inlineDeliveryKeys?: string[];
 };
 export type InboxTask = {
   id: string; sequence: number; revision: number; state: InboxState; owner: string;
@@ -98,12 +99,13 @@ export class MessageInbox {
     if (task.state !== "preparing" || hasDispatchEvidence(task) || task.message.text.trim().startsWith("/")) {
       throw new Error("当前任务状态或派发证据不允许保存准备检查点");
     }
-    if (!hasExactKeys(value, ["sessionId", "input", "notices", "contextReceipts"]) || typeof value.input !== "string") {
+    if (!hasPreparationKeys(value, ["sessionId", "input", "notices", "contextReceipts"]) || typeof value.input !== "string") {
       throw new Error("准备检查点结构无效");
     }
     const preparation: InboxPreparation = { sessionId: value.sessionId, input: value.input,
       fingerprint: createHash("sha256").update(value.input).digest("hex"), notices: value.notices,
-      contextReceipts: value.contextReceipts, preparedAt: task.preparation?.preparedAt ?? Date.now() };
+      contextReceipts: value.contextReceipts, preparedAt: task.preparation?.preparedAt ?? Date.now(),
+      ...(value.inlineDeliveryKeys !== undefined ? { inlineDeliveryKeys: value.inlineDeliveryKeys } : {}) };
     validatePreparation(preparation);
     if (task.preparation) {
       if (JSON.stringify(task.preparation) !== JSON.stringify(preparation)) throw new Error("已保存的准备检查点不能被替换");
@@ -430,7 +432,7 @@ function boundedIdentifier(value: unknown, maxBytes: number): value is string {
 }
 
 function validatePreparation(value: unknown): asserts value is InboxPreparation {
-  if (!hasExactKeys(value, ["sessionId", "input", "fingerprint", "notices", "contextReceipts", "preparedAt"])
+  if (!hasPreparationKeys(value, ["sessionId", "input", "fingerprint", "notices", "contextReceipts", "preparedAt"])
     || !boundedIdentifier(value.sessionId, 256) || typeof value.input !== "string" || Buffer.byteLength(value.input, "utf8") > 2 * 1024 * 1024
     || typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.fingerprint)
     || createHash("sha256").update(value.input).digest("hex") !== value.fingerprint
@@ -440,7 +442,14 @@ function validatePreparation(value: unknown): asserts value is InboxPreparation 
     || !Array.isArray(value.contextReceipts) || value.contextReceipts.length > 128
     || Array.from(value.contextReceipts).some(receipt => !hasExactKeys(receipt, ["id", "fingerprint"])
       || !boundedIdentifier(receipt.id, 512) || !boundedIdentifier(receipt.fingerprint, 256))
-    || new Set(value.contextReceipts.map(receipt => receipt.id)).size !== value.contextReceipts.length) {
+    || new Set(value.contextReceipts.map(receipt => receipt.id)).size !== value.contextReceipts.length
+    || (value.inlineDeliveryKeys !== undefined && (!Array.isArray(value.inlineDeliveryKeys) || value.inlineDeliveryKeys.length > 256
+      || Array.from(value.inlineDeliveryKeys).some(key => !boundedIdentifier(key, 1024))
+      || new Set(value.inlineDeliveryKeys).size !== value.inlineDeliveryKeys.length))) {
     throw new Error("准备检查点结构无效或超过大小上限");
   }
+}
+
+function hasPreparationKeys(value: unknown, required: string[]): value is Record<string, unknown> {
+  return hasExactKeys(value, [...required, ...(value && typeof value === "object" && Object.hasOwn(value, "inlineDeliveryKeys") ? ["inlineDeliveryKeys"] : [])]);
 }

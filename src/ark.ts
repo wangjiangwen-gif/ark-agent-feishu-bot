@@ -5,6 +5,8 @@ import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
 import { RunFileObserver, type RunFileObservation } from "./run-file-observation.ts";
 import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
 import { inspectUploadedFile, validUploadName, type FileUploadQuery, type FileUploadInspection } from "./upload-inspection.ts";
+import { inspectCreatedSession, type SessionCreationQuery, type SessionCreationInspection } from "./session-creation-inspection.ts";
+export type { SessionCreationQuery, SessionCreationInspection } from "./session-creation-inspection.ts";
 import {
   prepareSessionUpgrade, parseSessionUpgradeSnapshot, validUpgradeSessionId, validateUpgradeWait,
   type SessionUpgradeRequest, type SessionUpgradeSubmission, type SessionUpgradeObservation, type SessionUpgradeWaitOptions
@@ -307,6 +309,36 @@ export class ArkClient {
     } finally {
       clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort();
     }
+  }
+
+  async inspectSessionCreation(query: SessionCreationQuery, signal?: AbortSignal): Promise<SessionCreationInspection> {
+    if (signal?.aborted) return { status: "unknown", reason: "cancelled" };
+    const controller = new AbortController();
+    const timeoutMs = Number.isSafeInteger(this.options.inspectionTimeoutMs) && this.options.inspectionTimeoutMs > 0
+      ? Math.min(5000, this.options.inspectionTimeoutMs) : 5000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let abort!: () => void, remaining = 4 * 1024 * 1024;
+    const interrupted = new Promise<SessionCreationInspection>(resolve => {
+      abort = () => resolve({ status: "unknown", reason: signal?.aborted ? "cancelled" : "timeout" });
+      combined.addEventListener("abort", abort, { once: true });
+    });
+    const inspect = inspectCreatedSession(query, async path => {
+      combined.throwIfAborted();
+      const response = await this.fetcher(`${this.baseUrl}${path}`, { method: "GET",
+        headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, redirect: "error", signal: combined });
+      if (!response.ok || combined.aborted) { void response.body?.cancel().catch(() => {}); throw new Error("核查不可用"); }
+      const body = await boundedHistoryBody(response, remaining, combined, bytes => { remaining -= bytes; });
+      combined.throwIfAborted();
+      return JSON.parse(body);
+    }).then((result): SessionCreationInspection => result.status === "confirmed" && this.apiKey
+      && [result.sessionId, result.agentId, result.environmentId].some(value => value.includes(this.apiKey))
+      ? { status: "unknown", reason: "invalid_sessions" } : result)
+      .catch((): SessionCreationInspection => ({ status: "unknown", reason: "sessions_unavailable" }));
+    try {
+      // 一个总预算覆盖全部列表页与详情，忽略取消信号的适配器也不能无限阻塞调用方。
+      return await Promise.race([inspect, interrupted]);
+    } finally { clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort(); }
   }
 
   async updateAgent(agentId: string, version: string, config: AgentConfig): Promise<{ id: string; version?: string }> {
@@ -812,7 +844,7 @@ export class ArkClient {
   }
 }
 
-async function boundedHistoryBody(response: Response, maxBytes: number, signal?: AbortSignal): Promise<string> {
+async function boundedHistoryBody(response: Response, maxBytes: number, signal?: AbortSignal, bytesRead?: (bytes: number) => void): Promise<string> {
   if (!response.body) throw new Error("事件历史响应为空");
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -834,6 +866,8 @@ async function boundedHistoryBody(response: Response, maxBytes: number, signal?:
       parts.push(decoder.decode(value, { stream: true }));
     }
     parts.push(decoder.decode());
+    // 多页共享预算使用网络字节数，不能因UTF-8解码移除BOM而少计大小。
+    bytesRead?.(bytes);
     return parts.join("");
   } catch (error) {
     void reader.cancel().catch(() => {});

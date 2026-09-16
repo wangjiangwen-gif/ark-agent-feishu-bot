@@ -90,6 +90,23 @@ export class AttachmentTraceStore {
     if (Number(result.changes) !== 1) throw new Error("附件阶段已经结束");
   }
 
+  annotatePendingFailure(id: string, diagnostic: FailureDiagnostic): void {
+    const row = this.db.prepare("SELECT details FROM attachment_stage_receipts WHERE id=? AND status='pending'")
+      .get(id) as { details: string } | undefined;
+    if (!row) throw new Error("附件阶段不存在或已经结束，不能追加未决诊断");
+    let previous: AttachmentStageDetails;
+    try {
+      previous = JSON.parse(row.details);
+      if (!previous || typeof previous !== "object" || Array.isArray(previous)) throw new Error("invalid details");
+      details(previous);
+    } catch { throw new Error("附件阶段记录损坏，不能追加未决诊断"); }
+    // 网络错误只说明结果未知，保留pending供只读核查；原始错误正文不进入阶段记录。
+    const data = { ...previous, failure: details({ failure: diagnostic }).failure };
+    const result = this.db.prepare("UPDATE attachment_stage_receipts SET details=? WHERE id=? AND status='pending' AND details=?")
+      .run(JSON.stringify(data), id, row.details);
+    if (Number(result.changes) !== 1) throw new Error("附件阶段已经变化，不能覆盖未决诊断");
+  }
+
   list(message: ChannelMessage, after = 0): { items: AttachmentStageReceipt[]; next?: number } {
     if (!Number.isSafeInteger(after) || after < 0) throw new Error("附件阶段游标无效");
     const rows = this.db.prepare("SELECT * FROM attachment_stage_receipts WHERE scope=? AND sequence>? ORDER BY sequence LIMIT 201").all(this.scope(message), after);
