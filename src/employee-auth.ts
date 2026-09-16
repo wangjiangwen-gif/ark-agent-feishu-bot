@@ -4,13 +4,13 @@ import type { FeishuOAuth } from "./oauth.ts";
 import { OAuthError, type OAuthTokens } from "./oauth.ts";
 import type { GatewayStore } from "./store.ts";
 import { credentialIdentityKey, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
-import { createHash } from "node:crypto";
+import { provisionUserCredential, type CredentialProvisioningArk } from "./credential-provisioning.ts";
 import { isAuthorizationTerminal, type AuthorizationFlow } from "./authorization-state.ts";
 import { validatePreparedAuthorization, type PreparedAuthorization } from "./prepared-authorization.ts";
 
 export const EMPLOYEE_CALENDAR_USER_SCOPES = ["offline_access", "auth:user.id:read", "calendar:calendar:read", "calendar:calendar.event:read", "calendar:calendar.free_busy:read"];
 
-type EmployeeAuthArk = Pick<ArkClient, "listVaults" | "createVault" | "listCredentials" | "createEnvironmentVariableCredential" | "updateEnvironmentCredential">;
+type EmployeeAuthArk = CredentialProvisioningArk & Pick<ArkClient, "updateEnvironmentCredential">;
 type PendingAuthorization = { flow: AuthorizationFlow; controller: AbortController; restored?: boolean; timer?: ReturnType<typeof setTimeout>; task?: Promise<void> };
 type AuthorizationLifecycleOptions = {
   notify?: (message: IncomingMessage, text: string) => Promise<void>;
@@ -333,6 +333,7 @@ export class EmployeeAuthorizationManager {
     if (message.conversationType !== "direct") return "群聊和话题仅使用 Bot 身份，不查询或申请个人用户授权。";
     const identity = this.identity(message);
     const credential = this.store.credentials.get(identity);
+    const provisioning = !credential ? this.store.credentialProvisioning.get(identity) : undefined;
     const flow = this.store.authorizations.get(identity);
     const messages = flow?.messages.filter(item => item.conversationId === message.conversationId
       && (item.threadId || "") === (message.threadId || "")) || [];
@@ -345,9 +346,16 @@ export class EmployeeAuthorizationManager {
       sync_pending: "用户凭证已保存，等待同步到 MA",
       reauth_required: "需要重新授权，下一次实际调用按权限错误处理"
     };
-    lines.push(`凭证：${!credential ? "没有当前应用身份的授权记录；旧版授权是否有效需另行核实"
+    lines.push(`凭证：${!credential ? provisioning ? "用户凭证预置未完成，尚不能确认可用的用户凭证"
+      : "没有当前应用身份的授权记录；旧版授权是否有效需另行核实"
       : credential.status === "ready" && credential.expiresAt <= Date.now() ? "凭证有效期已到，业务执行前需刷新或重新授权"
       : credentialLabels[credential.status]}`);
+    if (provisioning) {
+      const labels = { vault_pending: "Vault创建结果待确认", vault_confirmed: "Vault已记录，Credential尚未创建",
+        credential_pending: "Credential创建结果待确认", ready: "资源回执已记录，本地绑定待确认",
+        completed: "预置记录已完成但本地绑定缺失，需管理员核查" };
+      lines.push(`预置：${labels[provisioning.phase]}。查询不会创建资源、发起授权或重放业务，请保留数据库及配套密钥供核查。`);
+    }
     if (!flow || !messages.length) {
       lines.push("当前会话没有授权流程记录；本次查询不会创建授权或业务任务。");
       return lines.join("\n");
@@ -450,22 +458,7 @@ export class EmployeeAuthorizationManager {
     const provisioning = this.exclusive(identity, async () => {
       const current = this.store.migrateEmployeeCredential(identity);
       if (current) return { vaultId: current.vaultId, credentialId: current.credentialId };
-      const name = `ark-employee-user-${createHash("sha256").update(key).digest("hex").slice(0, 40)}`;
-      let vault = (await this.ark.listVaults()).find(item => item.displayName === name);
-      this.assertOpen();
-      if (!vault) vault = { id: await this.ark.createVault(name), displayName: name };
-      this.assertOpen();
-      const found = (await this.ark.listCredentials(vault.id)).find(item => item.secretName === "LARKSUITE_CLI_USER_ACCESS_TOKEN");
-      this.assertOpen();
-      const credentialId = found?.id || await this.ark.createEnvironmentVariableCredential(
-        vault.id,
-        "lark-cli-user-access-token",
-        "LARKSUITE_CLI_USER_ACCESS_TOKEN",
-        "ARKAGENT_USER_AUTH_PENDING"
-      );
-      this.assertOpen();
-      this.store.credentials.save(identity, { vaultId: vault.id, credentialId, status: "binding", scopes: [], expiresAt: 0 }, 0);
-      return { vaultId: vault.id, credentialId };
+      return provisionUserCredential(this.store, this.ark, identity, () => this.assertOpen());
     }).finally(() => {
       this.provisioning.delete(key);
     });

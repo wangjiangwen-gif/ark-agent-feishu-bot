@@ -181,6 +181,8 @@ npx --yes arkagent@latest employee doctor
 
 - 每轮单聊都会检查已授权凭证，包括复用已有 Session 的消息；群聊不执行用户刷新，未授权的普通问候不发起 OAuth。
 - 凭证按 Channel、App ID、租户、OpenID 四项绑定；授权完成后核对用户与租户，防止错账号写入。一个用户 Vault 不能分配给另一个身份。
+- 首次预置 Vault/Credential 时，在请求前加密记录创建意图，收到资源 ID 后保存回执；中断后核查原操作的身份、请求标记及资源详情，不重复提交结果未知的创建。已有本地绑定直接复用，不增加资源查询；同一身份的并发首次请求只创建一对资源。
+- 预置时的每次列表核查完整读取分页，但限制在 10 页、1,000 个资源、4 MiB 和 5 秒内，详情查询也有大小和超时限制；列表不完整、同名但没有原操作证明、多个候选或创建后被修改的凭证均停止自动认领。`/auth status` 可查看本地预置阶段，不查询远端、不自动重试。尚未提供未决预置的人工修正/放弃入口；不要删除数据库或密钥来绕过未知结果。
 - 同一身份的并发刷新合并处理。飞书刷新成功后先加密保存新 Refresh Token 和待同步 Access Token，再更新原 MA Credential；MA 同步失败或进程重启后只重试同步，不复用旧 Refresh Token。
 - 明确的授权失效会保留 Vault/Credential ID 并进入待重新授权状态；应用配置、权限错误不会伪装成用户授权失效。429 尊重退避时间。刷新结果未知时保留记录并停止自动重复刷新，不能假定旧 Refresh Token 仍可重用。
 - 用户凭证使用独立 AES-256-GCM 密钥，位置为 `<GATEWAY_DB_PATH>.credential-key`，权限必须为 `0600`。**停机备份时必须同时保存数据库及对应密钥**；在线备份需使用 SQLite 一致性备份机制，不能只复制正在写入的数据库主文件。密钥丢失或不匹配时拒绝解密，不会自动生成替代密钥；修改 WebUI Token 不影响该密钥。
@@ -190,11 +192,13 @@ npx --yes arkagent@latest employee doctor
 
 源码开发版已支持授权取消、超时与分阶段重启恢复：明确等待用户时继续原轮询，不重发卡片；交换Token或发送卡片结果未知时停止自动重试；已收到的Token先加密落盘，经身份校验后同步原Credential。凭证与同步阶段、取消与任务状态均采用事务更新。等待授权时暂停当前单聊后续业务，其他用户和群聊不受影响。仍未完成多步骤写操作的安全续跑，不能把原请求自动重发视为安全恢复，也不能把自动化测试通过等同于真实飞书端到端验收通过。
 
+预置恢复只处理资源绑定：再次进入该用户的预置流程时，确认原资源后继续尚未开始的步骤，不扫描并重放旧消息。Credential 的秘密值不可回读，因此未知创建仅在原关联标记匹配、列表与详情一致、创建及更新时间相同且时间范围可核实时认领；缺少这些证据就暂停。这不是服务端幂等保证，也不能消除核查后外部管理员同时修改凭证的竞态。实验持久队列中结果未知的个人凭证准备回调仍不自动续跑，不能把资源找回当作原任务恢复完成。
+
 数字员工不再维护第二套用户白名单。谁可以发现和使用 Bot，完全服从飞书应用的可用范围与禁用范围；企业希望接受范围外申请时，应在飞书管理后台开启原生的“允许不在可用范围内的成员申请使用应用”。凡是飞书成功投递到 Gateway 的消息都会进入 Managed Agents，WebUI 只记录实际使用者、使用次数和审计日志。
 
 企业管理员配置路径：`飞书管理后台 > 工作台 > 应用管理 > 方舟数字员工 > 应用可用范围`。如果企业的应用管理规则已允许成员申请没有权限的应用，可在这里勾选“允许不在可用范围内的成员申请使用应用”。该开关属于企业管理策略，当前公开 OpenAPI 与一键创建 SDK 均没有提供自动设置字段，因此 init 只做明确引导，不尝试绕过管理员配置。
 
-Bot 的 App Secret 保存在本地安全配置，用于 WebSocket 鉴权和刷新短期 `tenant_access_token`。Gateway 把短期 Bot token 写入方舟 Vault，以 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 注入 Session；MA Session 不需要读取 App Secret。App ID 由 Environment 提供。当前消息发送者的 `open_id` 会作为 `FEISHU_USER_OPEN_ID` 覆写到 Session；只有该 Session 同时挂载了对应用户 Vault 时，才表示这个用户已经授权。
+Bot 的 App Secret 保存在本地安全配置，用于 WebSocket 鉴权和刷新短期 `tenant_access_token`。Gateway 把短期 Bot token 写入方舟 Vault，以 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 注入 Session；MA Session 不需要读取 App Secret。App ID 由 Environment 提供。当前消息发送者的 `open_id` 会作为 `FEISHU_USER_OPEN_ID` 覆写到 Session；OpenID 和用户 Vault 挂载只表示身份及凭证位置，不表示已获用户授权。首次挂载仍是占位 Credential，完成 OAuth、核对账号并同步有效 Token 后才可使用用户能力。
 
 数字员工会显式申请 `im:message.p2p_msg:readonly` 与 `im:message.group_at_msg:readonly`，分别用于接收用户私聊和群聊中明确 @Bot 的消息；还会申请 `im:message.group_msg`，供 Gateway 和 Session 内的 Bot 读取群聊或话题近期历史。该权限属于敏感群消息权限，可能需要管理员审核并重新发布应用。Gateway 收到请求后先在用户消息上添加 `Get` 表情，使用同一条流式消息逐步更新 Agent 回复，任务成功或失败后都会移除该表情。应用可用范围、原生申请和审批由飞书控制面统一管理，arkagent 不复制这套能力。
 

@@ -6,6 +6,7 @@ import { hostname } from "node:os";
 import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
 import { baselineCompaction, type CompactionCheckpoint } from "./session-compaction.ts";
 import { CredentialStateStore, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
+import { CredentialProvisioningStore } from "./credential-provisioning-state.ts";
 import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
 import type { OAuthTokens } from "./oauth.ts";
 import type { RunEvidence } from "./run-evidence.ts";
@@ -66,6 +67,7 @@ export type AuthorizationRecoveryState = "waiting" | "resuming" | "completed" | 
 
 export class GatewayStore {
   readonly credentials: CredentialStateStore;
+  readonly credentialProvisioning: CredentialProvisioningStore;
   readonly authorizations: AuthorizationStateStore;
   readonly inbox: MessageInbox;
   readonly reactions: ReactionStateStore;
@@ -175,6 +177,7 @@ export class GatewayStore {
       );
     `);
     this.credentials = new CredentialStateStore(this.db, path);
+    this.credentialProvisioning = new CredentialProvisioningStore(this.db, this.credentials);
     this.authorizations = new AuthorizationStateStore(this.db, this.credentials);
     this.inbox = new MessageInbox(this.db, this.credentials, () => this.assertRuntimeLock());
     this.reactions = new ReactionStateStore(this.db, this.credentials, this.inbox, () => this.assertRuntimeLock());

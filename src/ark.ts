@@ -113,6 +113,15 @@ export type SessionCreateDefaults = {
   envOverrides?: Record<string, string>;
 };
 
+export type VaultMetadata = {
+  id: string; displayName: string; type?: "vault"; metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string;
+};
+export type CredentialMetadata = {
+  id: string; displayName: string; authType: string; secretName?: string; type?: "vault_credential";
+  vaultId?: string; metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string;
+  networking?: { type: string; allowed_hosts?: string[] };
+};
+
 const LARK_CLI_VERSION = "1.0.88";
 const LARK_CLI_SETUP_SCRIPT = `set -e
 case "$(uname -m)" in
@@ -402,42 +411,81 @@ export class ArkClient {
     return { id, name: String(data.name || name) };
   }
 
-  async createVault(displayName: string): Promise<string> {
-    const response = await this.request("/vaults", { method: "POST", body: JSON.stringify({ display_name: displayName }) });
+  async createVault(displayName: string, metadata?: Record<string, unknown>): Promise<string> {
+    const response = await this.request("/vaults", { method: "POST", body: JSON.stringify({ display_name: displayName,
+      ...(metadata === undefined ? {} : { metadata: resourceMetadata(metadata) }) }) });
     return responseId(await response.json(), "Vault");
   }
 
-  async listVaults(): Promise<Array<{ id: string; displayName: string }>> {
-    const response = await this.request("/vaults?limit=100");
-    const payload = await response.json() as Record<string, unknown>;
-    const items = Array.isArray(payload.data) ? payload.data : [];
-    return items.map(item => {
-      const record = item as Record<string, unknown>;
-      return { id: String(record.id || ""), displayName: String(record.display_name || "") };
-    }).filter(item => item.id);
+  async listVaults(signal?: AbortSignal): Promise<VaultMetadata[]> {
+    return this.inspectCredentialResources(read => collectCredentialResources(read, "/vaults", projectVault), signal);
   }
 
-  async listCredentials(vaultId: string): Promise<Array<{ id: string; displayName: string; authType: string; secretName?: string }>> {
-    const response = await this.request(`/vaults/${encodeURIComponent(vaultId)}/credentials?limit=100`);
-    const payload = await response.json() as Record<string, unknown>;
-    const items = Array.isArray(payload.data) ? payload.data : [];
-    return items.map(item => {
-      const record = item as Record<string, unknown>;
-      const auth = (record.auth || {}) as Record<string, unknown>;
-      return { id: String(record.id || ""), displayName: String(record.display_name || ""), authType: String(auth.type || ""), secretName: typeof auth.secret_name === "string" ? auth.secret_name : undefined };
-    }).filter(item => item.id);
+  async listCredentials(vaultId: string, signal?: AbortSignal): Promise<CredentialMetadata[]> {
+    return this.inspectCredentialResources(read => {
+      if (!validUpgradeSessionId(vaultId)) throw new Error();
+      return collectCredentialResources(read, `/vaults/${encodeURIComponent(vaultId)}/credentials`, item => projectCredential(item, vaultId));
+    }, signal);
+  }
+
+  async getVault(vaultId: string, signal?: AbortSignal): Promise<VaultMetadata> {
+    return this.inspectCredentialResources(async read => {
+      if (!validUpgradeSessionId(vaultId)) throw new Error();
+      const vault = projectVault(await read(`/vaults/${encodeURIComponent(vaultId)}`));
+      if (vault.id !== vaultId) throw new Error();
+      return vault;
+    }, signal);
+  }
+
+  async getCredential(vaultId: string, credentialId: string, signal?: AbortSignal): Promise<CredentialMetadata> {
+    return this.inspectCredentialResources(async read => {
+      if (!validUpgradeSessionId(vaultId) || !validUpgradeSessionId(credentialId)) throw new Error();
+      const credential = projectCredential(await read(`/vaults/${encodeURIComponent(vaultId)}/credentials/${encodeURIComponent(credentialId)}`), vaultId);
+      if (credential.id !== credentialId || credential.vaultId !== vaultId) throw new Error();
+      return credential;
+    }, signal);
+  }
+
+  private async inspectCredentialResources<T>(operation: (read: (path: string) => Promise<unknown>) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const controller = new AbortController();
+    const timeoutMs = Number.isSafeInteger(this.options.inspectionTimeoutMs) && this.options.inspectionTimeoutMs > 0
+      ? Math.min(5_000, this.options.inspectionTimeoutMs) : 5_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let abort!: () => void, remaining = 4 * 1024 * 1024;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new Error());
+      combined.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      combined.throwIfAborted();
+      const pending = operation(async path => {
+        combined.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}${path}`, { method: "GET", redirect: "error", signal: combined,
+          headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` } });
+        // 总预算包含所有分页和正文；忽略AbortSignal的适配器迟到后也只清理，不继续读。
+        if (!response.ok || combined.aborted) { void response.body?.cancel().catch(() => {}); throw new Error(); }
+        const body = await boundedHistoryBody(response, remaining, combined, bytes => { remaining -= bytes; });
+        combined.throwIfAborted();
+        return JSON.parse(body);
+      });
+      return await Promise.race([pending, interrupted]);
+    } catch {
+      // 失败绝不是空列表；不能让调用方误判资源不存在而重复创建。禁止转发密钥或上游正文。
+      throw new Error("凭证资源核查失败，未确认资源列表或详情");
+    } finally { clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort(); }
   }
 
   async createEnvironmentCredential(vaultId: string, displayName: string, secretValue: string): Promise<string> {
     return this.createEnvironmentVariableCredential(vaultId, displayName, "LARKSUITE_CLI_USER_ACCESS_TOKEN", secretValue);
   }
 
-  async createEnvironmentVariableCredential(vaultId: string, displayName: string, secretName: string, secretValue: string): Promise<string> {
+  async createEnvironmentVariableCredential(vaultId: string, displayName: string, secretName: string, secretValue: string, metadata?: Record<string, unknown>): Promise<string> {
     const response = await this.request(`/vaults/${encodeURIComponent(vaultId)}/credentials`, {
       method: "POST", body: JSON.stringify({ display_name: displayName, auth: {
         type: "environment_variable", secret_name: secretName, secret_value: secretValue,
         networking: { type: "unrestricted" }
-      } })
+      }, ...(metadata === undefined ? {} : { metadata: resourceMetadata(metadata) }) })
     });
     return responseId(await response.json(), "Credential");
   }
@@ -860,6 +908,106 @@ export class ArkClient {
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
     return parseEventStream(response.body);
   }
+}
+
+function resourceObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+}
+
+function resourceMetadata(value: unknown): Record<string, unknown> {
+  let nodes = 0, bytes = 0;
+  const seen = new Set<object>();
+  const copy = (item: unknown, depth: number): unknown => {
+    if (++nodes > 65_536 || depth > 32) throw new Error("凭证资源元信息无效");
+    if (item === null || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))) return item;
+    if (typeof item === "string") { bytes += Buffer.byteLength(item); if (bytes > 4 * 1024 * 1024) throw new Error("凭证资源元信息无效"); return item; }
+    if ((!resourceObject(item) && !Array.isArray(item)) || seen.has(item as object) || Object.getOwnPropertySymbols(item as object).length) throw new Error("凭证资源元信息无效");
+    const descriptors = Object.getOwnPropertyDescriptors(item);
+    if (Object.values(descriptors).some(value => value.get || value.set)) throw new Error("凭证资源元信息无效");
+    seen.add(item as object);
+    let result: unknown;
+    if (Array.isArray(item)) {
+      if (Object.keys(item).length !== item.length || Object.keys(item).some(key => !/^\d+$/.test(key))) throw new Error("凭证资源元信息无效");
+      result = item.map(value => copy(value, depth + 1));
+    } else result = Object.fromEntries(Object.keys(item as object).map(key => [copy(key, depth + 1), copy(descriptors[key].value, depth + 1)]));
+    seen.delete(item as object);
+    return result;
+  };
+  if (!resourceObject(value)) throw new Error("凭证资源元信息无效");
+  return copy(value, 0) as Record<string, unknown>;
+}
+
+function projectResource(value: unknown, type: string): { record: Record<string, unknown>; fields: { id: string; displayName: string;
+  metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string } } {
+  if (!resourceObject(value) || Object.hasOwn(value, "error") || !validUpgradeSessionId(value.id)
+    || (value.display_name === undefined ? type !== "vault_credential" : typeof value.display_name !== "string")
+    || (value.type !== undefined && value.type !== type)) throw new Error();
+  const fields: { id: string; displayName: string; metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string } = {
+    // Credential名称可省略；空字符串仅维持旧投影，不可作为预置资源归属的证明。
+    id: value.id, displayName: typeof value.display_name === "string" ? value.display_name : ""
+  };
+  if (value.metadata !== undefined) fields.metadata = resourceMetadata(value.metadata);
+  for (const [raw, normalized] of [["created_at", "createdAt"], ["updated_at", "updatedAt"]] as const) {
+    if (value[raw] === undefined) continue;
+    const stamp = value[raw];
+    if (typeof stamp !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(stamp) || !Number.isFinite(Date.parse(stamp))) throw new Error();
+    fields[normalized] = stamp;
+  }
+  return { record: value, fields };
+}
+
+function projectVault(value: unknown): VaultMetadata {
+  const { record, fields } = projectResource(value, "vault");
+  return { ...fields, ...(record.type === undefined ? {} : { type: "vault" }) };
+}
+
+function projectCredential(value: unknown, vaultId: string): CredentialMetadata {
+  const { record, fields } = projectResource(value, "vault_credential"), auth = record.auth;
+  if (!resourceObject(auth) || typeof auth.type !== "string" || !auth.type
+    || (auth.secret_name !== undefined && typeof auth.secret_name !== "string")
+    || (record.vault_id !== undefined && record.vault_id !== vaultId)) throw new Error();
+  let networking: CredentialMetadata["networking"];
+  if (auth.networking !== undefined) {
+    const source = auth.networking;
+    if (!resourceObject(source) || typeof source.type !== "string" || !source.type
+      || (source.allowed_hosts !== undefined && (!Array.isArray(source.allowed_hosts) || source.allowed_hosts.some(host => typeof host !== "string")))) throw new Error();
+    networking = { type: source.type, ...(source.allowed_hosts === undefined ? {} : { allowed_hosts: [...source.allowed_hosts as string[]] }) };
+  }
+  // 只读取明确的元信息字段；auth中的secret_value/token及其他凭证正文绝不进入返回值。
+  return { ...fields, authType: auth.type, ...(auth.secret_name === undefined ? {} : { secretName: auth.secret_name as string }),
+    ...(record.type === undefined ? {} : { type: "vault_credential" }), ...(record.vault_id === undefined ? {} : { vaultId }),
+    ...(networking === undefined ? {} : { networking }) };
+}
+
+async function collectCredentialResources<T extends { id: string }>(read: (path: string) => Promise<unknown>, path: string,
+  project: (item: unknown) => T): Promise<T[]> {
+  const result: T[] = [], cursors = new Set<string>(), ids = new Set<string>();
+  let page: string | undefined, total: number | undefined;
+  for (let count = 0; count < 10; count++) {
+    const payload = await read(`${path}?limit=100${page ? `&page=${encodeURIComponent(page)}` : ""}`);
+    if (!resourceObject(payload) || Object.hasOwn(payload, "error") || !Array.isArray(payload.data)) throw new Error();
+    if (payload.total !== undefined) {
+      if (!Number.isSafeInteger(payload.total) || (payload.total as number) < 0 || (payload.total as number) > 1000
+        || (total !== undefined && total !== payload.total)) throw new Error();
+      total = payload.total as number;
+    }
+    if (result.length + payload.data.length > 1000) throw new Error();
+    for (const item of payload.data) {
+      const projected = project(item);
+      if (ids.has(projected.id)) throw new Error();
+      ids.add(projected.id); result.push(projected);
+    }
+    const next = payload.next_page;
+    if (next !== undefined && next !== null && (typeof next !== "string" || Buffer.byteLength(next) > 2048 || /[\x00-\x20\x7f]/.test(next))) throw new Error();
+    if (typeof next === "string" && next) {
+      if (cursors.has(next)) throw new Error();
+      cursors.add(next); page = next; continue;
+    }
+    if ((total !== undefined && total !== result.length) || (total === undefined && next == null && payload.data.length >= 100)) throw new Error();
+    return result;
+  }
+  throw new Error();
 }
 
 async function boundedHistoryBody(response: Response, maxBytes: number, signal?: AbortSignal, bytesRead?: (bytes: number) => void): Promise<string> {
