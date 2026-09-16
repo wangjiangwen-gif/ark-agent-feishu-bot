@@ -18,8 +18,12 @@ function readKnownUserVaultIds(databasePath: string): string[] {
   if (!existsSync(databasePath)) return [];
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'employee_oauth'").get()) return [];
-    return (db.prepare("SELECT DISTINCT vault_id FROM employee_oauth").all() as { vault_id: string }[]).map(row => row.vault_id);
+    const ids = new Set<string>();
+    for (const table of ["employee_oauth", "employee_credentials"]) {
+      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) continue;
+      for (const row of db.prepare(`SELECT DISTINCT vault_id FROM ${table}`).all() as { vault_id: string }[]) ids.add(row.vault_id);
+    }
+    return [...ids];
   } finally { db.close(); }
 }
 

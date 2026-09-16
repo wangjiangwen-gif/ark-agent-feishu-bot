@@ -103,6 +103,7 @@ async function runEmployee(): Promise<void> {
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     ensureAuthorization: (message, request) => auth.ensure(message, request),
     getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
+    beforeDirectTurn: message => auth.ensureCredentialFresh(message),
     beforeCreateSession: ensureBotToken, dualIdentity: true, sharedGroupSessions: true,
     sessionEnvironment: message => ({
       FEISHU_IDENTITY_MODE: message.conversationType === "group" ? "bot_only" : "bot_with_user_oauth",

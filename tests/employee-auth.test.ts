@@ -4,6 +4,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import { EmployeeAuthorizationManager, EMPLOYEE_CALENDAR_USER_SCOPES } from "../src/employee-auth.ts";
 import { Gateway, type IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
+import { OAuthError } from "../src/oauth.ts";
+
+const identity = { channelType: "lark", installationId: "cli", tenantId: "tenant", openId: "ou-one" };
 
 test("employee authorization maps only explicit calendar tool failures to calendar scopes", () => {
   assert.ok(EMPLOYEE_CALENDAR_USER_SCOPES.includes("calendar:calendar.free_busy:read"));
@@ -17,7 +20,7 @@ test("unsupported lark-cli domains do not open an unrelated calendar OAuth flow"
   }, { begin: async () => { throw new Error("should not begin"); } } as never,
   async () => undefined, () => undefined);
 
-  await assert.rejects(auth.ensure(authMessage("om-doc"), {
+  await assert.rejects(auth.ensure(authMessage("om-doc", "direct"), {
     identity: "user", errorType: "authentication", subtype: "token_missing", domain: "docs"
   }), /尚未配置.*docs.*用户授权/);
   store.close();
@@ -42,7 +45,7 @@ test("concurrent authorization requests from one user all resume after one OAuth
   }, {
     begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }),
     poll: async () => poll,
-    getUserOpenId: async () => "ou-one"
+    getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
   } as never, async message => { cards.push(message.messageId); },
   message => { resumed.push(message.messageId); });
 
@@ -55,7 +58,7 @@ test("concurrent authorization requests from one user all resume after one OAuth
 
   assert.deepEqual(resumed, ["om-one", "om-two"]);
   assert.deepEqual(createdSecrets, ["ARKAGENT_USER_AUTH_PENDING"]);
-  assert.equal(store.getEmployeeOAuth("tenant", "ou-one")?.vaultId, "vlt-user");
+  assert.equal(store.credentials.get(identity)?.vaultId, "vlt-user");
   store.close();
 });
 
@@ -70,7 +73,7 @@ test("authorization resumes the original direct Session without handoff", async 
   }, {
     begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }),
     poll: async () => poll,
-    getUserOpenId: async () => "ou-one"
+    getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
   } as never, async () => undefined,
   message => { resumed.push(message.messageId); });
 
@@ -85,22 +88,23 @@ test("authorization resumes the original direct Session without handoff", async 
 
 test("an expired refresh token keeps the pre-mounted Vault and falls through to a new OAuth flow", async () => {
   const store = new GatewayStore(":memory:");
-  store.saveEmployeeOAuth({
-    tenantKey: "tenant", openId: "ou-one", vaultId: "vlt-user", credentialId: "vcrd-user",
+  store.credentials.save(identity, {
+    status: "ready", vaultId: "vlt-user", credentialId: "vcrd-user",
     refreshToken: "expired", expiresAt: Date.now() - 1, scopes: EMPLOYEE_CALENDAR_USER_SCOPES
-  });
+  }, 0);
   let began = 0;
   const auth = new EmployeeAuthorizationManager(store, {
     listVaults: async () => [], createVault: async () => "never", listCredentials: async () => [],
     createEnvironmentVariableCredential: async () => "never",
     updateEnvironmentCredential: async () => undefined
   }, {
-    refresh: async () => { throw new Error("refresh token expired"); },
+    refresh: async () => { throw new OAuthError("reauth_required", { outcome: "rejected" }); },
     begin: async () => { began++; return { verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }; },
     poll: async () => new Promise(() => undefined)
   } as never, async () => undefined, () => undefined);
 
   assert.deepEqual(await auth.vaultIds(authMessage("om-expired", "direct")), ["vlt-user"]);
+  await auth.ensureCredentialFresh(authMessage("om-expired", "direct"));
   assert.equal(await auth.ensure(authMessage("om-expired", "direct"), calendarRequest()), false);
   assert.equal(began, 1);
   store.close();
@@ -135,11 +139,12 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
   const auth = new EmployeeAuthorizationManager(store, ark, {
     begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }),
     poll: async () => poll,
-    getUserOpenId: async () => "ou-one"
+    getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
   } as never, async () => undefined, (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId));
   gateway = new Gateway(store, ark, async () => undefined, {
     agentId: "agent", environmentId: "env", vaultId: "vlt-bot", timeoutMs: 5_000, platformAccess: true,
-    getUserVaultIds: message => auth.vaultIds(message), ensureAuthorization: (message, request) => auth.ensure(message, request)
+    getUserVaultIds: message => auth.vaultIds(message), ensureAuthorization: (message, request) => auth.ensure(message, request),
+    beforeDirectTurn: message => auth.ensureCredentialFresh(message)
   });
 
   gateway.accept(authMessage("om-hot-reload", "direct"));
@@ -150,7 +155,7 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
   assert.deepEqual(createdVaultLists, [["vlt-bot", "vlt-user"]]);
   assert.deepEqual(runSessions, ["session-original", "session-original"]);
   assert.deepEqual(credentialWrites, ["ARKAGENT_USER_AUTH_PENDING", "valid-uat"]);
-  assert.equal(store.getEmployeeOAuth("tenant", "ou-one")?.credentialId, "vcrd-user");
+  assert.equal(store.credentials.get(identity)?.credentialId, "vcrd-user");
   store.close();
 });
 

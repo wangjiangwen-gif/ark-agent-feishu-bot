@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { hostname } from "node:os";
 import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
 import type { CompactionCheckpoint } from "./session-compaction.ts";
+import { CredentialStateStore, type CredentialIdentity, type CredentialState } from "./credential-state.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -50,6 +51,7 @@ export type EmployeeOAuth = {
 };
 
 export class GatewayStore {
+  readonly credentials: CredentialStateStore;
   private db: DatabaseSync;
   private runtimeToken?: string;
   private closed = false;
@@ -59,6 +61,7 @@ export class GatewayStore {
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA secure_delete = ON;
       CREATE TABLE IF NOT EXISTS conversations (
         conversation_key TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -144,6 +147,7 @@ export class GatewayStore {
         session_id TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at TEXT NOT NULL
       );
     `);
+    this.credentials = new CredentialStateStore(this.db, path);
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
     this.ensureColumn("audit_logs", "response_summary", "TEXT");
@@ -190,7 +194,7 @@ export class GatewayStore {
   }
 
   knownUserVaultIds(): string[] {
-    return (this.db.prepare("SELECT DISTINCT vault_id FROM employee_oauth").all() as { vault_id: string }[]).map(row => row.vault_id);
+    return (this.db.prepare("SELECT vault_id FROM employee_oauth UNION SELECT vault_id FROM employee_credentials").all() as { vault_id: string }[]).map(row => row.vault_id);
   }
 
   getCompactionCheckpoint(sessionId: string): CompactionCheckpoint | undefined {
@@ -472,7 +476,7 @@ export class GatewayStore {
 
   getEmployeeOAuth(tenantKey: string, openId: string): EmployeeOAuth | undefined {
     const row = this.db.prepare("SELECT * FROM employee_oauth WHERE tenant_key = ? AND open_id = ?").get(tenantKey, openId) as Record<string, unknown> | undefined;
-    return row ? { tenantKey: String(row.tenant_key), openId: String(row.open_id), vaultId: String(row.vault_id), credentialId: String(row.credential_id), refreshToken: String(row.refresh_token), expiresAt: Number(row.expires_at), scopes: JSON.parse(String(row.scopes)), updatedAt: String(row.updated_at) } : undefined;
+    return row ? { tenantKey: String(row.tenant_key), openId: String(row.open_id), vaultId: String(row.vault_id), credentialId: String(row.credential_id), refreshToken: this.credentials.openLegacy(String(row.refresh_token), tenantKey, openId), expiresAt: Number(row.expires_at), scopes: JSON.parse(String(row.scopes)), updatedAt: String(row.updated_at) } : undefined;
   }
 
   saveEmployeeOAuth(value: Omit<EmployeeOAuth, "updatedAt">): EmployeeOAuth {
@@ -481,12 +485,48 @@ export class GatewayStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(tenant_key, open_id) DO UPDATE SET vault_id=excluded.vault_id, credential_id=excluded.credential_id,
       refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, scopes=excluded.scopes, updated_at=excluded.updated_at`
-    ).run(value.tenantKey, value.openId, value.vaultId, value.credentialId, value.refreshToken, value.expiresAt, JSON.stringify(value.scopes), updatedAt);
+    ).run(value.tenantKey, value.openId, value.vaultId, value.credentialId, this.credentials.sealLegacy(value.refreshToken, value.tenantKey, value.openId), value.expiresAt, JSON.stringify(value.scopes), updatedAt);
     return { ...value, updatedAt };
+  }
+
+  migrateEmployeeCredential(identity: CredentialIdentity): CredentialState | undefined {
+    const current = this.credentials.get(identity);
+    if (current) return current;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const migrate = (): CredentialState | undefined => {
+        const found = this.credentials.get(identity);
+        if (found) return found;
+        const legacy = this.getEmployeeOAuth(identity.tenantId, identity.openId);
+        if (!legacy) return undefined;
+        // 同一旧Vault被多个身份引用时不能按先到先得认领；保留记录供管理员核查。
+        const prefix = [identity.channelType, identity.installationId, identity.tenantId].map(escapeKeyPart).join(":") + ":";
+        const suffix = `:${escapeKeyPart(identity.openId)}`;
+        const rows = this.db.prepare("SELECT conversation_key, vault_ids FROM conversations WHERE vault_ids IS NOT NULL").all() as { conversation_key: string; vault_ids: string }[];
+        const owners = rows.filter(row => {
+          let vaultIds: unknown;
+          try { vaultIds = JSON.parse(row.vault_ids); } catch { throw new Error("旧Session挂载记录损坏，无法安全确认用户凭证归属"); }
+          if (!Array.isArray(vaultIds)) throw new Error("旧Session挂载记录格式错误，无法安全确认用户凭证归属");
+          return vaultIds.includes(legacy.vaultId);
+        });
+        const matches = (row: typeof rows[number]) => row.conversation_key.split(":").length === 6
+          && row.conversation_key.startsWith(prefix) && row.conversation_key.endsWith(suffix);
+        if (!owners.some(matches)) return undefined;
+        if (!owners.every(matches)) throw new Error("旧用户凭证的应用或用户归属不唯一，已停止自动迁移，请管理员核查");
+        const state = this.credentials.save(identity, { vaultId: legacy.vaultId, credentialId: legacy.credentialId,
+          refreshToken: legacy.refreshToken, expiresAt: legacy.expiresAt, scopes: legacy.scopes, status: "ready" }, 0);
+        this.db.prepare("DELETE FROM employee_oauth WHERE tenant_key = ? AND open_id = ?").run(identity.tenantId, identity.openId);
+        return state;
+      };
+      const state = migrate();
+      this.db.exec("COMMIT");
+      return state;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 
   close(): void {
     if (this.closed) return;
+    this.credentials.close();
     if (this.runtimeToken) this.db.prepare("DELETE FROM gateway_runtime_lock WHERE id = 1 AND token = ?").run(this.runtimeToken);
     this.db.close();
     this.closed = true;

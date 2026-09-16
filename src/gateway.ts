@@ -312,6 +312,7 @@ export class Gateway {
         this.options.readMessage);
     })();
     await this.options.beforeCreateSession?.();
+    if (message.conversationType === "direct") await this.options.beforeDirectTurn?.(message);
     const startedAt = Date.now();
     const reusableSession = !this.usesIsolatedSession(message);
     let sessionId = reusableSession ? this.store.getSession(key) : undefined;
@@ -900,6 +901,7 @@ export type GatewayOptions = {
   addReaction?: (message: IncomingMessage, emojiType: string) => Promise<string>;
   removeReaction?: (message: IncomingMessage, reactionId: string) => Promise<void>;
   beforeCreateSession?: () => Promise<void>;
+  beforeDirectTurn?: (message: IncomingMessage) => Promise<void>;
   platformAccess?: boolean;
   ensureAuthorization?: (message: IncomingMessage, request: UserAuthorizationRequired) => Promise<boolean>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
