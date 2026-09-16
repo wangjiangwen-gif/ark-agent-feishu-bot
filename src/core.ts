@@ -3,6 +3,7 @@ export {
   type AgentConfig,
   type EnvironmentConfig,
   type RunResult,
+  type RunInspection,
   type SessionCreateDefaults,
   type SessionCreateRequest,
   type SessionResource,

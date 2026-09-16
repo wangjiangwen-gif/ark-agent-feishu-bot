@@ -10,6 +10,11 @@ export type RunResult = {
   evidence?: RunEvidence;
 };
 
+export type RunInspection =
+  | { status: "unknown"; reason: "history_unavailable" | "anchor_not_found" | "ambiguous_anchor" | "conflicting_event" | "later_request" | "multiple_threads" | "event_order_unknown" | "activity_after_terminal" | "terminal_not_observed"; anchorEventId?: string }
+  | { status: "running"; anchorEventId: string }
+  | { status: "ended"; anchorEventId: string; terminalEventId: string; result: RunResult };
+
 export type UserAuthorizationRequired = {
   identity: "user";
   errorType: "authentication";
@@ -37,6 +42,7 @@ export type CompactionObservation = {
 type ArkClientOptions = {
   sseHeadStartMs?: number;
   eventPollIntervalMs?: number;
+  inspectionTimeoutMs?: number;
 };
 
 type RunBoundary = { startedAt: number; input: string; previousIds: Set<string>; anchored: boolean; page?: string };
@@ -116,7 +122,8 @@ export class ArkClient {
     this.fetcher = fetcher;
     this.options = {
       sseHeadStartMs: options.sseHeadStartMs ?? 100,
-      eventPollIntervalMs: options.eventPollIntervalMs ?? 750
+      eventPollIntervalMs: options.eventPollIntervalMs ?? 750,
+      inspectionTimeoutMs: options.inspectionTimeoutMs ?? 10_000
     };
   }
 
@@ -570,15 +577,40 @@ export class ArkClient {
     return (await this.readSessionEvents(sessionId, signal)).events;
   }
 
-  private async readSessionEvents(sessionId: string, signal?: AbortSignal, startPage?: string): Promise<{ events: ArkEvent[]; lastPage?: string }> {
+  // 只核查已提交的原运行，不发送消息、不执行工具，也不将idle等同于业务成功。
+  async inspectRun(sessionId: string, requestFingerprint: string, signal?: AbortSignal): Promise<RunInspection> {
+    if (!/^[a-f0-9]{64}$/.test(requestFingerprint)) throw new Error("运行请求指纹必须是SHA256");
+    const deadline = AbortSignal.timeout(this.options.inspectionTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    try {
+      combined.throwIfAborted();
+      const { events } = await this.readSessionEvents(sessionId, combined, undefined, true);
+      combined.throwIfAborted();
+      return inspectRunHistory(events, requestFingerprint);
+    } catch {
+      // 上游错误可能包含凭证或文档片段；核查状态只返回稳定原因，不转发原始错误。
+      return { status: "unknown", reason: "history_unavailable" };
+    }
+  }
+
+  private async readSessionEvents(sessionId: string, signal?: AbortSignal, startPage?: string, strict = false): Promise<{ events: ArkEvent[]; lastPage?: string }> {
     const events: ArkEvent[] = [];
     let page = startPage;
     const pages = new Set<string>();
+    let bytes = 0;
     for (let count = 0; count < 100; count++) {
+      signal?.throwIfAborted();
       const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/events?limit=200${page ? `&page=${encodeURIComponent(page)}` : ""}`, { signal });
-      const payload = await response.json() as Record<string, unknown>;
+      const body = strict ? await boundedHistoryBody(response, 64 * 1024 * 1024 - bytes, signal) : undefined;
+      if (body !== undefined) {
+        bytes += Buffer.byteLength(body);
+        if (bytes > 64 * 1024 * 1024) throw new Error("事件历史超过核查大小上限");
+      }
+      const payload = (body === undefined ? await response.json() : JSON.parse(body)) as Record<string, unknown>;
+      if (strict) validateInspectionPage(payload);
       const data = payload.data as { items?: ArkEvent[]; next_page?: string } | undefined;
       events.push(...(Array.isArray(payload.data) ? payload.data as ArkEvent[] : data?.items || []));
+      if (strict && events.length > 20_000) throw new Error("事件历史超过核查数量上限");
       const nextPage = payload.next_page || data?.next_page;
       if (typeof nextPage !== "string" || !nextPage) return { events, lastPage: page };
       if (pages.has(nextPage)) throw new Error("Session 事件分页游标重复，不能确认完整运行结果");
@@ -596,6 +628,84 @@ export class ArkClient {
     if (!response.ok || !response.body) throw new Error(`方舟事件流失败 ${response.status}`);
     return parseEventStream(response.body);
   }
+}
+
+async function boundedHistoryBody(response: Response, maxBytes: number, signal?: AbortSignal): Promise<string> {
+  if (!response.body) throw new Error("事件历史响应为空");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const parts: string[] = [];
+  let bytes = 0;
+  const abort = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        void reader.cancel().catch(() => {});
+        throw new Error("事件历史超过核查大小上限");
+      }
+      parts.push(decoder.decode(value, { stream: true }));
+    }
+    parts.push(decoder.decode());
+    return parts.join("");
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    reader.releaseLock();
+  }
+}
+
+function validateInspectionPage(payload: unknown): void {
+  const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!object(payload)) throw new Error("无效事件历史结构");
+  const data = payload.data;
+  const items = Array.isArray(data) ? data : object(data) ? data.items : undefined;
+  if (!Array.isArray(items) || items.some(event => !object(event) || typeof event.id !== "string" || !event.id || typeof event.type !== "string" || !event.type)) throw new Error("事件历史不完整");
+  const cursors = [payload.next_page, object(data) ? data.next_page : undefined];
+  if (cursors.some(cursor => cursor != null && typeof cursor !== "string")) throw new Error("无效事件分页游标");
+  if (cursors.every(cursor => typeof cursor === "string") && cursors[0] !== cursors[1]) throw new Error("事件分页游标冲突");
+}
+
+function inspectRunHistory(events: ArkEvent[], requestFingerprint: string): RunInspection {
+  const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)])) : value;
+  const seen = new Map<string, string>();
+  const unique: ArkEvent[] = [];
+  for (const event of events) {
+    const id = event.id!;
+    const hash = createHash("sha256").update(JSON.stringify(canonical(event))).digest("hex");
+    const previous = seen.get(id);
+    if (previous && previous !== hash) return { status: "unknown", reason: "conflicting_event" };
+    if (!previous) { seen.set(id, hash); unique.push(event); }
+  }
+  const anchors = unique.filter(event => event.type === "user.message" && Array.isArray(event.content)
+    && event.content.length > 0 && event.content.every(item => item && item.type === "text" && typeof item.text === "string")
+    && createHash("sha256").update(eventText(event)).digest("hex") === requestFingerprint);
+  if (anchors.length !== 1) return { status: "unknown", reason: anchors.length ? "ambiguous_anchor" : "anchor_not_found" };
+  const anchorEventId = anchors[0].id!;
+  const unknown = (reason: Extract<RunInspection, { status: "unknown" }>["reason"]): RunInspection => ({ status: "unknown", reason, anchorEventId });
+  const current = unique.slice(unique.indexOf(anchors[0]));
+  if (current.slice(1).some(event => event.type === "user.message")) return unknown("later_request");
+  const threads = new Set(current.map(event => event.session_thread_id).filter(value => typeof value === "string" && value));
+  if (threads.size > 1) return unknown("multiple_threads");
+  let stamp = -Infinity;
+  for (const event of current) {
+    if (event.processed_at === undefined) continue;
+    const next = Date.parse(event.processed_at);
+    if (!Number.isFinite(next) || next < stamp) return unknown("event_order_unknown");
+    stamp = next;
+  }
+  const terminalIndex = current.findIndex(event => event.type === "session.status_idle" || event.type === "session.status_failed");
+  if (terminalIndex < 0) return current.some(event => event.type === "session.status_running")
+    ? { status: "running", anchorEventId } : unknown("terminal_not_observed");
+  const tail = current.slice(terminalIndex + 1);
+  if (tail.some(event => event.type?.startsWith("agent.") || ["session.status_running", "session.status_failed", "session.error"].includes(event.type!))) return unknown("activity_after_terminal");
+  const result = terminalResult(current.slice(0, terminalIndex + 1))!;
+  return { status: "ended", anchorEventId, terminalEventId: current[terminalIndex].id!, result };
 }
 
 function validateSessionCreateRequest(request: SessionCreateRequest): void {
