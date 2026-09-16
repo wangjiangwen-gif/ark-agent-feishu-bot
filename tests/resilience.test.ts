@@ -23,6 +23,8 @@ function harness(overrides: Record<string, any> = {}, store = new GatewayStore("
   const resources: any[] = [];
   let uploads = 0;
   const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 10, latestEventId: "idle", status: "idle" }),
+    inspectCompaction: async () => ({ result: "succeeded", terminal: "idle", reason: "test_adapter_verified_completion" }),
     createSession: async request => { resources.push(...(request.resources || [])); return "session"; },
     uploadFile: async name => ({ id: `file-${++uploads}`, name }),
     addSessionResource: async (_id, resource) => { resources.push(resource); },

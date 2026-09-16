@@ -18,6 +18,18 @@ export type UserAuthorizationRequired = {
 export type SessionStats = {
   eventCount: number;
   latestInputTokens?: number;
+  latestTokenSampleId?: string;
+  latestBusinessEventId?: string;
+  latestEventId?: string;
+  status?: "running" | "idle" | "failed";
+  latestCompaction?: { eventId: string; eventCount: number; tokenSampleId?: string; businessEventId?: string };
+};
+
+export type CompactionObservation = {
+  result: "succeeded" | "failed" | "unknown";
+  terminal?: "idle" | "failed";
+  reason: string;
+  evidenceEventId?: string;
 };
 
 type ArkClientOptions = {
@@ -358,18 +370,68 @@ export class ArkClient {
   }
 
   async getSessionStats(sessionId: string, signal?: AbortSignal): Promise<SessionStats> {
-    const events = await this.listSessionEvents(sessionId, signal);
-    let latestInputTokens: number | undefined;
+    const history = await this.listSessionEvents(sessionId, signal);
+    const events = [...new Map(history.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
+    const stats: SessionStats = { eventCount: 0 };
+    const threads = new Set(events.flatMap(event => typeof event.session_thread_id === "string" ? [event.session_thread_id] : []));
+    let compactTurn = false;
     for (const event of events) {
+      if (event.id) stats.latestEventId = event.id;
+      if (event.type === "session.status_running") stats.status = "running";
+      if (event.type === "session.status_idle") stats.status = "idle";
+      if (event.type === "session.status_failed" || event.type === "session.error") stats.status = "failed";
+      if (event.type === "user.message") {
+        compactTurn = eventText(event).trim() === "/compact";
+        if (!compactTurn && event.id) stats.latestBusinessEventId = event.id;
+      }
+      if (event.type === "agent.thread_context_compacted" && event.id && threads.size <= 1) {
+        stats.latestCompaction = { eventId: event.id, eventCount: stats.eventCount,
+          ...(stats.latestTokenSampleId ? { tokenSampleId: stats.latestTokenSampleId } : {}),
+          ...(stats.latestBusinessEventId ? { businessEventId: stats.latestBusinessEventId } : {}) };
+        continue;
+      }
+      // 压缩模型调用不是新的业务输入，不得用它再次触发压缩。
+      if (compactTurn) {
+        if (event.type === "session.status_idle" || event.type === "session.status_failed") compactTurn = false;
+        continue;
+      }
+      stats.eventCount++;
       const usage = event.model_usage && typeof event.model_usage === "object"
         ? event.model_usage as Record<string, unknown>
         : undefined;
       const inputTokens = usage?.input_tokens;
-      if (typeof inputTokens === "number" && Number.isFinite(inputTokens)) {
-        latestInputTokens = inputTokens;
+      if (event.is_error !== true && typeof inputTokens === "number" && Number.isFinite(inputTokens) && inputTokens > 0) {
+        stats.latestInputTokens = inputTokens;
+        stats.latestTokenSampleId = event.id;
       }
     }
-    return { eventCount: events.length, latestInputTokens };
+    return stats;
+  }
+
+  async inspectCompaction(sessionId: string, beforeEventId?: string, signal?: AbortSignal): Promise<CompactionObservation> {
+    const history = await this.listSessionEvents(sessionId, signal);
+    const events = [...new Map(history.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
+    const boundary = beforeEventId ? events.findIndex(event => event.id === beforeEventId) : -1;
+    if (beforeEventId && boundary < 0) return { result: "unknown", reason: "boundary_not_found" };
+    const next = events.slice(boundary + 1);
+    const command = next.findIndex(event => event.type === "user.message");
+    if (command < 0 || eventText(next[command]).trim() !== "/compact") return { result: "unknown", reason: "command_not_found" };
+    const current: ArkEvent[] = [];
+    for (const event of next.slice(command + 1)) {
+      if (event.type === "user.message") break;
+      current.push(event);
+      if (event.type === "session.status_idle" || event.type === "session.status_failed") break;
+    }
+    const result = terminalResult(current);
+    if (result?.terminal === "failed") return { result: "failed", terminal: "failed", reason: "session_error" };
+    // 官方事件契约：https://docs.volcengine.com/docs/82379/2559583?lang=zh
+    // 同时要求本轮正常结束和明确压缩事件。多线程结果不能代表整个Session，暂不自动确认。
+    const threads = new Set([...next.slice(0, command), ...current].flatMap(event => typeof event.session_thread_id === "string" ? [event.session_thread_id] : []));
+    const proof = current.find(event => event.type === "agent.thread_context_compacted" && typeof event.id === "string");
+    if (result?.terminal === "idle" && proof && threads.size <= 1) {
+      return { result: "succeeded", terminal: "idle", reason: "thread_context_compacted", evidenceEventId: proof.id };
+    }
+    return { result: "unknown", ...(result ? { terminal: result.terminal } : {}), reason: result ? "missing_completion_evidence" : "run_not_terminal" };
   }
 
   async run(

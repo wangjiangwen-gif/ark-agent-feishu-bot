@@ -331,10 +331,87 @@ test("getSessionStats reports event count and latest model input tokens", async 
   const client = new ArkClient("key", "https://ark.example/api/v3", async () => new Response(JSON.stringify({ data: { items: [
     { type: "span.model_request_end", model_usage: { input_tokens: 1200 } },
     { type: "agent.message" },
-    { type: "span.model_request_end", model_usage: { input_tokens: 27611 } }
+    { id: "model-latest", type: "span.model_request_end", model_usage: { input_tokens: 27611 } }
   ] } }), { status: 200 }));
 
-  assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611 });
+  assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611, latestTokenSampleId: "model-latest", latestEventId: "model-latest" });
+});
+
+test("session stats deduplicate events and exclude compact turns from business samples", async () => {
+  const events = [
+    { id: "user", type: "user.message", content: [{ type: "text", text: "task" }] },
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "idle", type: "session.status_idle" },
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "compact", type: "user.message", content: [{ type: "text", text: "/compact" }] },
+    { id: "compact-model", type: "span.model_request_end", model_usage: { input_tokens: 40000 } },
+    { id: "compact-idle", type: "session.status_idle" }
+  ];
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: events }));
+  assert.deepEqual(await client.getSessionStats("s"), {
+    eventCount: 3, latestInputTokens: 30000, latestTokenSampleId: "model", latestBusinessEventId: "user", latestEventId: "compact-idle", status: "idle"
+  });
+});
+
+test("zero-token error samples do not replace a successful business token sample", async () => {
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "failed-model", type: "span.model_request_end", is_error: true, model_usage: { input_tokens: 0 } },
+    { id: "running", type: "session.status_running" }
+  ] }));
+  const stats = await client.getSessionStats("s");
+  assert.equal(stats.latestTokenSampleId, "model");
+  assert.equal(stats.status, "running");
+});
+
+test("compact verification requires a new native compaction event and an idle terminal", async () => {
+  const base = [
+    { id: "old-proof", type: "agent.thread_context_compacted", session_thread_id: "main" },
+    { id: "boundary", type: "session.status_idle" },
+    { id: "command", type: "user.message", content: [{ type: "text", text: "/compact" }] }
+  ];
+  let after: Record<string, unknown>[] = [];
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [...base, ...after] }));
+  const idle = { id: "idle", type: "session.status_idle" };
+  const proof = { id: "proof", type: "agent.thread_context_compacted", session_thread_id: "main" };
+  after = [idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  after = [base[0], idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  after = [proof];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  after = [proof, idle];
+  assert.deepEqual(await client.inspectCompaction("s", "boundary"), { result: "succeeded", terminal: "idle", reason: "thread_context_compacted", evidenceEventId: "proof" });
+  after = [proof, { id: "error", type: "session.error" }, idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "failed");
+  after = [proof, { id: "child", type: "session.thread_status_running", session_thread_id: "child" }, idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  assert.equal((await client.inspectCompaction("s", "missing")).reason, "boundary_not_found");
+});
+
+test("compact reconciliation never consumes a subsequent business run or its error", async () => {
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [
+    { id: "boundary", type: "session.status_idle" },
+    { id: "command", type: "user.message", content: [{ type: "text", text: "/compact" }] },
+    { id: "proof", type: "agent.thread_context_compacted" },
+    { id: "idle", type: "session.status_idle" },
+    { id: "business", type: "user.message", content: [{ type: "text", text: "task" }] },
+    { id: "later-error", type: "session.error" }
+  ] }));
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "succeeded");
+  assert.equal((await client.inspectCompaction("s", "idle")).reason, "command_not_found");
+});
+
+test("session stats recognize native platform compaction without exposing its content", async () => {
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [
+    { id: "business", type: "user.message", content: [{ type: "text", text: "task" }] },
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "proof", type: "agent.thread_context_compacted", session_thread_id: "main", content: "private summary" },
+    { id: "idle", type: "session.status_idle" }
+  ] }));
+  const stats = await client.getSessionStats("s");
+  assert.deepEqual(stats.latestCompaction, { eventId: "proof", eventCount: 2, tokenSampleId: "model", businessEventId: "business" });
+  assert.ok(!JSON.stringify(stats).includes("private summary"));
 });
 
 test("Ark uploads a file and mounts it in a Session", async () => {
@@ -406,6 +483,6 @@ test("event history follows native next_page and detects the newest token usage"
       ? Response.json({ data: [{ id: "new", model_usage: { input_tokens: 1000 } }] })
       : Response.json({ data: [{ id: "old", model_usage: { input_tokens: 30000 } }], next_page: "second" });
   });
-  assert.deepEqual(await client.getSessionStats("s"), { eventCount: 2, latestInputTokens: 1000 });
+  assert.deepEqual(await client.getSessionStats("s"), { eventCount: 2, latestInputTokens: 1000, latestTokenSampleId: "new", latestEventId: "new" });
   assert.equal(pages.length, 2);
 });

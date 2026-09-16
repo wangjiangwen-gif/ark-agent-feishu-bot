@@ -32,7 +32,14 @@
 **Goal**: 持久化压缩检查点与退避；每轮刷新、结构化认证错误、凭证同步、授权等待/取消/恢复。
 **Success Criteria**: P01-P05、A01-A07；不串身份、不静默handoff、不盲重放写请求。
 **Tests**: 同样本/无新消息/重启防重、并发刷新、失效/网络/权限分类、错账号/重复回调、部分成功。
-**Status**: Not Started
+**Status**: In Progress
+
+本轮先推进压缩检查点。真实隔离Session `sesn-20260916030636-vf5pc` 执行 `/compact` 返回 `model_rate_limited_error`（平台重试耗尽），随后仍出现 `session.status_idle`；不能把idle单独作为压缩成功证据。不会重新创建Session规避该错误。
+
+压缩实现（2026-09-16）：新增SQLite持久化检查点、样本ID/业务边界、5分钟冷却、连续两次明确失败暂停自动压缩；新Session建立空基线，旧Session首次观测仅建立基线。同样本不重复消费；未决提交重启后先核查，无法确认终态不发送新业务；已确认idle但缺压缩证据时只暂停压缩，不阻断正常业务。手动压缩遵守同scope队列。纯文本附件在可能已经压缩后仍标记恢复，失败不新建Session。
+官方契约已通过浏览器读取 `https://docs.volcengine.com/docs/82379/2559583?lang=zh`（页面更新2026-09-09）：`agent.thread_context_compacted` 是压缩事件；实现要求本轮该事件和正常idle同时存在。多MA线程不将单个子线程事件误报为全Session压缩。当前无多MA线程全局压缩验收结论。
+回归：208/208测试通过；syntax check、build、diff检查通过。新增覆盖原生事件解析、旧证明去重、错误后idle、未决提交互斥、重启防重、串行执行、文件挂载记录保留、平台自动压缩基线。证据见 `docs/test-results/session-compaction-2026-09-16.json`。
+真实测试连续3次均被模型供应商限流（每次约29.6秒，retry_status=exhausted），达到本项目3次尝试上限，停止该路径重试。下一步先核实测试模型/配额或等待外部限流解除，再用已更新的smoke-resilience脚本验收原生成功事件和真实文件保留；不能把mock成功路径当作真实成功。授权恢复子阶段尚未开发。
 
 ## Stage 4: 文件终态与平台扩展
 **Goal**: 附件阶段追踪、运行与交付状态区分、早停准确反馈；验证upgrade与动态MemoryStore契约后接入。

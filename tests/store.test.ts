@@ -6,8 +6,21 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { execFileSync } from "node:child_process";
 import { GatewayStore } from "../src/store.ts";
+import { baselineCompaction, startCompaction } from "../src/session-compaction.ts";
 
 const key = { channelType: "lark", installationId: "cli-one", tenantId: "tenant", conversationId: "chat", threadId: "", senderId: "user" };
+
+test("compaction checkpoint and in-flight boundary survive database reopen", t => {
+  const directory = mkdtempSync(join(tmpdir(), "arkagent-compact-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "gateway.db");
+  const stats = { eventCount: 200, latestEventId: "boundary", latestTokenSampleId: "sample", latestBusinessEventId: "user" };
+  const state = startCompaction(baselineCompaction(stats), stats, "message", "automatic", 123);
+  const first = new GatewayStore(path); first.saveCompactionCheckpoint("session", state); first.close();
+  const second = new GatewayStore(path); t.after(() => second.close());
+  assert.deepEqual(second.getCompactionCheckpoint("session"), state);
+  assert.equal(second.getCompactionCheckpoint("other"), undefined);
+});
 
 test("store saves, reuses and resets a conversation session with its mounted Vaults", () => {
   const store = new GatewayStore(":memory:");

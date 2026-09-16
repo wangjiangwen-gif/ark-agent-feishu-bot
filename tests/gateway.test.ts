@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { Gateway, resultToReply, shouldHandleMessage, toConversationKey, type IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
+import { baselineCompaction } from "../src/session-compaction.ts";
 
 function message(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
   return {
@@ -748,10 +749,12 @@ test("automatic compaction keeps using the same Session when compact fails", asy
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
+  store.saveCompactionCheckpoint("session-old", baselineCompaction({ eventCount: 0 }));
   const operations: string[] = [];
   let creates = 0;
   const gateway = new Gateway(store, {
-    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000 }),
+    getSessionStats: async () => ({ eventCount: 200, latestInputTokens: 30_000, latestTokenSampleId: "model", latestBusinessEventId: "user", latestEventId: "idle", status: "idle" }),
+    inspectCompaction: async () => ({ result: "failed", terminal: "failed", reason: "session_error" }),
     createSession: async () => { creates++; return "session-new"; },
     run: async (sessionId, input) => {
       operations.push(`${sessionId}:${requestText(input)}`);
@@ -777,13 +780,15 @@ test("gateway automatically compacts an oversized Session in place", async () =>
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-old", "agent-1");
+  store.saveCompactionCheckpoint("session-old", baselineCompaction({ eventCount: 0 }));
   const operations: string[] = [];
   let creates = 0;
   const gateway = new Gateway(store, {
     getSessionStats: async sessionId => {
       operations.push(`stats:${sessionId}`);
-      return { eventCount: 196, latestInputTokens: 27_611 };
+      return { eventCount: 196, latestInputTokens: 27_611, latestTokenSampleId: "model", latestBusinessEventId: "user", latestEventId: "idle", status: "idle" };
     },
+    inspectCompaction: async () => ({ result: "succeeded", terminal: "idle", reason: "test_adapter_verified_completion" }),
     createSession: async () => {
       creates++;
       return "session-new";
@@ -799,7 +804,7 @@ test("gateway automatically compacts an oversized Session in place", async () =>
   gateway.accept(message({ text: "继续" }));
   await delay(40);
 
-  assert.deepEqual(operations, ["stats:session-old", "run:session-old:/compact", "run:session-old:继续"]);
+  assert.deepEqual(operations, ["stats:session-old", "run:session-old:/compact", "stats:session-old", "run:session-old:继续"]);
   assert.equal(creates, 0);
   assert.equal(store.getSession(key), "session-old");
   const compactLog = store.listAuditLogs().find(log => log.action === "session_compact");
@@ -837,9 +842,11 @@ test("gateway does not compact the same event range repeatedly", async () => {
   const store = new GatewayStore(":memory:");
   const key = toConversationKey(message());
   store.saveSession(key, "session-current", "agent-1");
+  store.saveCompactionCheckpoint("session-current", baselineCompaction({ eventCount: 0 }));
   const inputs: string[] = [];
   const gateway = new Gateway(store, {
-    getSessionStats: async () => ({ eventCount: 196, latestInputTokens: 1_000 }),
+    getSessionStats: async () => ({ eventCount: 196, latestInputTokens: 1_000, latestTokenSampleId: "model", latestBusinessEventId: "user", latestEventId: "idle", status: "idle" }),
+    inspectCompaction: async () => ({ result: "succeeded", terminal: "idle", reason: "test_adapter_verified_completion" }),
     createSession: async () => "session-new",
     run: async (_sessionId, input) => {
       inputs.push(requestText(input));
@@ -867,6 +874,8 @@ test("manual compact runs the Managed Agents command in the current Session", as
   const operations: string[] = [];
   const replies: string[] = [];
   const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 10, latestEventId: "idle", status: "idle" }),
+    inspectCompaction: async () => ({ result: "succeeded", terminal: "idle", reason: "test_adapter_verified_completion" }),
     createSession: async () => "session-new",
     run: async (sessionId, input) => {
       operations.push(`${sessionId}:${input}`);

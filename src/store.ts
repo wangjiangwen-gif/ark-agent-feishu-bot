@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { hostname } from "node:os";
 import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
+import type { CompactionCheckpoint } from "./session-compaction.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -139,6 +140,9 @@ export class GatewayStore {
         id INTEGER PRIMARY KEY CHECK(id = 1), pid INTEGER NOT NULL,
         host TEXT NOT NULL, token TEXT NOT NULL, acquired_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_compaction (
+        session_id TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
     `);
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
@@ -187,6 +191,17 @@ export class GatewayStore {
 
   knownUserVaultIds(): string[] {
     return (this.db.prepare("SELECT DISTINCT vault_id FROM employee_oauth").all() as { vault_id: string }[]).map(row => row.vault_id);
+  }
+
+  getCompactionCheckpoint(sessionId: string): CompactionCheckpoint | undefined {
+    const row = this.db.prepare("SELECT checkpoint FROM session_compaction WHERE session_id = ?").get(sessionId) as { checkpoint: string } | undefined;
+    return row ? JSON.parse(row.checkpoint) : undefined;
+  }
+
+  saveCompactionCheckpoint(sessionId: string, checkpoint: CompactionCheckpoint): void {
+    this.db.prepare(`INSERT INTO session_compaction VALUES (?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET checkpoint = excluded.checkpoint, updated_at = excluded.updated_at`
+    ).run(sessionId, JSON.stringify(checkpoint), new Date().toISOString());
   }
 
   saveSessionConfiguration(sessionId: string, fingerprint: string, metadata: { requestFingerprint: string; environmentId?: string; agentVersion?: string; vaultIds: string[]; hasSystemOverride: boolean }): void {
