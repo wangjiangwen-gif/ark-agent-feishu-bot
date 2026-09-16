@@ -119,7 +119,9 @@ npx --yes arkagent@latest login
 
 Gateway 会保存已接收的 Markdown/TXT 原文，原地压缩后在下一轮恢复近期原文（仍受单轮 256 KB 限制，超出时明确提示）。重启 Gateway 会复用数据库中的 Session 与附件记录，不会重复上传已记录的文件。**新 Session 的文件与沙箱状态迁移尚未实现**：`/new` 后不要假设旧文件仍可直接访问。沙箱长期休眠、回收后的持久性也不能由本地 Gateway 保证。
 
-源码开发版（尚未发布 npm）新增附件准备阶段记录：下载、上传、挂载、纯文本准备、缓存复用分别保存起止时间、耗时、字节数、SHA-256和已确认的File/Session ID，按应用/租户/群/话题/源消息隔离，保存在SQLite的`attachment_stage_receipts`中。内部诊断可使用`store.attachmentTrace.list(sourceMessage, after)`分页读取，每页最多200条；尚未提供WebUI入口。记录不包含文件正文或上游原始错误。`pending`表示没有结束回执（并不表示进程仍在执行），`error`不证明远端写入没有发生；`mount`成功仅代表资源接口/创建请求成功，不等于沙箱文件已被工具读到或模型已理解。已确认上传回执落盘后、缓存保存前退出的窗口可以复用原File ID；其他未知结果仍需核查，不能据此宣称所有附件操作均能安全自动恢复。
+源码开发版（尚未发布 npm）新增附件准备阶段记录：下载、上传、挂载、纯文本准备、缓存复用分别保存起止时间、耗时、字节数、SHA-256和已确认的File/Session ID，按应用/租户/群/话题/源消息隔离，保存在SQLite的`attachment_stage_receipts`中。内部诊断可使用`store.attachmentTrace.list(sourceMessage, after)`分页读取，每页最多200条。记录不包含文件正文或上游原始错误。`pending`表示没有结束回执（并不表示进程仍在执行），`error`不证明远端写入没有发生；`mount`成功仅代表资源接口/创建请求成功，不等于沙箱文件已被工具读到或模型已理解。已确认上传回执落盘后、缓存保存前退出的窗口可以复用原File ID；其他未知结果仍需核查，不能据此宣称所有附件操作均能安全自动恢复。
+
+管理员可在数字员工控制台的「行为日志 → 附件处理记录」查看当前飞书应用的历史记录，包括切换Agent前的记录。支持按**源消息ID**（文件所在消息，不一定是后来`@Bot`的消息）或Session ID精确筛选，按开始顺序倒序分页，每页最多100条。Session筛选只匹配明确记录了该Session的阶段；创建Session之前的下载/上传记录，请按源消息ID查找。该入口不依赖实验性持久化队列，查询只读本地数据库，不会触发重传、重跑或调用飞书/MA，也不会补造升级前缺失的记录。HTTP入口为`GET /api/employees/{agentId}/attachments`，使用已有控制台Bearer Token；可选参数为`messageId`、`sessionId`、`before`（上一页返回的`next`）。应用范围由服务端当前配置固定，客户端不能指定其他AppID。不要把控制台Token放进查询参数或分享给普通群成员。
 
 ## 数字员工模式
 

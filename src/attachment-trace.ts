@@ -8,6 +8,8 @@ export type AttachmentStageReceipt = AttachmentStageDetails & {
   id: string; sequence: number; attachmentKey: string; stage: AttachmentStage;
   status: "pending" | "succeeded" | "error"; startedAt: number; finishedAt?: number; durationMs?: number;
 };
+export type AttachmentDiagnosticFilters = { before?: number; messageId?: string; sessionId?: string };
+export type AttachmentDiagnostic = AttachmentStageReceipt & { tenantId: string; conversationId: string; threadId: string; messageId: string };
 
 function details(value: AttachmentStageDetails): AttachmentStageDetails {
   const result: AttachmentStageDetails = {};
@@ -38,7 +40,16 @@ export class AttachmentTraceStore {
       scope TEXT NOT NULL, attachment_key TEXT NOT NULL, stage TEXT NOT NULL,
       status TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER,
       details TEXT NOT NULL
-    ); CREATE INDEX IF NOT EXISTS attachment_stage_scope ON attachment_stage_receipts(scope, sequence);`);
+    ); CREATE INDEX IF NOT EXISTS attachment_stage_scope ON attachment_stage_receipts(scope, sequence);
+    CREATE INDEX IF NOT EXISTS attachment_stage_installation ON attachment_stage_receipts(
+      json_extract(scope, '$[0]'), json_extract(scope, '$[1]'), sequence
+    );
+    CREATE INDEX IF NOT EXISTS attachment_stage_message ON attachment_stage_receipts(
+      json_extract(scope, '$[0]'), json_extract(scope, '$[1]'), json_extract(scope, '$[5]'), sequence
+    );
+    CREATE INDEX IF NOT EXISTS attachment_stage_session ON attachment_stage_receipts(
+      json_extract(scope, '$[0]'), json_extract(scope, '$[1]'), json_extract(details, '$.sessionId'), sequence
+    );`);
   }
 
   begin(message: ChannelMessage, key: string, stage: AttachmentStage, value: AttachmentStageDetails = {}): string {
@@ -63,13 +74,30 @@ export class AttachmentTraceStore {
   list(message: ChannelMessage, after = 0): { items: AttachmentStageReceipt[]; next?: number } {
     if (!Number.isSafeInteger(after) || after < 0) throw new Error("附件阶段游标无效");
     const rows = this.db.prepare("SELECT * FROM attachment_stage_receipts WHERE scope=? AND sequence>? ORDER BY sequence LIMIT 201").all(this.scope(message), after);
-    const items = rows.slice(0, 200).map(row => ({
-      id: String(row.id), sequence: Number(row.sequence), attachmentKey: String(row.attachment_key),
-      stage: row.stage as AttachmentStage, status: row.status as AttachmentStageReceipt["status"], startedAt: Number(row.started_at),
-      ...(row.finished_at === null ? {} : { finishedAt: Number(row.finished_at), durationMs: Number(row.finished_at) - Number(row.started_at) }),
-      ...details(JSON.parse(String(row.details)))
-    }));
+    const items = rows.slice(0, 200).map(receipt);
     return { items, ...(rows.length > 200 ? { next: items.at(-1)!.sequence } : {}) };
+  }
+
+  // 管理员查看当前应用的历史准备证据；不将历史记录归属到当前配置的Agent。
+  // 只读本地记录，不查询远端、不重试附件，也不推断pending任务仍在执行。
+  listForInstallation(channelType: string, installationId: string, filters: AttachmentDiagnosticFilters = {}): {
+    scope: "installation"; items: AttachmentDiagnostic[]; next?: number;
+  } {
+    if (filters.before !== undefined && (!Number.isSafeInteger(filters.before) || filters.before < 1)) throw new Error("附件阶段游标无效");
+    for (const value of [filters.messageId, filters.sessionId]) if (value !== undefined
+      && (typeof value !== "string" || !value || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value))) throw new Error("附件筛选条件无效");
+    const clauses = ["json_extract(scope, '$[0]')=?", "json_extract(scope, '$[1]')=?"];
+    const parameters: Array<string | number> = [channelType, installationId];
+    if (filters.before !== undefined) { clauses.push("sequence<?"); parameters.push(filters.before); }
+    if (filters.messageId !== undefined) { clauses.push("json_extract(scope, '$[5]')=?"); parameters.push(filters.messageId); }
+    if (filters.sessionId !== undefined) { clauses.push("json_extract(details, '$.sessionId')=?"); parameters.push(filters.sessionId); }
+    const rows = this.db.prepare(`SELECT * FROM attachment_stage_receipts WHERE ${clauses.join(" AND ")} ORDER BY sequence DESC LIMIT 101`).all(...parameters);
+    const items = rows.slice(0, 100).map(row => {
+      const scope: unknown = JSON.parse(String(row.scope));
+      if (!Array.isArray(scope) || scope.length !== 6 || scope.some(value => typeof value !== "string")) throw new Error("附件范围记录无效");
+      return { ...receipt(row), tenantId: scope[2], conversationId: scope[3], threadId: scope[4], messageId: scope[5] };
+    });
+    return { scope: "installation", items, ...(rows.length > 100 ? { next: items.at(-1)!.sequence } : {}) };
   }
 
   confirmedUpload(message: ChannelMessage, key: string): AttachmentStageDetails | undefined {
@@ -85,4 +113,13 @@ export class AttachmentTraceStore {
   private scope(message: ChannelMessage): string {
     return JSON.stringify([message.channelType, message.installationId, message.tenantId, message.conversationId, message.threadId, message.messageId]);
   }
+}
+
+function receipt(row: Record<string, unknown>): AttachmentStageReceipt {
+  return {
+    id: String(row.id), sequence: Number(row.sequence), attachmentKey: String(row.attachment_key),
+    stage: row.stage as AttachmentStage, status: row.status as AttachmentStageReceipt["status"], startedAt: Number(row.started_at),
+    ...(row.finished_at === null ? {} : { finishedAt: Number(row.finished_at), durationMs: Number(row.finished_at) - Number(row.started_at) }),
+    ...details(JSON.parse(String(row.details)))
+  };
 }

@@ -1,0 +1,51 @@
+{
+  "date": "2026-09-16",
+  "baseline": "def1f8865921cbed57c717f1bece88704befcaf3",
+  "scope": "attachment administrator diagnostics, not full attachment recovery",
+  "environment": { "node": "v22.22.1", "database": "isolated SQLite", "externalServices": "none" },
+  "tests": {
+    "added": 13,
+    "initialRed": { "tests": 9, "failed": 9, "note": "after allowing loopback listening; missing methods and HTTP routes" },
+    "indexRedGreen": "EXPLAIN initially chose application scan; dedicated message/session indexes then verified",
+    "full": { "passed": 566, "failed": 0, "skipped": 0, "durationMs": 3816.833625 },
+    "syntaxCheck": "passed; not a full TypeScript typecheck",
+    "build": "passed",
+    "diffCheck": "passed",
+    "coverage": [
+      "server-owned channel/application boundary and explicit application history scope",
+      "bounded exact filters, parameterized SQL, cursor pagination with concurrent new rows",
+      "legacy trace migration and read-only queries preserving rows",
+      "HTTP 401/400/404/405/500, no-store, disabled durable queue compatibility",
+      "raw database error suppression and metadata-only output",
+      "actual embedded page script: text-only rendering, stale responses, filter changes and employee switching"
+    ]
+  },
+  "browser": {
+    "kind": "real in-app browser and isolated HTTP WebUI with synthetic records",
+    "passed": ["employee detail and audit tab", "100 rows then 5 earlier rows", "source message filter returns 5 rows", "combined Session filter returns 1 mount row", "no match empty state", "viewport screenshot inspected"],
+    "previewStopped": true,
+    "productionDataUsed": false
+  },
+  "benchmark": {
+    "script": "scripts/benchmark-attachment-diagnostics.mjs",
+    "rows": 30000,
+    "samples": 30,
+    "warmupIterations": 5,
+    "alternatingOrder": true,
+    "kind": "local SQLite synthetic metadata, not external E2E",
+    "p95MsWithoutThenWithIndexes": {
+      "writePair": [0.410, 0.526],
+      "latestPage": [0.843, 0.466],
+      "missingMessage": [20.587, 0.038],
+      "missingSession": [22.556, 0.032]
+    }
+  },
+  "notClaimed": [
+    "client PDF premature idle reproduced or resolved",
+    "unknown upload/mount safely recovered",
+    "model actually understood file contents",
+    "full real Feishu/MA E2E or user latency acceptance",
+    "new increment deployed or published",
+    "experimental durable queue enabled"
+  ]
+}
