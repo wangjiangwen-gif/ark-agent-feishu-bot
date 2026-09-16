@@ -294,7 +294,7 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 
 - 单聊中的文本、文件和图片消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
-- 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session；`/compact` 在原 Session 内压缩上下文，`/new` 显式重置。数字员工 OAuth 只更新已预挂载的 Credential，并在原 Session 自动续跑；仅升级前无法确认 Vault 挂载的遗留 Session 会做一次兼容性交接。普通群聊共享一个排队 Session，Thread 各自共享独立的排队 Session，且群聊仅使用 Bot 身份。
+- 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session；`/compact` 在原 Session 内压缩上下文，`/new` 显式重置。数字员工 OAuth 更新已预挂载的 Credential，并校验原 Session 后恢复；源码开发版对无法确认 Vault 挂载的遗留 Session 仅提示显式选择，不再静默交接。普通群聊共享一个排队 Session，Thread 各自共享独立的排队 Session，且群聊仅使用 Bot 身份。
 - 单聊新建 Session 时，Gateway 会把消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment。共享群聊/Thread 不固定首位用户的 OpenID 或首条触发消息；每轮通过 `current_actor`、`current_message` 注入当前发言者与消息标识。旧 Session 的静态用户变量不能作为本轮身份依据。
 - 每轮输入保留显式引用关系，优先使用近期消息和同会话缓存，必要时按消息 ID 定向查询。引用和历史共享最多20条/8000字符预算；缓存标记为未核实快照，撤回、缺失或无权限不会伪造成有效原文。当前用户请求独立保留。
 - Gateway 优先使用 `Get` 表情反馈处理中状态；仅当表情添加失败且请求超过 2.5 秒仍未完成时，才发送一次“正在处理，请稍候。”兜底提示。
@@ -310,6 +310,10 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 ### 源码开发版：声明式配置与只读诊断
 
 以下能力尚未作为新的npm版本发布；本地测试请先 `npm run build`，再用 `node dist/cli.js` 替代 `arkagent`。
+
+数字员工单聊可发送 `/auth cancel` 取消正在等待的 OAuth 和本次任务续跑。该控制命令不排入业务队列，不触发模型；它不撤销飞书服务端授权，不中断已经开始的业务操作，也不能撤销已经发出的凭证更新。授权过期或被拒绝时会发送状态通知，取消/过期检查点保存在数据库中，迟到回调不会恢复这些任务。
+
+当前开发边界：尚未完成活跃授权流程在进程重启后的完整恢复、等待授权期间的单聊队列暂停，以及部分业务写入后的安全续跑；不要将上述取消能力视为这些场景已验收。二次开发调用方应提供授权状态通知回调，并在关闭数据库前调用 `EmployeeAuthorizationManager.close()`。
 
 在当前模式的 `config.env` 中可选设置：
 

@@ -50,7 +50,7 @@ export type EmployeeOAuth = {
   refreshToken: string; expiresAt: number; scopes: string[]; updatedAt: string;
 };
 
-export type AuthorizationRecoveryState = "waiting" | "resuming" | "completed" | "failed" | "blocked";
+export type AuthorizationRecoveryState = "waiting" | "resuming" | "completed" | "failed" | "blocked" | "cancelled" | "expired";
 
 export class GatewayStore {
   readonly credentials: CredentialStateStore;
@@ -506,7 +506,7 @@ export class GatewayStore {
       .run(new Date().toISOString(), this.authorizationRequestKey(message)).changes) === 1;
   }
 
-  finishAuthorizationRecovery(message: ChannelMessage, state: "completed" | "failed" | "blocked"): void {
+  finishAuthorizationRecovery(message: ChannelMessage, state: Exclude<AuthorizationRecoveryState, "waiting" | "resuming">): void {
     this.db.prepare("UPDATE authorization_recoveries SET state = ?, updated_at = ? WHERE request_key = ? AND state IN ('waiting', 'resuming')")
       .run(state, new Date().toISOString(), this.authorizationRequestKey(message));
   }

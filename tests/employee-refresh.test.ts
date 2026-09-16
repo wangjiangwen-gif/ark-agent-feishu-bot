@@ -156,7 +156,7 @@ test("OAuth callback rejects wrong user or tenant and duplicate requests resume 
     const polling = new Promise<typeof fresh>(resolve => { finish = resolve; });
     const auth = new EmployeeAuthorizationManager(store, {
       updateEnvironmentCredential: async (_vault: string, _credential: string, token: string) => { writes.push(token); }
-    } as never, { applicationId: "cli", begin: async () => ({ verificationUrl: "https://example.invalid/oauth" }), poll: async () => polling,
+    } as never, { applicationId: "cli", begin: async () => ({ verificationUrl: "https://example.invalid/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }), poll: async () => polling,
       getUserIdentity: async () => user } as never, async () => undefined, input => { resumes.push(input.messageId); });
     const request = { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" };
     await auth.ensure(message, request);

@@ -96,3 +96,48 @@ test("device polling respects slow_down even when the server also supplies a num
   t.mock.timers.tick(1); await pending;
   assert.deepEqual(calls, [10_000, 16_000]);
 });
+
+test("cancelled device polling never starts a request", async () => {
+  let calls = 0;
+  const oauth = new FeishuOAuth("cli", "secret", async () => { calls++; throw new Error("unexpected"); });
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(oauth.poll({ deviceCode: "test", verificationUrl: "https://example.test", expiresAt: Date.now() + 60_000, intervalMs: 1000 }, controller.signal),
+    error => error instanceof OAuthError && error.kind === "cancelled");
+  assert.equal(calls, 0);
+});
+
+test("cancellation interrupts pending backoff without another token exchange", async () => {
+  let calls = 0;
+  const oauth = new FeishuOAuth("cli", "secret", async () => {
+    calls++; return new Response(JSON.stringify({ error: "authorization_pending" }), { status: 400 });
+  });
+  const controller = new AbortController();
+  const pending = oauth.poll({ deviceCode: "test", verificationUrl: "https://example.test", expiresAt: Date.now() + 60_000, intervalMs: 30_000 }, controller.signal);
+  const rejected = assert.rejects(pending, error => error instanceof OAuthError && error.kind === "cancelled");
+  await flush(); controller.abort(); await rejected;
+  assert.equal(calls, 1);
+});
+
+test("cancellation aborts an in-flight request and preserves unknown server outcome", async () => {
+  let aborted = false;
+  const oauth = new FeishuOAuth("cli", "secret", async (_url, init) => new Promise((_resolve, reject) => {
+    init!.signal!.addEventListener("abort", () => { aborted = true; reject(new Error("private request")); }, { once: true });
+  }));
+  const controller = new AbortController();
+  const pending = oauth.poll({ deviceCode: "test", verificationUrl: "https://example.test", expiresAt: Date.now() + 60_000, intervalMs: 1000 }, controller.signal);
+  const rejected = assert.rejects(pending, error => error instanceof OAuthError && error.kind === "cancelled" && error.outcome === "unknown");
+  await flush(); controller.abort(); await rejected;
+  assert.equal(aborted, true);
+});
+
+test("device expiry aborts a hung token response rather than waiting for request timeout", async () => {
+  const oauth = new FeishuOAuth("cli", "secret", async (_url, init) => new Promise((_resolve, reject) => {
+    init!.signal!.addEventListener("abort", () => reject(new Error("expired")), { once: true });
+  }));
+  // keep-alive仅用于测试；生产进程由Channel连接维持。
+  const keepAlive = setInterval(() => undefined, 1000);
+  try {
+    await assert.rejects(oauth.poll({ deviceCode: "test", verificationUrl: "https://example.test", expiresAt: Date.now() + 30, intervalMs: 1000 }),
+      error => error instanceof OAuthError && error.kind === "expired" && error.outcome === "unknown");
+  } finally { clearInterval(keepAlive); }
+});

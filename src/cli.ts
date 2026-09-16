@@ -63,7 +63,8 @@ async function runEmployee(): Promise<void> {
   const config = loadEmployeeConfig();
   const store = new GatewayStore(config.databasePath);
   store.acquireRuntimeLock();
-  process.once("exit", () => store.close());
+  let closeAuthorization = (): void => undefined;
+  process.once("exit", () => { closeAuthorization(); store.close(); });
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
   const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
   let botTokenExpiresAt = 0;
@@ -85,7 +86,7 @@ async function runEmployee(): Promise<void> {
     await botTokenRefreshing;
   };
   const sendAuthorizationCard = async (message: ChannelMessage, url: string): Promise<void> => {
-    const card = { schema: "2.0", config: { width_mode: "default" }, header: { title: { tag: "plain_text", content: "授权查看你的日程" }, subtitle: { tag: "plain_text", content: "仅用于本次数字员工协作" }, template: "blue", icon: { tag: "standard_icon", token: "calendar_outlined" } }, body: { elements: [{ tag: "markdown", content: "为了帮你避开冲突，数字员工需要读取你的日程和忙闲信息。创建日程仍使用数字员工的 Bot 身份，并会邀请你参加。" }, { tag: "button", text: { tag: "plain_text", content: "授权查看日程" }, type: "primary_filled", width: "fill", behaviors: [{ type: "open_url", default_url: url }] }] } };
+    const card = { schema: "2.0", config: { width_mode: "default" }, header: { title: { tag: "plain_text", content: "授权查看你的日程" }, subtitle: { tag: "plain_text", content: "用户日历权限授权" }, template: "blue", icon: { tag: "standard_icon", token: "calendar_outlined" } }, body: { elements: [{ tag: "markdown", content: "为了帮你避开冲突，数字员工需要读取你的日程和忙闲信息。创建日程仍使用数字员工的 Bot 身份，并会邀请你参加。\n\n可发送 `/auth cancel` 取消本次等待和任务续跑；这不会撤销已经授予的飞书权限。" }, { tag: "button", text: { tag: "plain_text", content: "授权查看日程" }, type: "primary_filled", width: "fill", behaviors: [{ type: "open_url", default_url: url }] }] } };
     await channel.reply(message, { type: "card", card });
   };
   let gateway: InstanceType<typeof Gateway>;
@@ -94,14 +95,17 @@ async function runEmployee(): Promise<void> {
     ark,
     new FeishuOAuth(config.feishuAppId, config.feishuAppSecret),
     sendAuthorizationCard,
-    (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId)
+    (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId),
+    { notify: (message, text) => channel.reply(message, { type: "text", text }) }
   );
+  closeAuthorization = () => auth.close();
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
     appId: config.feishuAppId, sessionConfiguration,
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
     ensureAuthorization: (message, request) => auth.ensure(message, request),
+    cancelAuthorization: message => auth.cancel(message),
     getUserVaultIds: message => message.conversationType === "direct" ? auth.vaultIds(message) : Promise.resolve([]),
     beforeDirectTurn: message => auth.ensureCredentialFresh(message),
     beforeCreateSession: ensureBotToken, dualIdentity: true, sharedGroupSessions: true,
@@ -135,6 +139,7 @@ async function runEmployee(): Promise<void> {
   try {
     await channel.start(message => gateway.accept(message));
   } catch (error) {
+    auth.close();
     web.server.close();
     store.close();
     throw error;

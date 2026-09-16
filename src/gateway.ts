@@ -72,6 +72,22 @@ export class Gateway {
     if (!shouldHandleMessage(message)) return false;
     // 飞书可能为同一条消息重复投递不同 event_id；message_id 才是业务幂等键。
     if (!this.store.claimEvent(message.channelType, message.installationId, message.messageId)) return false;
+    if (message.conversationType === "direct" && message.text.trim() === "/auth cancel" && this.options.cancelAuthorization) {
+      // 控制命令不进入业务队列，避免等待授权的任务阻塞自己的取消操作。
+      void (async () => {
+        try {
+          const cancelled = await this.options.cancelAuthorization!(message);
+          await this.replyText(message, cancelled
+            ? "已取消本次授权等待和任务续跑。这不等于撤销飞书服务端授权，也不会撤销已经完成的操作。"
+            : "当前没有可取消的授权等待。本命令不等于撤销飞书服务端授权，也不会中断已经开始的业务操作。");
+          this.store.completeEvent(message.channelType, message.installationId, message.messageId, "completed");
+        } catch {
+          this.store.completeEvent(message.channelType, message.installationId, message.messageId, "failed");
+          try { await this.replyText(message, "取消授权等待未完成，请检查网关状态；不会因此自动重放任务。"); } catch { console.warn("发送授权取消状态失败"); }
+        }
+      })();
+      return true;
+    }
     const heartbeat = setInterval(() => this.store.touchEvent(message), 60_000);
     heartbeat.unref();
     const key = this.conversationKey(message);
@@ -927,6 +943,7 @@ export type GatewayOptions = {
   beforeDirectTurn?: (message: IncomingMessage) => Promise<void>;
   platformAccess?: boolean;
   ensureAuthorization?: (message: IncomingMessage, request: UserAuthorizationRequired) => Promise<boolean>;
+  cancelAuthorization?: (message: IncomingMessage) => boolean | Promise<boolean>;
   getUserVaultIds?: (message: IncomingMessage) => Promise<string[]>;
   perMessageSessions?: boolean;
   sharedGroupSessions?: boolean;

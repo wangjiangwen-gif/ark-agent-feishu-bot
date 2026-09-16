@@ -109,6 +109,8 @@ export class CredentialStateStore {
 
   release(identity: CredentialIdentity, token: string): void {
     const key = credentialIdentityKey(identity);
+    // close已释放的租约不再访问数据库，允许晚到的异步finally安全退出。
+    if (this.leases.get(key) !== token) return;
     this.db.prepare("DELETE FROM employee_credential_operations WHERE identity_key = ? AND token = ?").run(key, token);
     if (this.leases.get(key) === token) this.leases.delete(key);
   }

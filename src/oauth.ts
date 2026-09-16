@@ -5,7 +5,7 @@ export type OAuthTokens = {
   scopes?: string[];
 };
 
-export type OAuthErrorKind = "reauth_required" | "configuration" | "permission" | "rate_limit" | "network" | "upstream" | "invalid_response" | "pending" | "denied" | "expired" | "unknown";
+export type OAuthErrorKind = "reauth_required" | "configuration" | "permission" | "rate_limit" | "network" | "upstream" | "invalid_response" | "pending" | "denied" | "expired" | "cancelled" | "unknown";
 export class OAuthError extends Error {
   readonly kind: OAuthErrorKind;
   readonly outcome: "rejected" | "unknown";
@@ -43,11 +43,11 @@ export class FeishuOAuth {
 
   get applicationId(): string { return this.appId; }
 
-  async begin(scopes: string[]): Promise<DeviceAuthorization> {
+  async begin(scopes: string[], signal?: AbortSignal): Promise<DeviceAuthorization> {
     const body = new URLSearchParams({ client_id: this.appId, client_secret: this.appSecret });
     if (scopes.length) body.set("scope", scopes.join(" "));
     const payload = await this.request("https://accounts.feishu.cn/oauth/v1/device_authorization", {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body, signal
     });
     const deviceCode = stringField(payload, "device_code");
     const verificationUrl = stringField(payload, "verification_uri_complete") || stringField(payload, "verification_uri");
@@ -60,25 +60,34 @@ export class FeishuOAuth {
     };
   }
 
-  async poll(device: DeviceAuthorization): Promise<OAuthTokens> {
+  async poll(device: DeviceAuthorization, signal?: AbortSignal): Promise<OAuthTokens> {
+    if (signal?.aborted) throw cancellationError(signal);
+    if (!Number.isFinite(device.expiresAt) || !Number.isFinite(device.intervalMs) || device.intervalMs <= 0) throw new OAuthError("invalid_response");
+    if (Date.now() >= device.expiresAt) throw new OAuthError("expired", { outcome: "rejected" });
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(new OAuthError("expired")), Math.min(device.expiresAt - Date.now(), 2_147_483_647));
+    timer.unref?.();
+    const combined = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
     let interval = device.intervalMs;
-    while (Date.now() < device.expiresAt) {
-      try {
-        const payload = await this.request("https://open.feishu.cn/open-apis/authen/v2/oauth/token", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-          client_id: this.appId, client_secret: this.appSecret, device_code: device.deviceCode
-        })
-      });
-        return parseTokens(payload);
-      } catch (error) {
-        if (!(error instanceof OAuthError) || error.kind !== "pending") throw error;
-        if (error.oauthType === "slow_down") interval += 5_000;
-        await delay(Math.min(interval, Math.max(0, device.expiresAt - Date.now())));
+    try {
+      while (Date.now() < device.expiresAt) {
+        try {
+          const payload = await this.request("https://open.feishu.cn/open-apis/authen/v2/oauth/token", {
+            method: "POST", headers: { "Content-Type": "application/json" }, signal: combined,
+            body: JSON.stringify({
+              grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+              client_id: this.appId, client_secret: this.appSecret, device_code: device.deviceCode
+            })
+          });
+          return parseTokens(payload);
+        } catch (error) {
+          if (!(error instanceof OAuthError) || error.kind !== "pending") throw error;
+          if (error.oauthType === "slow_down") interval += 5_000;
+          await delay(Math.min(interval, Math.max(0, device.expiresAt - Date.now())), combined);
+        }
       }
-    }
-    throw new OAuthError("expired", { outcome: "rejected" });
+      throw new OAuthError("expired", { outcome: "rejected" });
+    } finally { clearTimeout(timer); }
   }
 
   async refresh(refreshToken: string): Promise<OAuthTokens> {
@@ -93,9 +102,9 @@ export class FeishuOAuth {
     return (await this.getUserIdentity(accessToken)).openId;
   }
 
-  async getUserIdentity(accessToken: string): Promise<{ openId: string; tenantKey?: string }> {
+  async getUserIdentity(accessToken: string, signal?: AbortSignal): Promise<{ openId: string; tenantKey?: string }> {
     const payload = await this.request("https://open.feishu.cn/open-apis/authen/v1/user_info", {
-      headers: { Authorization: `Bearer ${accessToken}` }
+      headers: { Authorization: `Bearer ${accessToken}` }, signal
     });
     const data = payload.data && typeof payload.data === "object" ? payload.data as Record<string, unknown> : payload;
     const openId = stringField(data, "open_id");
@@ -111,10 +120,13 @@ export class FeishuOAuth {
   }
 
   private async request(url: string, init: RequestInit): Promise<Record<string, unknown>> {
+    if (init.signal?.aborted) throw cancellationError(init.signal);
     let response: Response;
-    try { response = await this.fetcher(url, { ...init, signal: init.signal || AbortSignal.timeout(30_000) }); }
-    catch { throw new OAuthError("network"); }
+    const timeout = AbortSignal.timeout(30_000);
+    try { response = await this.fetcher(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout }); }
+    catch { throw init.signal?.aborted ? cancellationError(init.signal) : new OAuthError("network"); }
     const parsed: unknown = await response.json().catch(() => undefined);
+    if (init.signal?.aborted) throw cancellationError(init.signal);
     const payload = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
     if (!response.ok || payload?.error || (typeof payload?.code === "number" && payload.code !== 0)) throw oauthError(response.status, payload || {}, response.headers.get("Retry-After"));
     if (!payload) throw new OAuthError("invalid_response", { status: response.status });
@@ -156,4 +168,14 @@ function oauthError(status: number, payload: Record<string, unknown>, retryHeade
 }
 function stringField(payload: Record<string, unknown>, key: string): string { return typeof payload[key] === "string" ? payload[key] : ""; }
 function numberField(payload: Record<string, unknown>, key: string, fallback: number): number { const value = Number(payload[key]); return Number.isFinite(value) && value > 0 ? value : fallback; }
-function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
+function cancellationError(signal: AbortSignal): OAuthError {
+  return new OAuthError(signal.reason instanceof OAuthError && signal.reason.kind === "expired" ? "expired" : "cancelled");
+}
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(cancellationError(signal)); return; }
+    const abort = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); reject(cancellationError(signal)); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}

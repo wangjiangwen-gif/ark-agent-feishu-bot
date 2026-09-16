@@ -43,7 +43,7 @@ test("concurrent authorization requests from one user all resume after one OAuth
     },
     updateEnvironmentCredential: async () => undefined
   }, {
-    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }),
+    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }),
     poll: async () => poll,
     getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
   } as never, async message => { cards.push(message.messageId); },
@@ -71,7 +71,7 @@ test("authorization resumes the original direct Session without handoff", async 
     listVaults: async () => [], createVault: async () => "vlt-user", listCredentials: async () => [],
     createEnvironmentVariableCredential: async () => "vcrd-user", updateEnvironmentCredential: async () => undefined
   }, {
-    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }),
+    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }),
     poll: async () => poll,
     getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
   } as never, async () => undefined,
@@ -99,7 +99,7 @@ test("an expired refresh token keeps the pre-mounted Vault and falls through to 
     updateEnvironmentCredential: async () => undefined
   }, {
     refresh: async () => { throw new OAuthError("reauth_required", { outcome: "rejected" }); },
-    begin: async () => { began++; return { verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }; },
+    begin: async () => { began++; return { verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }; },
     poll: async () => new Promise(() => undefined)
   } as never, async () => undefined, () => undefined);
 
@@ -107,6 +107,7 @@ test("an expired refresh token keeps the pre-mounted Vault and falls through to 
   await auth.ensureCredentialFresh(authMessage("om-expired", "direct"));
   assert.equal(await auth.ensure(authMessage("om-expired", "direct"), calendarRequest()), false);
   assert.equal(began, 1);
+  auth.close();
   store.close();
 });
 
@@ -137,7 +138,7 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
     }
   };
   const auth = new EmployeeAuthorizationManager(store, ark, {
-    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresIn: 60, interval: 1 }),
+    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }),
     poll: async () => poll,
     getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
   } as never, async () => undefined, (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId));
