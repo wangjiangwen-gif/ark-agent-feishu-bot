@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; processed_at?: string };
 
 export type RunResult = {
@@ -92,7 +94,7 @@ export class ArkClient {
 
   private fetcher: typeof fetch;
   private options: Required<ArkClientOptions>;
-  private environmentConfigs = new Map<string, EnvironmentConfig>();
+  private environmentConfigs = new Map<string, { config: EnvironmentConfig; fetchedAt: number }>();
 
   constructor(apiKey: string, baseUrl: string, fetcher: typeof fetch = fetch, options: ArkClientOptions = {}) {
     this.apiKey = apiKey;
@@ -134,6 +136,26 @@ export class ArkClient {
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
     return { id: String(data.id || agentId), version: data.version === undefined ? undefined : String(data.version) };
+  }
+
+  async getSessionInfo(sessionId: string): Promise<{
+    id: string; status?: string; agentId?: string; agentVersion?: string; environmentId?: string;
+    appId?: string; vaultIds: string[]; systemFingerprint?: string;
+  }> {
+    const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const data = (payload.data || payload) as Record<string, unknown>;
+    const agent = data.agent && typeof data.agent === "object" ? data.agent as Record<string, unknown> : undefined;
+    const environment = data.environment && typeof data.environment === "object" ? data.environment as { id?: string; config?: EnvironmentConfig } : undefined;
+    return {
+      id: String(data.id || sessionId), status: typeof data.status === "string" ? data.status : undefined,
+      agentId: typeof data.agent === "string" ? data.agent : typeof agent?.id === "string" ? agent.id : undefined,
+      agentVersion: agent?.version === undefined ? undefined : String(agent.version),
+      environmentId: typeof data.environment_id === "string" ? data.environment_id : environment?.id,
+      appId: environment?.config?.env?.LARKSUITE_CLI_APP_ID,
+      vaultIds: Array.isArray(data.vault_ids) ? data.vault_ids.filter((id): id is string => typeof id === "string") : [],
+      systemFingerprint: typeof agent?.system === "string" ? createHash("sha256").update(agent.system).digest("hex") : undefined
+    };
   }
 
   async updateAgent(agentId: string, version: string, config: AgentConfig): Promise<{ id: string; version?: string }> {
@@ -243,22 +265,23 @@ export class ArkClient {
     });
   }
 
-  async getEnvironmentConfig(environmentId: string): Promise<EnvironmentConfig> {
+  async getEnvironmentConfig(environmentId: string, options: { fresh?: boolean } = {}): Promise<EnvironmentConfig> {
     const cached = this.environmentConfigs.get(environmentId);
-    if (cached) return cached;
+    if (cached && !options.fresh && Date.now() - cached.fetchedAt < 60_000) return structuredClone(cached.config);
     const response = await this.request(`/environments/${encodeURIComponent(environmentId)}`);
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
     const config = data.config as EnvironmentConfig | undefined;
     if (!config || typeof config !== "object" || typeof config.type !== "string") throw new Error("Environment 响应缺少有效 config");
-    this.environmentConfigs.set(environmentId, config);
-    return config;
+    this.environmentConfigs.set(environmentId, { config: structuredClone(config), fetchedAt: Date.now() });
+    return structuredClone(config);
   }
 
   async buildSessionCreateRequest(defaults: SessionCreateDefaults): Promise<SessionCreateRequest> {
     const vaultIds = defaults.vaultIds || [];
     const envOverrides = defaults.envOverrides || {};
     const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(defaults.environmentId) : undefined;
+    if (envOverrides.LARKSUITE_CLI_APP_ID && environmentConfig?.env?.LARKSUITE_CLI_APP_ID && environmentConfig.env.LARKSUITE_CLI_APP_ID !== envOverrides.LARKSUITE_CLI_APP_ID) throw new Error("Environment的LARKSUITE_CLI_APP_ID与当前FEISHU_APP_ID冲突，请显式修正绑定");
     return {
       agent: defaults.agentId,
       ...(environmentConfig ? {

@@ -278,7 +278,8 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 - 单聊中的文本、文件和图片消息会发送给绑定的 Agent。
 - 群聊只处理明确 `@Bot` 的文本消息。
 - 个人助手和数字员工单聊均在一个飞书会话中复用 Managed Agents Session；`/compact` 在原 Session 内压缩上下文，`/new` 显式重置。数字员工 OAuth 只更新已预挂载的 Credential，并在原 Session 自动续跑；仅升级前无法确认 Vault 挂载的遗留 Session 会做一次兼容性交接。普通群聊共享一个排队 Session，Thread 各自共享独立的排队 Session，且群聊仅使用 Bot 身份。
-- 新建 Session 时，Gateway 会把当前消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment；初始化时保存的授权用户 open_id 只用于 Gateway 访问控制，不作为沙箱运行时身份来源。
+- 单聊新建 Session 时，Gateway 会把消息 sender 的 `open_id` 作为 `FEISHU_USER_OPEN_ID` 动态覆写到 Environment。共享群聊/Thread 不固定首位用户的 OpenID 或首条触发消息；每轮通过 `current_actor`、`current_message` 注入当前发言者与消息标识。旧 Session 的静态用户变量不能作为本轮身份依据。
+- 每轮输入保留显式引用关系，优先使用近期消息和同会话缓存，必要时按消息 ID 定向查询。引用和历史共享最多20条/8000字符预算；缓存标记为未核实快照，撤回、缺失或无权限不会伪造成有效原文。当前用户请求独立保留。
 - Gateway 优先使用 `Get` 表情反馈处理中状态；仅当表情添加失败且请求超过 2.5 秒仍未完成时，才发送一次“正在处理，请稍候。”兜底提示。
 - Gateway 不向飞书转发 Agent 的工具执行过程，避免出现“执行进度：xxx”消息刷屏；只发送处理中提示和最终结果。
 - Session 默认最多运行 10 分钟；临界超时后还会短暂回查事件历史。
@@ -288,6 +289,49 @@ Gateway 会在 access token 距离过期不足 5 分钟时刷新 token，更新�
 - 群聊中明确 `@Bot` 的文本、文件和图片可进入 Agent；音视频和交互卡片暂不作为任务输入处理。
 
 ## 二次开发：完整 Session Create 请求
+
+### 源码开发版：声明式配置与只读诊断
+
+以下能力尚未作为新的npm版本发布；本地测试请先 `npm run build`，再用 `node dist/cli.js` 替代 `arkagent`。
+
+在当前模式的 `config.env` 中可选设置：
+
+```ini
+ARK_SESSION_CONFIG_FILE="./session-config.json"
+```
+
+相对路径以 `config.env` 所在目录为基准。文件示例：
+
+```json
+{
+  "schemaVersion": 1,
+  "defaults": { "request": { "tags": [{ "key": "source", "value": "feishu" }] } },
+  "direct": { "request": { "title": "个人协作" } },
+  "group": { "request": { "title": "群聊协作" } },
+  "thread": { "request": { "title": "话题协作" } },
+  "vaultPurposes": {}
+}
+```
+
+`request` 使用MA原生Session Create字段，包括Agent版本、Environment覆写、resources、Memory/TOS等；未知扩展字段不被插件丢弃。是否被服务端接受仍以当前MA契约为准。合并顺序是基础配置 → defaults → direct，或group → thread → 开发者hook → 必需资源与身份校验。
+
+- 标量覆盖、对象深合并；显式空对象（例如`tos:{}`）保留清空语义，普通数组由后层替换。本轮上传文件在hook之后再次追加并去重，不因替换resources而丢失。
+- 一个Bot绑定一个Agent ID，可配置同一Agent的版本/覆写，不允许配置不同Agent ID。插件不会更新控制台Agent。
+- 额外群聊Vault必须在`vaultPurposes`中以Vault ID为键声明`"application"`用途；`"user"`或本地已知个人Vault不能进入共享群Session。用途声明不发送到MA。
+- App ID冲突、身份冲突、不同资源使用相同挂载路径会明确报错。启动时先校验三个会话场景，不创建Session、不执行开发者hook。
+- 配置只在启动时加载，只影响新Session。已存在Session不会重建；记录配置指纹，变化时提示未应用。`/new`会丢失对旧沙箱的会话绑定，不是无损升级。
+- Gateway按数据库实行单实例保护；活跃进程持锁时第二个进程拒绝启动，确认原进程退出后可以恢复。它不是跨机器分布式锁，也不能防止同一Bot使用两个不同数据库启动。
+
+```bash
+arkagent --version
+arkagent -v
+arkagent employee doctor --json
+arkagent employee doctor --session <session-id> --json
+```
+
+`doctor`默认只读控制面和本地数据库，不修改资源、不执行沙箱命令。输出软件版本、运行/配置路径、构建Commit与源码Hash、各场景配置指纹、App ID检查和Session实际Agent版本；SP只输出是否显式覆写及Hash，不输出正文或Token。老Session缺少本地证据时显示unknown，不猜测为配置一致。源码运行无构建记录时会明确标记。
+
+### 编程扩展
 
 `arkagent/core` 暴露 `ArkClient`、`Gateway`、Channel 契约以及对应 TypeScript 类型。`ArkClient.createSession(request)` 直接接受方舟原生 Session Create 请求，不会丢弃未知扩展字段、显式空数组或 `tos: {}` 等 wire 语义：
 

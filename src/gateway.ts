@@ -3,6 +3,7 @@ import type {
 } from "./ark.ts";
 import type { ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage } from "./channel.ts";
 import { buildConversationTurn, resolveReplyContext } from "./conversation-context.ts";
+import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, mergeSessionRequest, requestEnvironmentId, selectSessionRequest, validateSessionConfiguration, type SessionConfiguration, type SessionScope } from "./session-config.ts";
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
 import { createHash } from "node:crypto";
 
@@ -44,6 +45,7 @@ export class Gateway {
   private sessionStatsCheckedAt = new Map<string, number>();
   private sessionCompactedAtEventCount = new Map<string, number>();
   private authorizationRetries = new Set<string>();
+  private configurationWarnings = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
     ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "getSessionStats"
@@ -62,7 +64,8 @@ export class Gateway {
     this.store = store;
     this.ark = ark;
     this.reply = reply;
-    this.options = options;
+    this.options = { ...options, sessionConfiguration: options.sessionConfiguration ? structuredClone(options.sessionConfiguration) : undefined };
+    if (this.options.sessionConfiguration) validateSessionConfiguration(this.options.sessionConfiguration);
   }
 
   accept(message: IncomingMessage): boolean {
@@ -86,6 +89,20 @@ export class Gateway {
       }
     });
     return true;
+  }
+
+  async validateConfiguration(): Promise<void> {
+    for (const scope of ["direct", "group", "thread"] as const) {
+      const message: IncomingMessage = {
+        channelType: "lark", installationId: this.options.appId || "validation", tenantId: "validation",
+        eventId: "validation", messageId: "validation", conversationId: "validation", createTime: 0,
+        conversationType: scope === "direct" ? "direct" : "group", threadId: scope === "thread" ? "validation" : "",
+        rootMessageId: "", parentMessageId: "", senderId: this.options.authorizedUserId || "validation",
+        text: "", resources: [], mentionedBot: true
+      };
+      // 启动校验不执行可能有副作用或依赖真实消息的开发者hook，也不创建Session。
+      await this.buildSessionCreateRequest(message, [this.options.vaultId], [], false);
+    }
   }
 
   resume(message: IncomingMessage): void {
@@ -293,6 +310,18 @@ export class Gateway {
     const reusableSession = !this.usesIsolatedSession(message);
     let sessionId = reusableSession ? this.store.getSession(key) : undefined;
     if (sessionId) this.store.assertSessionAgent(key, this.options.agentId);
+    if (sessionId) {
+      const storedConfig = this.store.getSessionConfiguration(sessionId);
+      const fingerprint = this.configurationFingerprint(message);
+      if (storedConfig && storedConfig.fingerprint !== fingerprint) {
+        notices.push("本地Session配置已变化，当前仍复用原Session；新配置未应用到旧Session，不会自动重建或丢弃文件。");
+        const warning = `${sessionId}:${fingerprint}`;
+        if (!this.configurationWarnings.has(warning)) {
+          console.warn(`Session ${sessionId} 使用旧配置；请通过doctor核对差异，必要时显式 /new。`);
+          this.configurationWarnings.add(warning);
+        }
+      }
+    }
     let progressTimer: ReturnType<typeof setTimeout> | undefined;
     let progressReply: Promise<void> | undefined;
     if (!hasReaction) {
@@ -356,7 +385,13 @@ export class Gateway {
           initialResources
         );
         sessionId = await this.ark.createSession(request);
-        if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId, undefined, vaultIds);
+        const agentVersion = typeof request.agent === "object" && request.agent.version !== undefined ? String(request.agent.version) : undefined;
+        if (reusableSession) this.store.saveSession(key, sessionId, this.options.agentId, agentVersion, request.vault_ids);
+        this.store.saveSessionConfiguration(sessionId, this.configurationFingerprint(message), {
+          requestFingerprint: configFingerprint(request), environmentId: requestEnvironmentId(request),
+          agentVersion, vaultIds: request.vault_ids || [],
+          hasSystemOverride: typeof request.agent === "object" && Object.hasOwn(request.agent, "system")
+        });
       } else if (initialResources.length) {
         for (const resource of initialResources) {
           try { await this.addSessionResource(sessionId, resource); }
@@ -597,25 +632,55 @@ export class Gateway {
   private async buildSessionCreateRequest(
     message: IncomingMessage,
     vaultIds: string[],
-    initialResources: SessionResource[]
+    initialResources: SessionResource[],
+    useHook = true
   ): Promise<SessionCreateRequest> {
+    const configured = selectSessionRequest(this.options.sessionConfiguration, this.sessionScope(message));
     const defaults: SessionCreateDefaults = {
       agentId: this.options.agentId,
-      environmentId: this.options.environmentId,
+      environmentId: requestEnvironmentId(configured) || this.options.environmentId,
       vaultIds,
-      envOverrides: { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message) }
+      envOverrides: { ...this.defaultSessionEnvironment(message), ...this.options.sessionEnvironment?.(message),
+        ...(this.options.appId ? { LARKSUITE_CLI_APP_ID: this.options.appId } : {}) }
     };
     const base = this.ark.buildSessionCreateRequest
       ? await this.ark.buildSessionCreateRequest(defaults)
       : fallbackSessionCreateRequest(defaults);
-    const draft = initialResources.length ? {
-      ...base,
-      resources: [...(base.resources || []), ...initialResources]
-    } : base;
-    if (!this.options.buildSessionRequest) return draft;
-    const request = await this.options.buildSessionRequest(message, structuredClone(draft));
+    const merged = mergeSessionRequest(base, configured) as SessionCreateRequest;
+    // 保持旧hook可见本轮附件，同时在hook之后重新合并必需附件，防止替换resources时丢失。
+    const draft = initialResources.length ? { ...merged, resources: [...(merged.resources || []), ...initialResources] } : merged;
+    let request = useHook && this.options.buildSessionRequest ? await this.options.buildSessionRequest(message, structuredClone(draft)) : draft;
     if (!request || typeof request !== "object") throw new Error("buildSessionRequest 必须返回 Session Create 请求对象");
-    return request;
+    request = mergeSessionRequest({}, request) as SessionCreateRequest;
+    const environmentId = requestEnvironmentId(request);
+    if (!environmentId) throw new Error("Session配置缺少Environment绑定");
+    // hook也可能选择另一Environment；重新加载该资源，不复用原Environment的配置。
+    const hydrated = environmentId === defaults.environmentId ? base : this.ark.buildSessionCreateRequest
+      ? await this.ark.buildSessionCreateRequest({ ...defaults, environmentId })
+      : fallbackSessionCreateRequest({ ...defaults, environmentId });
+    const environment = hydrated.environment || fallbackSessionCreateRequest({ ...defaults, environmentId }).environment!;
+    assertEnvironmentAppId(environment.config?.env, this.options.appId);
+    const patch = { ...request, environment: request.environment || { id: environmentId, type: "environment_with_overrides" } };
+    delete patch.environment_id;
+    request = mergeSessionRequest({ ...hydrated, environment }, patch) as SessionCreateRequest;
+    const purposes = this.options.sessionConfiguration?.vaultPurposes || {};
+    return finalizeSessionRequest(request, {
+      agentId: this.options.agentId, requiredVaultIds: vaultIds, mandatoryEnv: defaults.envOverrides!,
+      sharedGroup: Boolean(this.options.sharedGroupSessions && message.conversationType === "group"), appId: this.options.appId,
+      applicationVaultIds: Object.keys(purposes).filter(id => purposes[id] === "application"),
+      knownUserVaultIds: [...this.store.knownUserVaultIds(), ...Object.keys(purposes).filter(id => purposes[id] === "user")],
+      resources: initialResources
+    });
+  }
+
+  private sessionScope(message: IncomingMessage): SessionScope {
+    return message.conversationType === "direct" ? "direct" : message.threadId ? "thread" : "group";
+  }
+
+  private configurationFingerprint(message: IncomingMessage): string {
+    return configFingerprint({ agentId: this.options.agentId, environmentId: this.options.environmentId, vaultId: this.options.vaultId,
+      appId: this.options.appId, scope: this.sessionScope(message), sharedGroup: this.options.sharedGroupSessions,
+      configuration: this.options.sessionConfiguration || {}, hookRevision: this.options.sessionConfigurationRevision || (this.options.buildSessionRequest ? "unversioned-hook" : "none") });
   }
 
   private async addSessionResource(sessionId: string, resource: SessionResource): Promise<void> {
@@ -758,7 +823,9 @@ export class Gateway {
           FEISHU_TRIGGER_CREATE_TIME: String(message.createTime)
         })
       } : {}),
-      ...(this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}),
+      ...(message.conversationType === "group" && this.options.sharedGroupSessions
+        ? { FEISHU_IDENTITY_MODE: "bot_only", LARKSUITE_CLI_STRICT_MODE: "bot" }
+        : this.options.dualIdentity ? { LARKSUITE_CLI_STRICT_MODE: "off" } : {}),
       LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
       LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
     };
@@ -794,6 +861,9 @@ export type GatewayOptions = {
   sharedGroupSessions?: boolean;
   loadRecentHistory?: (message: IncomingMessage) => Promise<ChannelHistoryMessage[]>;
   readMessage?: ChannelReadMessage;
+  appId?: string;
+  sessionConfiguration?: SessionConfiguration;
+  sessionConfigurationRevision?: string;
   dualIdentity?: boolean;
   sessionEnvironment?: (message: IncomingMessage) => Record<string, string>;
   buildSessionRequest?: (

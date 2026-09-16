@@ -20,7 +20,13 @@
 **Goal**: 声明式 JSON、原生参数保留、身份约束、指纹与版本/doctor、AppID校验、单实例保护。
 **Success Criteria**: S01-S05、E01-E02；不自动覆盖Agent，不重建旧Session。
 **Tests**: 合并优先级、未知字段、挂载冲突、UAT拒绝、版本命令、旧库迁移、启动锁。
-**Status**: Not Started
+**Status**: In Progress
+
+实现进展（2026-09-16）：声明式配置已接入两种CLI模式；支持default/direct/group/thread分层、原生字段保留、显式空对象和数组、环境切换重新加载、hook后必需资源补回与挂载冲突校验。Vault用途声明、已知用户Vault拒绝、AppID和共享群bot-only保护均位于最终请求边界。新Session记录配置/请求指纹、显式SP覆写标记和版本；旧Session只提示配置差异，不重建。
+诊断：`--version/-v`、`employee doctor --json --session`、构建Commit/源码Hash；doctor只读MA和数据库，SP只Hash，不输出凭证；同数据库SQLite事务锁拒绝第二个活跃进程，确认原PID已退出可恢复。
+本地回归：187/187通过；npm run check（自动发现全部src模块）、build和diff检查通过。新测覆盖配置分层、空对象清空、未知字段、hook换环境及冲突别名、配置变化保留Session、凭证隔离、版本无凭证启动、诊断脱敏/只读、单实例与真实子进程退出恢复。
+真实只读核验：构建产物doctor读取 `sesn-20260916030636-vf5pc` 成功，Agent v4、AppID匹配；该隔离测试使用内存DB，doctor正确报告unknown_legacy_or_external，不误报配置已一致。构建包含dirty标记，未冒充已发布版本。
+未完成：真实Memory/TOS多资源挂载（S02）、开发机旧库迁移/回退及完整E2E；代码通过不等于这些验收已完成。README标明新能力仅源码开发版、尚未发布npm。
 
 ## Stage 3: 压缩与授权恢复
 **Goal**: 持久化压缩检查点与退避；每轮刷新、结构化认证错误、凭证同步、授权等待/取消/恢复。

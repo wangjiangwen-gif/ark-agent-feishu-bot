@@ -153,6 +153,26 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
   assert.equal(calls.at(-1)?.body?.environment_id, undefined);
 });
 
+test("Environment App ID conflicts are rejected before the Session request", async () => {
+  let creates = 0;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async url => {
+    if (String(url).endsWith("/sessions")) creates++;
+    return new Response(JSON.stringify({ config: { type: "cloud", env: { LARKSUITE_CLI_APP_ID: "other" } } }));
+  });
+  await assert.rejects(client.createSession("agent", "env", [], { LARKSUITE_CLI_APP_ID: "expected" }), /APP_ID/);
+  assert.equal(creates, 0);
+});
+
+test("Environment cache returns copies and supports explicit fresh reads", async () => {
+  let requests = 0;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async () => {
+    requests++; return new Response(JSON.stringify({ config: { type: "cloud", env: { VALUE: String(requests) } } }));
+  });
+  const first = await client.getEnvironmentConfig("env"); first.env!.VALUE = "mutated";
+  assert.equal((await client.getEnvironmentConfig("env")).env?.VALUE, "1");
+  assert.equal((await client.getEnvironmentConfig("env", { fresh: true })).env?.VALUE, "2");
+});
+
 test("Ark createSession preserves the complete native Session request", async () => {
   let body: Record<string, unknown> = {};
   const client = new ArkClient("key", "https://ark.example/api/v3", async (_url, init) => {

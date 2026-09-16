@@ -6,6 +6,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { loadConfig, loadConfigFile } from "./config.ts";
 import { persistOAuthState } from "./login.ts";
 import { getArkagentPaths, getEmployeePaths } from "./paths.ts";
+import { loadSessionConfiguration } from "./session-config.ts";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource } from "./channel.ts";
 
 const command = process.argv[2] || "run";
@@ -13,7 +14,8 @@ const employeeCommand = process.argv[3] || "run";
 
 async function main(): Promise<void> {
   try {
-    if (command === "run") await run();
+    if (command === "--version" || command === "-v") console.log(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
+    else if (command === "run") await run();
     else if (command === "doctor") await doctor();
     else if (command === "init") await guidedInit();
     else if (command === "login") await login();
@@ -53,12 +55,15 @@ async function repairEmployeeEnvironment(): Promise<void> {
 }
 
 async function runEmployee(): Promise<void> {
-  loadSavedEmployeeEnvironment();
+  const paths = loadSavedEmployeeEnvironment();
+  const sessionConfiguration = loadSessionConfiguration(process.env.ARK_SESSION_CONFIG_FILE, paths.configPath).config;
   const [{ loadEmployeeConfig }, { ArkClient }, { Gateway }, { GatewayStore }, { startEmployeeWeb }, { FeishuOAuth }, { EmployeeAuthorizationManager }] = await Promise.all([
     import("./config.ts"), import("./ark.ts"), import("./gateway.ts"), import("./store.ts"), import("./web.ts"), import("./oauth.ts"), import("./employee-auth.ts")
   ]);
   const config = loadEmployeeConfig();
   const store = new GatewayStore(config.databasePath);
+  store.acquireRuntimeLock();
+  process.once("exit", () => store.close());
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
   const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
   let botTokenExpiresAt = 0;
@@ -92,6 +97,7 @@ async function runEmployee(): Promise<void> {
     (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId)
   );
   gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
+    appId: config.feishuAppId, sessionConfiguration,
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
@@ -105,6 +111,7 @@ async function runEmployee(): Promise<void> {
     loadRecentHistory: message => channel.loadRecentHistory?.(message) || Promise.resolve([]),
     readMessage: channel.readMessage
   });
+  await gateway.validateConfiguration();
   const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName });
   console.log("数字员工配置：");
   console.log(`- 飞书 App ID：${config.feishuAppId}`);
@@ -134,21 +141,34 @@ async function runEmployee(): Promise<void> {
 }
 
 async function employeeDoctor(): Promise<void> {
-  loadSavedEmployeeEnvironment();
-  const [{ loadEmployeeConfig }, { ArkClient }] = await Promise.all([import("./config.ts"), import("./ark.ts")]);
+  const paths = loadSavedEmployeeEnvironment();
+  const loaded = loadSessionConfiguration(process.env.ARK_SESSION_CONFIG_FILE, paths.configPath);
+  const args = process.argv.slice(4);
+  const sessionIndex = args.indexOf("--session");
+  if (sessionIndex >= 0 && (!args[sessionIndex + 1] || args[sessionIndex + 1].startsWith("--"))) throw new Error("--session 需要Session ID");
+  const [{ loadEmployeeConfig }, { ArkClient }, { collectEmployeeDiagnostics }] = await Promise.all([import("./config.ts"), import("./ark.ts"), import("./doctor.ts")]);
   const config = loadEmployeeConfig();
-  const agent = await new ArkClient(config.arkApiKey, config.arkBaseUrl).getAgent(config.arkAgentId);
-  console.log(`数字员工配置有效；已连接 Agent ${agent.id}${agent.version ? ` v${agent.version}` : ""}。`);
-  console.log(`WebUI 将监听 http://${config.webHost}:${config.webPort}/。`);
+  let build;
+  try { build = JSON.parse(readFileSync(new URL("./build-info.json", import.meta.url), "utf8")); } catch { /* 源码运行没有构建记录 */ }
+  const report = await collectEmployeeDiagnostics({ config, configPath: paths.configPath,
+    sessionConfiguration: loaded.config, sessionConfigurationPath: loaded.path,
+    sessionId: sessionIndex >= 0 ? args[sessionIndex + 1] : undefined,
+    executablePath: process.argv[1], version: JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version,
+    build, ark: new ArkClient(config.arkApiKey, config.arkBaseUrl) });
+  console.log(JSON.stringify(report, null, args.includes("--json") ? undefined : 2));
+  if (!report.ok) process.exitCode = 1;
 }
 
 async function run(): Promise<void> {
   const paths = loadSavedEnvironment();
+  const sessionConfiguration = loadSessionConfiguration(process.env.ARK_SESSION_CONFIG_FILE, paths.configPath).config;
   const config = loadConfig();
   const [{ ArkClient }, { Gateway }, { GatewayStore }, { FeishuOAuth }] = await Promise.all([
     import("./ark.ts"), import("./gateway.ts"), import("./store.ts"), import("./oauth.ts")
   ]);
   const store = new GatewayStore(config.databasePath);
+  store.acquireRuntimeLock();
+  process.once("exit", () => store.close());
   const ark = new ArkClient(config.arkApiKey, config.arkBaseUrl);
   const oauth = new FeishuOAuth(config.feishuAppId, config.feishuAppSecret);
   let tokens = { accessToken: "", refreshToken: config.feishuRefreshToken, expiresAt: config.feishuAccessTokenExpiresAt };
@@ -164,6 +184,7 @@ async function run(): Promise<void> {
   };
   const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
   const gateway = new Gateway(store, ark, (message, outbound) => channel.reply(message, outbound), {
+    appId: config.feishuAppId, sessionConfiguration,
     agentId: config.arkAgentId,
     environmentId: config.arkEnvironmentId,
     vaultId: config.arkVaultId,
@@ -176,6 +197,7 @@ async function run(): Promise<void> {
     readMessage: channel.readMessage,
     timeoutMs: config.sessionTimeoutMs
   });
+  await gateway.validateConfiguration();
   console.log("Gateway 配置：");
   console.log(`- 飞书 App ID：${config.feishuAppId}`);
   console.log(`- 方舟 Agent ID：${config.arkAgentId}`);
@@ -448,7 +470,7 @@ async function readMaskedInput(prompt: string): Promise<string> {
 }
 
 function printHelp(): void {
-  console.log(`arkagent [command]\n\n个人助手：\n  init             交互式认领办公助手\n  login            复用当前 App 重新执行用户 OAuth\n  doctor           检查配置并验证方舟 Agent\n  run              启动个人助手 Gateway（默认）\n\n数字员工：\n  employee init                创建 Bot 身份数字员工\n  employee                     启动数字员工 Gateway 与 WebUI\n  employee doctor              检查数字员工配置\n  employee repair-environment  重建并切换数字员工运行环境`);
+  console.log(`arkagent [command]\n  --version / -v   显示当前安装版本\n\n个人助手：\n  init             交互式认领办公助手\n  login            复用当前 App 重新执行用户 OAuth\n  doctor           检查配置并验证方舟 Agent\n  run              启动个人助手 Gateway（默认）\n\n数字员工：\n  employee init                创建 Bot 身份数字员工\n  employee                     启动数字员工 Gateway 与 WebUI\n  employee doctor [--json] [--session <id>]  只读配置与Session诊断\n  employee repair-environment  重建并切换数字员工运行环境\n\n可选配置：\n  ARK_SESSION_CONFIG_FILE       Session原生请求JSON，相对config.env目录解析`);
 }
 
 await main();

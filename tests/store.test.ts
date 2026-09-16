@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { execFileSync } from "node:child_process";
 import { GatewayStore } from "../src/store.ts";
 
 const key = { channelType: "lark", installationId: "cli-one", tenantId: "tenant", conversationId: "chat", threadId: "", senderId: "user" };
@@ -16,6 +17,42 @@ test("store saves, reuses and resets a conversation session with its mounted Vau
   store.resetSession(key);
   assert.equal(store.getSession(key), undefined);
   store.close();
+});
+
+test("same database refuses a second live Gateway and releases its own lock on close", t => {
+  const directory = mkdtempSync(join(tmpdir(), "arkagent-lock-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "gateway.db");
+  const first = new GatewayStore(path), second = new GatewayStore(path);
+  first.acquireRuntimeLock();
+  assert.throws(() => second.acquireRuntimeLock(), /已有Gateway运行/);
+  first.close();
+  assert.doesNotThrow(() => second.acquireRuntimeLock());
+  second.close();
+});
+
+test("runtime lock can recover only after its owning process actually exited", t => {
+  const directory = mkdtempSync(join(tmpdir(), "arkagent-dead-lock-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "gateway.db");
+  const script = `import { GatewayStore } from './src/store.ts'; const store = new GatewayStore(${JSON.stringify(path)}); store.acquireRuntimeLock(); process.exit(0);`;
+  execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], { stdio: "pipe" });
+  const store = new GatewayStore(path); t.after(() => store.close());
+  assert.doesNotThrow(() => store.acquireRuntimeLock());
+});
+
+test("configuration evidence survives reopening and is never rewritten as current configuration", t => {
+  const directory = mkdtempSync(join(tmpdir(), "arkagent-session-config-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "gateway.db");
+  const first = new GatewayStore(path);
+  const metadata = { requestFingerprint: "hash", environmentId: "env", vaultIds: ["vault"], hasSystemOverride: false };
+  first.saveSessionConfiguration("session", "original", metadata); first.close();
+  const second = new GatewayStore(path); t.after(() => second.close());
+  second.saveSessionConfiguration("session", "changed", { ...metadata, environmentId: "new" });
+  assert.equal(second.getSessionConfiguration("session")?.fingerprint, "original");
+  assert.equal(second.getSessionConfiguration("session")?.metadata.environmentId, "env");
+  assert.equal(second.getSessionConfiguration("legacy"), undefined);
 });
 
 test("sessions are isolated by channel installation", () => {

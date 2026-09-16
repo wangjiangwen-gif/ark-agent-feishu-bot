@@ -1,0 +1,28 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "f0009cbb6957fc26695a4e961648c3049e39fd97",
+  "testedCode": "working tree: stage 2 session configuration and diagnostics",
+  "unitAndIntegration": { "tests": 187, "passed": 187, "failed": 0 },
+  "syntaxCheck": true,
+  "build": true,
+  "diffCheck": true,
+  "versionCommands": { "source": "0.2.9", "bundle": "0.2.9", "newReleasePublished": false },
+  "liveDoctor": {
+    "command": "node dist/cli.js employee doctor --json --session sesn-20260916030636-vf5pc",
+    "readOnly": true,
+    "ok": true,
+    "sessionId": "sesn-20260916030636-vf5pc",
+    "agentId": "agent-20260819140401-nf7xw",
+    "agentVersion": "4",
+    "environmentId": "env-20260820154731-qspjg",
+    "appIdStatus": "match",
+    "configStatus": "unknown_legacy_or_external",
+    "cliRuntime": "not_probed"
+  },
+  "remaining": [
+    "真实Memory和TOS多资源挂载",
+    "开发机旧数据库迁移和回退演练",
+    "真实飞书入口完整端到端",
+    "固定模型和配置下的性能对照"
+  ]
+}

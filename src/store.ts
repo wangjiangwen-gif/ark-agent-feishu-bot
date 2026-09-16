@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { hostname } from "node:os";
 import type { ChannelHistoryMessage, ChannelMessage } from "./channel.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
@@ -49,6 +50,8 @@ export type EmployeeOAuth = {
 
 export class GatewayStore {
   private db: DatabaseSync;
+  private runtimeToken?: string;
+  private closed = false;
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -128,6 +131,14 @@ export class GatewayStore {
         PRIMARY KEY (session_id, attachment_key)
       );
       CREATE TABLE IF NOT EXISTS inline_restore_pending (session_id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS session_configuration (
+        session_id TEXT PRIMARY KEY, config_fingerprint TEXT NOT NULL,
+        metadata TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS gateway_runtime_lock (
+        id INTEGER PRIMARY KEY CHECK(id = 1), pid INTEGER NOT NULL,
+        host TEXT NOT NULL, token TEXT NOT NULL, acquired_at TEXT NOT NULL
+      );
     `);
     this.ensureColumn("audit_logs", "channel_type", "TEXT NOT NULL DEFAULT 'lark'");
     this.ensureColumn("audit_logs", "installation_id", "TEXT NOT NULL DEFAULT 'legacy'");
@@ -172,6 +183,19 @@ export class GatewayStore {
     } catch {
       return undefined;
     }
+  }
+
+  knownUserVaultIds(): string[] {
+    return (this.db.prepare("SELECT DISTINCT vault_id FROM employee_oauth").all() as { vault_id: string }[]).map(row => row.vault_id);
+  }
+
+  saveSessionConfiguration(sessionId: string, fingerprint: string, metadata: { requestFingerprint: string; environmentId?: string; agentVersion?: string; vaultIds: string[]; hasSystemOverride: boolean }): void {
+    this.db.prepare("INSERT OR IGNORE INTO session_configuration VALUES (?, ?, ?, ?)").run(sessionId, fingerprint, JSON.stringify(metadata), new Date().toISOString());
+  }
+
+  getSessionConfiguration(sessionId: string): { fingerprint: string; metadata: { requestFingerprint: string; environmentId?: string; agentVersion?: string; vaultIds: string[]; hasSystemOverride: boolean } } | undefined {
+    const row = this.db.prepare("SELECT config_fingerprint, metadata FROM session_configuration WHERE session_id = ?").get(sessionId) as { config_fingerprint: string; metadata: string } | undefined;
+    return row ? { fingerprint: row.config_fingerprint, metadata: JSON.parse(row.metadata) } : undefined;
   }
 
   assertSessionAgent(key: ConversationKey, agentId: string): void {
@@ -447,7 +471,30 @@ export class GatewayStore {
   }
 
   close(): void {
+    if (this.closed) return;
+    if (this.runtimeToken) this.db.prepare("DELETE FROM gateway_runtime_lock WHERE id = 1 AND token = ?").run(this.runtimeToken);
     this.db.close();
+    this.closed = true;
+  }
+
+  acquireRuntimeLock(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const owner = this.db.prepare("SELECT pid, host FROM gateway_runtime_lock WHERE id = 1").get() as { pid: number; host: string } | undefined;
+      if (owner) {
+        if (owner.host !== hostname()) throw new Error("数据库由另一主机的Gateway占用；不支持共享数据库上的多主机运行");
+        let alive = true;
+        try { process.kill(owner.pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+        if (alive) throw new Error(`同一数据库已有Gateway运行（PID ${owner.pid}），请先停止原进程`);
+      }
+      const token = randomUUID();
+      this.db.prepare("INSERT OR REPLACE INTO gateway_runtime_lock VALUES (1, ?, ?, ?, ?)").run(process.pid, hostname(), token, new Date().toISOString());
+      this.db.exec("COMMIT");
+      this.runtimeToken = token;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {

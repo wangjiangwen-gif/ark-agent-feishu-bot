@@ -30,3 +30,10 @@ export type {
   ChannelResource,
   ChannelType
 } from "./channel.ts";
+export {
+  loadSessionConfiguration,
+  mergeSessionRequest,
+  selectSessionRequest,
+  type SessionConfiguration,
+  type SessionScope
+} from "./session-config.ts";
