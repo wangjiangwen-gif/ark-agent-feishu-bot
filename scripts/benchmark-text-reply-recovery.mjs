@@ -1,4 +1,6 @@
 // 交替对照Gateway、真实SQLite和Channel适配层；外部发送/MA为模拟，不代表用户端时延。
+// 旧测量口径保留供复现：reply后的setImmediate也计入总耗时，且顺序仅正反交替。
+// 定位回退时使用profile-text-reply-recovery.mjs：成功落盘终点、分段计时、均衡位置与A/A校准。
 import { mkdtempSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
