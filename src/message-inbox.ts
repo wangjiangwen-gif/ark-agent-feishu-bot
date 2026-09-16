@@ -35,16 +35,7 @@ export class MessageInbox {
     this.validate(message, binding);
     return this.transaction(() => {
       const eventKey = this.eventKey(message);
-      const existing = this.db.prepare("SELECT * FROM gateway_message_inbox WHERE event_key = ?").get(eventKey);
-      if (existing) {
-        const original = this.decode(existing);
-        // 重复投递可以带新的eventId，不能借相同messageId切换到别的用户或会话。
-        if (original.message.tenantId !== message.tenantId || original.message.senderId !== message.senderId
-          || original.message.conversationId !== message.conversationId || original.message.threadId !== message.threadId) {
-          throw new Error("重复消息的身份或会话与原记录不一致");
-        }
-        return undefined;
-      }
+      if (this.findMessage(message)) return undefined;
       const sequence = Number(this.db.prepare("SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM gateway_message_inbox").get()!.next);
       const task: InboxTask = { id: randomUUID(), sequence, revision: 1, state: "queued", owner: "",
         message: structuredClone(message), binding: structuredClone(binding) };
@@ -56,6 +47,19 @@ export class MessageInbox {
           binding.configFingerprint, task.state, task.owner, task.revision, secret);
       return task;
     });
+  }
+
+  findMessage(message: ChannelMessage): InboxTask | undefined {
+    this.runtimeOwner();
+    const row = this.db.prepare("SELECT * FROM gateway_message_inbox WHERE event_key = ?").get(this.eventKey(message));
+    if (!row) return undefined;
+    const original = this.decode(row);
+    // 重复投递可以带新的eventId，不能借相同messageId切换到别的用户或会话。
+    if (original.message.tenantId !== message.tenantId || original.message.senderId !== message.senderId
+      || original.message.conversationId !== message.conversationId || original.message.threadId !== message.threadId) {
+      throw new Error("重复消息的身份或会话与原记录不一致");
+    }
+    return original;
   }
 
   claim(id: string, expectedBinding: InboxBinding): InboxTask | undefined {
@@ -175,8 +179,9 @@ export class MessageInbox {
   }
 
   private transaction<T>(operation: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try { const result = operation(); this.db.exec("COMMIT"); return result; }
-    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    // Store原子接收的外层事务与独立Inbox操作共用此边界；释放savepoint不提交外层事务。
+    this.db.exec("SAVEPOINT message_inbox");
+    try { const result = operation(); this.db.exec("RELEASE message_inbox"); return result; }
+    catch (error) { this.db.exec("ROLLBACK TO message_inbox; RELEASE message_inbox"); throw error; }
   }
 }

@@ -9,7 +9,7 @@ import { CredentialStateStore, type CredentialIdentity, type CredentialState } f
 import { AuthorizationStateStore, type AuthorizationFlow } from "./authorization-state.ts";
 import type { OAuthTokens } from "./oauth.ts";
 import type { RunEvidence } from "./run-evidence.ts";
-import { MessageInbox } from "./message-inbox.ts";
+import { MessageInbox, type InboxBinding, type InboxTask } from "./message-inbox.ts";
 
 export type StoredAttachment = { fileId?: string; inlineText?: string; name: string; mountPath: string; bytes: number };
 
@@ -293,7 +293,77 @@ export class GatewayStore {
     return [channelType, installationId, eventId].map(escapeKeyPart).join(":");
   }
 
+  receiveMessage(message: ChannelMessage, binding: InboxBinding): InboxTask | undefined {
+    return this.messageTransaction(() => {
+      const existing = this.inbox.findMessage(message);
+      const eventKey = this.eventKey(message.channelType, message.installationId, message.messageId);
+      const event = this.db.prepare("SELECT 1 FROM processed_events WHERE event_id = ?").get(eventKey);
+      if (existing) {
+        if (!event) throw new Error("持久化消息缺少对应接收记录，不能自动重建或重放");
+        return undefined;
+      }
+      // 老版本缺少执行阶段证据，即使记录过期或failed也不能推断可以安全重放。
+      if (event || (message.channelType === "lark" && this.db.prepare("SELECT 1 FROM processed_events WHERE event_id = ?").get(message.messageId))) return undefined;
+      this.db.prepare("INSERT INTO processed_events (event_id, status, updated_at) VALUES (?, 'processing', ?)")
+        .run(eventKey, new Date().toISOString());
+      return this.inbox.enqueue(message, binding);
+    });
+  }
+
+  dispatchMessage(id: string, sessionId: string, requestFingerprint: string): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.dispatched(id, sessionId, requestFingerprint);
+      this.updateMessageEvent(task, "processing", true);
+      return task;
+    });
+  }
+
+  finishMessage(id: string, outcome: "completed" | "failed" | "awaiting_authorization"): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.finish(id, outcome);
+      this.updateMessageEvent(task, task.state, Boolean(task.sessionId));
+      return task;
+    });
+  }
+
+  recoverMessages(channelType: string, installationId: string): ReturnType<MessageInbox["recover"]> {
+    return this.messageTransaction(() => {
+      const recovered = this.inbox.recover(channelType, installationId);
+      for (const task of [...recovered.queued, ...recovered.interrupted, ...recovered.awaitingAuthorization]) {
+        const message = task.message;
+        const key = this.eventKey(message.channelType, message.installationId, message.messageId);
+        const event = this.db.prepare("SELECT status, dispatched FROM processed_events WHERE event_id=?").get(key);
+        const expected = task.state === "queued" ? "processing" : task.state;
+        // 旧owner刚从preparing/dispatched转为uncertain时，同步另一份日志；整批校验失败则全部回滚。
+        if (task.state === "uncertain" && event?.status === "processing") {
+          this.updateMessageEvent(task, "uncertain", Boolean(task.sessionId));
+        } else if (event?.status !== expected || Boolean(event.dispatched) !== Boolean(task.sessionId)) {
+          throw new Error("持久化消息与接收记录不一致，未恢复该批任务");
+        }
+      }
+      return recovered;
+    });
+  }
+
+  private updateMessageEvent(task: InboxTask, status: string, dispatched: boolean): void {
+    const message = task.message;
+    const result = this.db.prepare(`UPDATE processed_events SET status = ?, dispatched = MAX(dispatched, ?), updated_at = ?
+      WHERE event_id = ? AND status = 'processing'`)
+      .run(status, dispatched ? 1 : 0, new Date().toISOString(), this.eventKey(message.channelType, message.installationId, message.messageId));
+    if (Number(result.changes) !== 1) throw new Error("消息接收记录缺失或状态已变化，不能更新执行检查点");
+  }
+
+  private messageTransaction<T>(operation: () => T): T {
+    this.assertRuntimeLock();
+    this.db.exec("BEGIN IMMEDIATE");
+    try { const result = operation(); this.db.exec("COMMIT"); return result; }
+    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
   claimEvent(channelType: string, installationId: string, eventId: string, now = Date.now()): boolean {
+    // 持久化任务只能经Inbox领取；旧入口的超时重试不能绕过队列和未知结果保护。
+    if (this.db.prepare("SELECT 1 FROM gateway_message_inbox WHERE event_key = ?")
+      .get(JSON.stringify([channelType, installationId, eventId]))) return false;
     if (channelType === "lark") {
       const legacy = this.db.prepare("SELECT 1 FROM processed_events WHERE event_id = ?").get(eventId);
       if (legacy) return false;
