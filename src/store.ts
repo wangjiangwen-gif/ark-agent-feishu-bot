@@ -439,6 +439,14 @@ export class GatewayStore {
     });
   }
 
+  claimPreparingMessage(expected: InboxTask, binding: InboxBinding): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.claimPreparationPlan(expected, binding);
+      this.updateMessageEvent(task, "processing", false, "uncertain");
+      return task;
+    });
+  }
+
   finishMessage(id: string, outcome: "completed" | "failed" | "awaiting_authorization"): InboxTask {
     return this.messageTransaction(() => {
       const task = this.inbox.finish(id, outcome);

@@ -86,7 +86,7 @@ test("ready group input preserves historical TXT, quoted Markdown and current PD
   } finally { store.close(); files.cleanup(); }
 });
 
-for (const phase of ["before_ready", "dispatched"] as const) test(`${phase} exit never replays preparation or MA requests`, async () => {
+for (const phase of ["before_ready", "dispatched"] as const) test(`${phase} exit preserves the preparation or dispatch boundary`, async () => {
   const files = fixture(); exitDuringPreparation(files.path, first, "", phase);
   const store = new GatewayStore(files.path); store.acquireRuntimeLock(); let runs = 0;
   try {
@@ -94,8 +94,10 @@ for (const phase of ["before_ready", "dispatched"] as const) test(`${phase} exit
       run: async () => { runs++; return done(); }, inspectSessionReadiness: async (sessionId) => ({ status: "idle", sessionId, agentId: "agent" }),
       inspectRun: async () => ({ status: "unknown", reason: "history_unavailable" }) }, async () => {}, options);
     gateway.recoverPendingMessages("lark", "cli"); await gateway.reconcilePendingMessage(first);
-    await until(() => store.inbox.findMessage(first)?.state === "uncertain");
-    assert.equal(runs, 0); assert.equal(store.inbox.findMessage(first)!.state, "uncertain");
+    // 新计划已冻结全部步骤时可以拼回ready；已派发的任务仍不得重放。
+    const expected = phase === "before_ready" ? "completed" : "uncertain";
+    await until(() => store.inbox.findMessage(first)?.state === expected);
+    assert.equal(runs, phase === "before_ready" ? 1 : 0); assert.equal(store.inbox.findMessage(first)!.state, expected);
   } finally { store.close(); files.cleanup(); }
 });
 

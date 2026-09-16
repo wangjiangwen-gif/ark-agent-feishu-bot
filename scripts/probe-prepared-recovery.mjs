@@ -9,6 +9,7 @@ import { ArkClient } from "../src/ark.ts";
 import { loadConfigFile, loadEmployeeConfig } from "../src/config.ts";
 import { Gateway, toConversationKey } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
+import { buildConversationTurn } from "../src/conversation-context.ts";
 
 // 只对新建的隔离Session执行一次随机回显；不连接飞书，不修改Agent或生产凭证。
 const CHILD_TIMEOUT_MS = 70_000;
@@ -21,6 +22,7 @@ const mode = childMode ? "child" : resumeMode ? "resume" : "parent";
 // 每次显式恢复独立留证，绝不覆盖首次父进程或之前的恢复证据。
 const evidenceName = resumeMode ? `resume-${randomUUID()}-evidence.json` : `${mode}-evidence.json`;
 let evidenceDir, store, sessionId, childProcess, hardTimer;
+let phase = "ready";
 const counts = { creates: 0, runs: 0, readinessChecks: 0, uploads: 0, configBuilds: 0, configHooks: 0,
   historyReads: 0, credentialMaintenance: 0, replies: 0, blockedOperations: 0, httpCreates: 0,
   httpMessages: 0, suppressedLogs: 0 };
@@ -33,7 +35,7 @@ function check(value, code) {
 }
 function safeSessionId(value) { return typeof value === "string" && /^sesn-[a-zA-Z0-9-]{1,100}$/.test(value) ? value : undefined; }
 function snapshot(stage, extra = {}) {
-  return { stage, mode, sessionId: safeSessionId(sessionId), elapsedMs: Date.now() - startedAt,
+  return { stage, mode, phase, sessionId: safeSessionId(sessionId), elapsedMs: Date.now() - startedAt,
     counts: { ...counts }, checks: { ...checks }, liveChannel: false, ...extra };
 }
 function save(stage, extra = {}) {
@@ -51,13 +53,38 @@ function incoming(meta) {
     resources: [], mentionedBot: true, createTime: meta.createdAt,
     text: `这是隔离回归测试。不要调用任何工具，不要访问文件或外部服务，只回复以下随机字符串，不要解释或添加其他内容：${meta.nonce}` };
 }
+function phaseOf(meta) {
+  // 旧探针未记录phase，继续按原ready检查点恢复；未知值不能隐式降级。
+  check(meta?.phase === undefined || ["ready", "preparing"].includes(meta.phase), "invalid_probe_phase");
+  return meta.phase || "ready";
+}
+function plannedFingerprint(meta) {
+  const message = incoming(meta);
+  return hash(buildConversationTurn(message, [], message.text, undefined).input);
+}
+function checkPreparingPlan(task, meta) {
+  const plan = task?.preparationPlan;
+  const creation = plan?.steps.find(step => step.id === "session-create");
+  const context = plan?.steps.find(step => step.id === "context");
+  check(!task.preparation && plan && plan.target.reusable === true && plan.target.sessionId === undefined
+    && plan.steps.every(step => step.state === "completed"), "invalid_preparing_plan");
+  check(creation?.kind === "creation" && creation.output === sessionId, "missing_confirmed_creation_step");
+  check(context?.kind === "observation" && JSON.stringify(context.output) === JSON.stringify({ history: [], reply: null, notices: [] }), "unexpected_probe_context");
+  checks.preparationAbsent = true;
+  checks.creationStepConfirmed = true;
+  checks.planFingerprint = hash(JSON.stringify(plan));
+  checks.preparedFingerprint = plannedFingerprint(meta);
+}
 function gatewayOptions(config, recovery) {
   return { agentId: config.arkAgentId, environmentId: config.arkEnvironmentId,
     // 占位值仅满足Gateway配置；真正发送MA前强制清空vault_ids，生产Vault从不进入请求。
     vaultId: "probe-no-vault", appId: config.feishuAppId, timeoutMs: RUN_TIMEOUT_MS,
     progressDelayMs: RECOVERY_TIMEOUT_MS + 10_000, platformAccess: true,
     sharedGroupSessions: true, durableQueue: true, sessionConfigurationRevision: "prepared-recovery-probe-v1",
-    beforeCreateSession: async () => { counts.credentialMaintenance++; },
+    beforeCreateSession: async () => {
+      counts.credentialMaintenance++;
+      if (recovery && phase === "preparing") { counts.blockedOperations++; check(false, "forbidden_recovery_credential_hook"); }
+    },
     buildSessionRequest: recovery ? forbidden("config_hook") : async (_message, request) => { counts.configHooks++; return request; },
     loadRecentHistory: recovery ? forbidden("history") : async () => { counts.historyReads++; return []; },
     readMessage: forbidden("read_message"), downloadAttachment: forbidden("download"),
@@ -99,7 +126,23 @@ function createClient(config) {
 async function prepareInChild(config, meta) {
   const client = createClient(config);
   store = new GatewayStore(join(evidenceDir, "gateway.db")); store.acquireRuntimeLock();
+  if (phase === "preparing") {
+    const complete = store.inbox.completePreparationStep.bind(store.inbox);
+    store.inbox.completePreparationStep = (expected, planId, id, value) => {
+      const task = complete(expected, planId, id, value);
+      if (id === "session-create") {
+        check(task.state === "preparing" && !task.sessionId && !task.requestFingerprint && !task.dispatchId, "already_dispatched");
+        check(counts.runs === 0 && counts.httpMessages === 0, "child_sent_message");
+        checkPreparingPlan(task, meta);
+        output(save("preparing_after_session_create"));
+        // 创建步骤已真正提交，但尚未生成最终prepared输入，模拟这个边界上的进程退出。
+        process.exit(77);
+      }
+      return task;
+    };
+  }
   store.dispatchMessage = () => {
+    check(phase === "ready", "preparing_exit_checkpoint_missed");
     const task = store.inbox.findMessage(incoming(meta));
     check(task?.state === "preparing" && task.preparation?.sessionId === sessionId, "missing_preparation");
     check(!task.sessionId && !task.requestFingerprint && !task.dispatchId, "already_dispatched");
@@ -155,12 +198,19 @@ async function recoverInParent(config, meta, childEvidence) {
   const recoverableState = resumeMode && saved?.state === "uncertain" && saved.interruptedAt === "preparing";
   const noDispatchEvidence = saved && ["sessionId", "requestFingerprint", "dispatchId", "replyConfirmed", "replyResultFingerprint",
     "replyIntent", "delivery", "replyInspection", "inspection", "resolution"].every(key => saved[key] === undefined);
-  check((preparedState || recoverableState) && saved.preparation && noDispatchEvidence, "invalid_restart_checkpoint");
-  check(saved.preparation.sessionId === sessionId, "restart_session_changed");
-  checks.preparedFingerprint = hash(saved.preparation.input);
-  checks.preparedShaMatches = checks.preparedFingerprint === saved.preparation.fingerprint
-    && checks.preparedFingerprint === childEvidence.checks.preparedFingerprint;
-  check(checks.preparedShaMatches, "restart_input_changed");
+  check((preparedState || recoverableState) && noDispatchEvidence, "invalid_restart_checkpoint");
+  if (phase === "preparing") {
+    checkPreparingPlan(saved, meta);
+    check(checks.planFingerprint === childEvidence.checks.planFingerprint, "restart_plan_changed");
+    check(checks.preparedFingerprint === childEvidence.checks.preparedFingerprint, "restart_input_changed");
+  } else {
+    check(saved.preparation, "invalid_restart_checkpoint");
+    check(saved.preparation.sessionId === sessionId, "restart_session_changed");
+    checks.preparedFingerprint = hash(saved.preparation.input);
+    checks.preparedShaMatches = checks.preparedFingerprint === saved.preparation.fingerprint
+      && checks.preparedFingerprint === childEvidence.checks.preparedFingerprint;
+    check(checks.preparedShaMatches, "restart_input_changed");
+  }
   let runResult;
   const gateway = new Gateway(store, {
     createSession: forbidden("recovery_create"), buildSessionCreateRequest: forbidden("recovery_build"),
@@ -197,7 +247,8 @@ async function recoverInParent(config, meta, childEvidence) {
     await delay(100);
   }
   check(runResult?.terminal === "idle" && !runResult.authorizationRequired, "run_not_successful");
-  check(counts.runs === 1 && counts.httpMessages === 1 && counts.readinessChecks === 1 && counts.credentialMaintenance === 1, "recovery_count_mismatch");
+  check(counts.runs === 1 && counts.httpMessages === 1 && counts.readinessChecks === 1
+    && counts.credentialMaintenance === (phase === "preparing" ? 0 : 1), "recovery_count_mismatch");
   check(counts.blockedOperations === 0 && counts.creates === 0 && counts.uploads === 0 && counts.configBuilds === 0 && counts.configHooks === 0, "preparation_repeated");
   check(store.getSession(toConversationKey(message, true)) === sessionId, "conversation_session_changed");
   // 运行结束后只读核验完整历史，不补发消息、不压缩、不轮换Session。
@@ -221,7 +272,9 @@ async function recoverInParent(config, meta, childEvidence) {
 
 try {
   check((childMode || resumeMode || process.argv[2] === "--live") && process.argv[3]
-    && process.argv.length === (childMode || resumeMode ? 5 : 4), "usage_expected_live_config_or_resume_config_evidence_dir");
+    && (childMode || resumeMode ? process.argv.length === 5
+      : process.argv.length === 4 || (process.argv.length === 5 && process.argv[4] === "--preparing")),
+    "usage_expected_live_config_optional_preparing_or_resume_config_evidence_dir");
   const configPath = resolve(process.argv[3]);
   evidenceDir = childMode || resumeMode ? resolve(process.argv[4]) : mkdtempSync(join(tmpdir(), "ark-prepared-live-"));
   // 库日志可能含服务端上下文；探针仅输出自己的稳定错误码、计数和SessionID。
@@ -233,17 +286,22 @@ try {
     output(save("failed", { reason: "hard_timeout_no_retry", evidenceDir })); process.exit(1);
   }, childMode ? CHILD_TIMEOUT_MS : (resumeMode ? 0 : CHILD_TIMEOUT_MS) + RECOVERY_TIMEOUT_MS + 30_000);
   if (childMode) {
-    await prepareInChild(config, JSON.parse(readFileSync(join(evidenceDir, "probe.json"), "utf8")));
+    const meta = JSON.parse(readFileSync(join(evidenceDir, "probe.json"), "utf8"));
+    phase = phaseOf(meta);
+    await prepareInChild(config, meta);
   } else {
     const meta = resumeMode ? JSON.parse(readFileSync(join(evidenceDir, "probe.json"), "utf8"))
-      : { id: randomUUID(), nonce: `PREPARED_${randomUUID().replaceAll("-", "")}`, createdAt: Date.now() };
+      : { id: randomUUID(), nonce: `PREPARED_${randomUUID().replaceAll("-", "")}`, createdAt: Date.now(),
+        phase: process.argv[4] === "--preparing" ? "preparing" : "ready" };
+    phase = phaseOf(meta);
     if (!resumeMode) writeFileSync(join(evidenceDir, "probe.json"), JSON.stringify(meta), { mode: 0o600 });
     output(save("started", { evidenceDir, evidenceName }));
     const code = resumeMode ? undefined : await launchChild(configPath);
     let childEvidence;
     try { childEvidence = JSON.parse(readFileSync(join(evidenceDir, "child-evidence.json"), "utf8")); } catch { /* 失败时保留父进程证据。 */ }
     sessionId = safeSessionId(childEvidence?.sessionId);
-    check((resumeMode || code === 77) && childEvidence?.stage === "prepared_before_dispatch" && sessionId, "child_did_not_exit_prepared");
+    check((resumeMode || code === 77) && childEvidence?.stage === (phase === "preparing" ? "preparing_after_session_create" : "prepared_before_dispatch")
+      && (childEvidence.phase === undefined ? phase === "ready" : childEvidence.phase === phase) && sessionId, "child_did_not_exit_prepared");
     check(childEvidence.counts.creates === 1 && childEvidence.counts.httpCreates === 1 && childEvidence.counts.runs === 0
       && childEvidence.counts.httpMessages === 0 && childEvidence.counts.blockedOperations === 0
       && childEvidence.counts.configBuilds === 1 && childEvidence.counts.configHooks === 1

@@ -15,6 +15,7 @@ import type { AttachmentStage, AttachmentStageDetails } from "./attachment-trace
 import { ArkHttpError } from "./ark.ts";
 import { ArkRunError, failureDiagnostic } from "./ark-errors.ts";
 import { isFailureNoticeDelivered } from "./failure-notice.ts";
+import { PreparationRunner, PreparationCheckpointError } from "./preparation-runner.ts";
 
 const MAX_INLINE_TEXT_BYTES = 256 * 1024;
 const MAX_HANDOFF_CHARS = 6_000;
@@ -247,6 +248,15 @@ export class Gateway {
     try {
       this.store.assertSessionAgent(this.conversationKey(task.message), this.options.agentId);
       const binding = this.inboxBinding(task.message);
+      if (task.preparationPlan) {
+        const actual = this.store.getSession(this.conversationKey(task.message));
+        const creationStep = task.preparationPlan.steps.find(step => step.id === "session-create");
+        const created = this.store.sessionCreations.latest(task.binding.scope);
+        const original = task.preparationPlan.target.sessionId
+          || (creationStep?.state === "completed" && typeof creationStep.output === "string" ? creationStep.output : undefined)
+          || (created?.state === "confirmed" && created.message.messageId === task.message.messageId ? created.sessionId : undefined);
+        if (actual !== original) return false;
+      }
       return binding.scope === task.binding.scope && binding.agentId === task.binding.agentId && binding.configFingerprint === task.binding.configFingerprint
         && (!(task.sessionId || task.preparation?.sessionId)
           || this.store.getSession(this.conversationKey(task.message)) === (task.sessionId || task.preparation?.sessionId));
@@ -289,8 +299,10 @@ export class Gateway {
     const operation = Promise.resolve().then(async () => {
       this.blockInboxScope(task.binding.scope);
       if (task.interruptedAt === "preparing" && !task.preparation) {
-        // 只核实已经发出的资源创建，不重跑尚未冻结的群历史、附件准备或开发者hook。
+        if (!this.recoveryBindingMatches(task)) return;
         await this.recoverSessionCreation(task.message, this.conversationKey(task.message));
+        if (task.preparationPlan) await this.resumePreparedMessage(task);
+        // 旧记录没有计划时只核查资源，不能补造曾经观察过的上下文。
         return;
       }
       if (task.interruptedAt === "preparing" && task.preparation && !task.sessionId && !task.requestFingerprint && !task.dispatchId) {
@@ -339,22 +351,38 @@ export class Gateway {
   }
 
   private async resumePreparedMessage(task: InboxTask): Promise<void> {
-    if (!this.ark.inspectSessionReadiness || !task.preparation || !this.recoveryBindingMatches(task)) return;
+    if ((!task.preparation && !task.preparationPlan) || !this.recoveryBindingMatches(task)) return;
+    if (task.preparationPlan?.steps.some(step => step.state === "pending" && !["attachment", "mount", "creation"].includes(step.kind))) return;
+    if (task.preparationPlan && !this.options.sessionConfigurationRevision) {
+      const completed = (id: string) => task.preparationPlan!.steps.some(step => step.id === id && step.state === "completed");
+      const creating = !task.preparationPlan.target.sessionId;
+      if ((this.options.beforeCreateSession && !completed("before-create"))
+        || (task.message.conversationType === "direct" && this.options.beforeDirectTurn && !completed("before-direct"))
+        || (creating && !this.usesBotOnlyIdentity(task.message) && this.options.getUserVaultIds && !completed("user-vaults"))
+        || (creating && (this.options.sessionEnvironment || this.options.buildSessionRequest) && !completed("session-request"))) return;
+    }
+    // 个人授权可能已换代。没有稳定授权检查点时不自动恢复部分准备；ready恢复保持原有凭证维护。
+    if (task.preparationPlan && this.options.dualIdentity && task.message.conversationType === "direct") return;
     // 恢复必须穿过本任务造成的暂停，但仍由同一scope队列串行，不并发修改Session。
     await new Promise<void>((resolve, reject) => this.queue.enqueue(task.binding.scope, async () => {
       let claimed = false;
       try {
         if (!this.recoveryBindingMatches(task) || this.authorizationWaits.get(task.binding.scope)?.size) return;
-        const controller = new AbortController();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const readiness = await Promise.race([
-          this.ark.inspectSessionReadiness!(task.preparation!.sessionId, controller.signal),
-          new Promise<undefined>(yes => { timer = setTimeout(() => { controller.abort(); yes(undefined); }, 5000); })
-        ]).finally(() => { clearTimeout(timer); controller.abort(); });
-        if (readiness?.status !== "idle" || readiness.sessionId !== task.preparation!.sessionId
-          || readiness.agentId !== this.options.agentId || !this.recoveryBindingMatches(task)
-          || this.authorizationWaits.get(task.binding.scope)?.size) return;
-        const current = this.store.claimPreparedMessage(task, this.inboxBinding(task.message));
+        const sessionId = task.preparation?.sessionId || this.store.getSession(this.conversationKey(task.message));
+        if (sessionId && !this.ark.inspectSessionReadiness) return;
+        if (sessionId) {
+          const controller = new AbortController();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const readiness = await Promise.race([
+            this.ark.inspectSessionReadiness!(sessionId, controller.signal),
+            new Promise<undefined>(yes => { timer = setTimeout(() => { controller.abort(); yes(undefined); }, 5000); })
+          ]).finally(() => { clearTimeout(timer); controller.abort(); });
+          if (readiness?.status !== "idle" || readiness.sessionId !== sessionId
+            || readiness.agentId !== this.options.agentId || !this.recoveryBindingMatches(task)
+            || this.authorizationWaits.get(task.binding.scope)?.size) return;
+        }
+        const current = task.preparation ? this.store.claimPreparedMessage(task, this.inboxBinding(task.message))
+          : this.store.claimPreparingMessage(task, this.inboxBinding(task.message));
         claimed = true;
         // 启动批次只等待只读核查与领取，不等待整轮模型执行，其他scope可独立恢复。
         resolve();
@@ -783,43 +811,64 @@ export class Gateway {
       await this.replyText(message, "当前 Agent Session 已完成上下文压缩。");
       return;
     }
+    const reusableSession = !this.usesIsolatedSession(message);
+    const inboxTask = inboxId ? this.store.inbox.findTask(inboxId) : undefined;
+    const preparing = inboxTask && !prepared && !continuation && !handoff && !message.text.trim().startsWith("/")
+      ? new PreparationRunner(this.store, inboxTask, { reusable: reusableSession,
+        ...(this.store.getSession(key) ? { sessionId: this.store.getSession(key) } : {}) }) : undefined;
+    if (preparing) await preparing.step("callbacks", "snapshot", {
+      beforeCreate: Boolean(this.options.beforeCreateSession), beforeDirect: Boolean(this.options.beforeDirectTurn),
+      userVaults: Boolean(this.options.getUserVaultIds), environment: Boolean(this.options.sessionEnvironment),
+      request: Boolean(this.options.buildSessionRequest), revision: this.options.sessionConfigurationRevision ?? null
+    }, () => null);
     const notices: string[] = prepared ? [...prepared.notices] : [];
     let observedHistory: ChannelHistoryMessage[] = [];
     let recentHistoryPromise: Promise<ChannelHistoryMessage[]> | undefined;
-    if (!prepared && this.options.loadRecentHistory && message.conversationType === "group") {
-      const fallbackHistory = this.mergeHistory(this.recentAuditHistory(message), this.store.cachedHistory(message), notices);
-      try {
-        recentHistoryPromise = this.options.loadRecentHistory(message).then(history => {
-          notices.push(...((history as ChannelHistoryMessage[] & { notices?: string[] }).notices || []));
-          history = history.filter(item => item.messageId !== message.messageId && item.createTime <= message.createTime);
-          observedHistory = history;
-          this.store.cacheHistory(message, history);
-          return this.mergeHistory(fallbackHistory, history, notices);
-        }).catch(error => {
-          notices.push("群聊历史暂时读取失败，本次仅使用本机已接收的记录，可能缺少离线期间的消息。");
+    const loadContext = async () => {
+      if (!prepared && this.options.loadRecentHistory && message.conversationType === "group") {
+        const fallbackHistory = this.mergeHistory(this.recentAuditHistory(message), this.store.cachedHistory(message), notices);
+        try {
+          recentHistoryPromise = this.options.loadRecentHistory(message).then(history => {
+            notices.push(...((history as ChannelHistoryMessage[] & { notices?: string[] }).notices || []));
+            history = history.filter(item => item.messageId !== message.messageId && item.createTime <= message.createTime);
+            observedHistory = history;
+            this.store.cacheHistory(message, history);
+            return this.mergeHistory(fallbackHistory, history, notices);
+          }).catch(error => {
+            notices.push("群聊历史暂时读取失败，本次仅使用本机已接收的记录，可能缺少离线期间的消息。");
+            console.warn("读取近期群聊上下文失败，将使用 Gateway 本地审计上下文：", error instanceof Error ? error.message : error);
+            return fallbackHistory;
+          });
+        } catch (error) {
+          notices.push("群聊历史暂时读取失败，本次仅使用本机已接收的记录，可能不完整。");
           console.warn("读取近期群聊上下文失败，将使用 Gateway 本地审计上下文：", error instanceof Error ? error.message : error);
-          return fallbackHistory;
-        });
-      } catch (error) {
-        notices.push("群聊历史暂时读取失败，本次仅使用本机已接收的记录，可能不完整。");
-        console.warn("读取近期群聊上下文失败，将使用 Gateway 本地审计上下文：", error instanceof Error ? error.message : error);
-        recentHistoryPromise = Promise.resolve(fallbackHistory);
+          recentHistoryPromise = Promise.resolve(fallbackHistory);
+        }
       }
+      const history = await recentHistoryPromise;
+      const reply = continuation || prepared ? undefined : await resolveReplyContext(message, observedHistory,
+          message.parentMessageId ? this.store.cachedMessage(message, message.parentMessageId) : undefined,
+          this.options.readMessage);
+      return { history: history ?? null, reply: reply ?? null, notices: [...notices] };
+    };
+    // 持久化路径先保存读取结果，再做任何准备写入；默认路径保留原有并行读取。
+    const contextPromise = preparing
+      ? Promise.resolve(await preparing.step("context", "observation", { message }, loadContext))
+      : loadContext();
+    if (preparing) notices.splice(0, notices.length, ...(await contextPromise).notices);
+    // 普通轮次与ready恢复仍执行原有凭证维护；部分准备恢复复用完成回执，不重复任意回调。
+    // 内置维护的安全重入与用户授权代次校验，尚不等同于任意开发者hook的可重跑性。
+    if (preparing) {
+      if (this.options.beforeCreateSession) await preparing.step("before-create", "hook", {}, async () => { await this.options.beforeCreateSession!(); return null; });
+      if (message.conversationType === "direct" && this.options.beforeDirectTurn) {
+        await preparing.step("before-direct", "hook", { message }, async () => { await this.options.beforeDirectTurn!(message); return null; });
+      }
+    } else {
+      await this.options.beforeCreateSession?.();
+      if (message.conversationType === "direct") await this.options.beforeDirectTurn?.(message);
     }
-    const replyContextPromise = (async () => {
-      await recentHistoryPromise;
-      if (continuation || prepared) return undefined;
-      return resolveReplyContext(message, observedHistory,
-        message.parentMessageId ? this.store.cachedMessage(message, message.parentMessageId) : undefined,
-        this.options.readMessage);
-    })();
-    // 兼容旧命名：这个入口历来在每轮执行，CLI用它刷新Bot凭证，恢复时也不能跳过。
-    // 资源配置的buildSessionRequest仅在真正创建Session时执行。
-    await this.options.beforeCreateSession?.();
-    if (message.conversationType === "direct") await this.options.beforeDirectTurn?.(message);
     const startedAt = Date.now();
-    const reusableSession = !this.usesIsolatedSession(message);
-    let sessionId = prepared?.sessionId || (reusableSession ? this.store.getSession(key)
+    let sessionId = prepared?.sessionId || (preparing ? preparing.target.sessionId : reusableSession ? this.store.getSession(key)
       : recoveredCreation?.message.messageId === message.messageId ? recoveredCreation.sessionId : undefined);
     if (sessionId) this.store.assertSessionAgent(key, this.options.agentId);
     if (sessionId) {
@@ -861,19 +910,20 @@ export class Gateway {
           for (const [index, attachment] of message.resources.entries()) {
             const name = safeFilename(attachment.name, index);
             try {
-              const prepared = await this.prepareAttachment(message, attachment, index, budget);
+              const { value: prepared, wasMounted } = await this.plannedAttachment(preparing, `current:${index}`, sessionId, message, attachment, index, budget);
               if (prepared.inlineText !== undefined) {
                 inlineTexts.push({ name, text: prepared.inlineText });
                 attachmentKeys.push(prepared.key);
                 inlineDeliveryKeys.add(prepared.key);
                 continue;
               }
-              if (!sessionId || !this.store.isAttachmentMounted(sessionId, prepared.key)) {
+              if (!sessionId || !wasMounted) {
                 initialResources.push({ type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath });
                 attachmentKeys.push(prepared.key);
               }
               mounted.push(sessionVisibleFilePath(prepared.mountPath));
             } catch (error) {
+              if (error instanceof PreparationCheckpointError) throw error;
               notices.push(`附件「${name}」未能读取：${attachmentError(error)}`);
             }
           }
@@ -894,38 +944,57 @@ export class Gateway {
         if (!sessionId) {
           // 数字员工的群聊 Session 是多人共享状态，绝不能挂载某一位成员的用户 Vault。
           // 用户凭证只允许进入按发送者隔离的单聊 Session。
-          const extraVaultIds = this.usesBotOnlyIdentity(message)
-            ? []
-            : await this.options.getUserVaultIds?.(message) || [];
+          const getVaults = async () => this.usesBotOnlyIdentity(message) ? [] : await this.options.getUserVaultIds?.(message) || [];
+          const extraVaultIds = preparing ? await preparing.step("user-vaults", "hook", { message }, getVaults) : await getVaults();
           const vaultIds = [...new Set([this.options.vaultId, ...extraVaultIds])];
-          const request = await this.buildSessionCreateRequest(
-            message,
-            vaultIds,
-            initialResources
-          );
-          const intent = this.store.beginSessionCreation({ message, key, request, reusable: reusableSession,
-            agentId: this.options.agentId, configFingerprint: this.configurationFingerprint(message),
-            mounts: attachmentKeys.filter(key => this.store.getAttachment(key)?.fileId)
-              .map(key => ({ key, details: this.store.getAttachment(key)! })) });
-          // 非幂等请求只发一次。网络错误或本地确认失败均保留pending，后续先查原资源。
-          try { sessionId = await this.ark.createSession(intent.request); }
-          catch (error) {
-            if (error instanceof ArkHttpError && error.status === 400 && error.code === "InvalidParameter") {
-              this.store.rejectSessionCreation(intent, failureDiagnostic(error));
-            } else for (const mount of intent.mounts) if (mount.intentId) {
-              this.store.attachmentTrace.annotatePendingFailure(mount.intentId, failureDiagnostic(error));
+          const build = () => this.buildSessionCreateRequest(message, vaultIds, initialResources);
+          const request = preparing ? await preparing.step("session-request", "hook", { message, vaultIds, initialResources }, build) : await build();
+          const create = async (recovering: boolean) => {
+            if (recovering) {
+              const previous = this.store.sessionCreations.latest(this.store.sessionCreationScope(key, reusableSession, message.messageId));
+              if (!previous || previous.message.messageId !== message.messageId || previous.state !== "confirmed"
+                || !previous.sessionId || previous.requestFingerprint !== configFingerprint(request)
+                || this.store.getSession(key) !== previous.sessionId) {
+                throw new PreparationCheckpointError("原Session创建尚未确认，不能重复提交创建请求");
+              }
+              return previous.sessionId;
             }
-            throw error;
-          }
-          this.store.confirmSessionCreation(intent, sessionId);
+            const intent = this.store.beginSessionCreation({ message, key, request, reusable: reusableSession,
+              agentId: this.options.agentId, configFingerprint: this.configurationFingerprint(message),
+              mounts: attachmentKeys.filter(key => this.store.getAttachment(key)?.fileId)
+                .map(key => ({ key, details: this.store.getAttachment(key)! })) });
+            // 非幂等请求只发一次。网络错误或本地确认失败均保留pending，后续先查原资源。
+            let createdSessionId: string;
+            try { createdSessionId = await this.ark.createSession(intent.request); }
+            catch (error) {
+              if (error instanceof ArkHttpError && error.status === 400 && error.code === "InvalidParameter") {
+                this.store.rejectSessionCreation(intent, failureDiagnostic(error));
+              } else for (const mount of intent.mounts) if (mount.intentId) {
+                this.store.attachmentTrace.annotatePendingFailure(mount.intentId, failureDiagnostic(error));
+              }
+              throw error;
+            }
+            this.store.confirmSessionCreation(intent, createdSessionId);
+            return createdSessionId;
+          };
+          sessionId = preparing ? await preparing.step("session-create", "creation", { request }, create) : await create(false);
         } else if (initialResources.length) {
           for (const resource of initialResources) {
             const resourceKey = attachmentKeys.find(key => this.store.getAttachment(key)?.fileId === resource.file_id && this.store.getAttachment(key)?.mountPath === resource.mount_path);
             try {
               if (!resourceKey) throw new Error("附件挂载缺少来源记录");
-              await this.mountAttachment(message, resourceKey, sessionId, resource, this.store.getAttachment(resourceKey));
+              const mount = async (recovering: boolean) => {
+                if (recovering && !this.store.attachmentTrace.latestMount(message, resourceKey, sessionId!)) {
+                  throw new PreparationCheckpointError("原附件挂载没有可核查意图，未重新提交");
+                }
+                try { await this.mountAttachment(message, resourceKey, sessionId!, resource, this.store.getAttachment(resourceKey)); return { error: null }; }
+                catch (error) { return { error: attachmentError(error) }; }
+              };
+              const mounted = preparing ? await preparing.step(`current-mount:${resourceKey}`, "mount", { sessionId, resource }, mount) : await mount(false);
+              if (mounted.error) throw new Error(mounted.error);
             }
             catch (error) {
+              if (error instanceof PreparationCheckpointError) throw error;
               const failedKey = attachmentKeys.find(key => this.store.getAttachment(key)?.fileId === resource.file_id);
               const file = failedKey ? this.store.getAttachment(failedKey) : undefined;
               if (failedKey) attachmentKeys.splice(attachmentKeys.indexOf(failedKey), 1);
@@ -939,30 +1008,35 @@ export class Gateway {
         }
 
         let contextHistory: ChannelHistoryMessage[] = [];
-        if (recentHistoryPromise) {
-          let history = await recentHistoryPromise;
-          if (message.conversationType === "group" && this.options.sharedGroupSessions) {
-            const cursor = this.store.getConversationContextCursor(key, sessionId);
-            history = history.filter(item => {
-              if (this.store.isOwnSessionReply(message, sessionId, item.messageId)) return false;
-              const previous = this.store.contextFingerprint(sessionId, item.messageId);
-              if (previous?.startsWith("trigger:")) return (item.updateTime || 0) > Number(previous.slice("trigger:".length));
-              if (previous !== undefined) return previous !== historyFingerprint(item);
-              return cursor === undefined || item.createTime > cursor || (item.updateTime || 0) > cursor;
-            });
-          }
-          for (const item of history) contextReceipts.push({ id: item.messageId, fingerprint: historyFingerprint(item) });
-          history = await this.mountHistoryAttachments(sessionId, message, history, budget, notices, historicalInlineKeys);
+        const context = await contextPromise;
+        if (context.history) {
+          const selectHistory = () => {
+            let history = context.history!;
+            if (message.conversationType === "group" && this.options.sharedGroupSessions) {
+              const cursor = this.store.getConversationContextCursor(key, sessionId);
+              history = history.filter(item => {
+                if (this.store.isOwnSessionReply(message, sessionId, item.messageId)) return false;
+                const previous = this.store.contextFingerprint(sessionId, item.messageId);
+                if (previous?.startsWith("trigger:")) return (item.updateTime || 0) > Number(previous.slice("trigger:".length));
+                if (previous !== undefined) return previous !== historyFingerprint(item);
+                return cursor === undefined || item.createTime > cursor || (item.updateTime || 0) > cursor;
+              });
+            }
+            return { history, receipts: history.map(item => ({ id: item.messageId, fingerprint: historyFingerprint(item) })) };
+          };
+          const selection = preparing ? await preparing.step("history-filter", "snapshot", { sessionId, history: context.history }, selectHistory) : selectHistory();
+          contextReceipts.push(...selection.receipts);
+          let history = await this.mountHistoryAttachments(sessionId, message, selection.history, budget, notices, historicalInlineKeys, preparing, "history");
           for (const item of history) if (item.attachmentPending) {
             const index = contextReceipts.findIndex(receipt => receipt.id === item.messageId);
             if (index >= 0) contextReceipts[index].fingerprint += ":pending";
           }
           contextHistory = history;
         }
-        let replyContext = await replyContextPromise;
+        let replyContext = context.reply ?? undefined;
         if (replyContext?.message) {
           const mountedQuote = contextHistory.find(item => item.messageId === replyContext!.messageId)
-            || (await this.mountHistoryAttachments(sessionId, message, [replyContext.message], budget, notices, historicalInlineKeys))[0];
+            || (await this.mountHistoryAttachments(sessionId, message, [replyContext.message], budget, notices, historicalInlineKeys, preparing, "reply"))[0];
           replyContext = { ...replyContext, message: mountedQuote };
         }
         const contextTurn = buildConversationTurn(message, contextHistory, input, replyContext);
@@ -974,7 +1048,8 @@ export class Gateway {
         for (const receipt of contextReceipts) if (!contextTurn.deliveredIds.has(receipt.id)) receipt.fingerprint += ":partial";
         const restored: Array<{ name: string; text: string }> = [];
         let restoredBytes = budget.inlineBytes;
-        for (const source of this.store.pendingInlineSources(sessionId)) {
+        const restoreSources = preparing ? await preparing.step("inline-restore", "snapshot", { sessionId }, () => this.store.pendingInlineSources(sessionId)) : this.store.pendingInlineSources(sessionId);
+        for (const source of restoreSources) {
           if (inlineDeliveryKeys.has(source.key)) continue;
           if (restoredBytes + source.bytes > MAX_INLINE_TEXT_BYTES) {
             notices.push(`附件「${source.name}」原文因单轮 256 KB 限制未恢复；若需精确引用，请重新发送该文件。`);
@@ -1005,6 +1080,13 @@ export class Gateway {
       }
       // 过程事件仍由 ArkClient 消费，但不传 onProgress，避免把 tool_use/tool_result
       // 转成“执行进度：xxx”消息刷屏。
+      if (preparing) {
+        const current = this.store.inbox.findTask(inboxId!);
+        if (!current || current.state !== "preparing" || !this.recoveryBindingMatches(current)
+          || this.authorizationWaits.get(current.binding.scope)?.size) {
+          throw new PreparationCheckpointError("准备期间Session或授权状态已变化，未派发任务");
+        }
+      }
       let dispatchId: string | undefined;
       if (inboxId) dispatchId = this.store.dispatchMessage(inboxId, sessionId, createHash("sha256").update(input).digest("hex")).dispatchId;
       else this.store.touchEvent(message, true);
@@ -1304,25 +1386,35 @@ export class Gateway {
     history: ChannelHistoryMessage[],
     budget: { bytes: number; inlineBytes: number },
     notices: string[],
-    inlineKeys: Map<string, string[]>
+    inlineKeys: Map<string, string[]>,
+    preparing?: PreparationRunner,
+    prefix = "history"
   ): Promise<ChannelHistoryMessage[]> {
     const candidates = history.flatMap(item => (item.resources || []).map(resource => ({ item, resource })));
     if (!candidates.length) return history;
-    const pending = candidates.filter(({ item, resource }) => {
-      const key = attachmentKey({ ...trigger, messageId: item.messageId }, resource.id);
-      return !this.store.isAttachmentMounted(sessionId, key) || this.store.getAttachment(key)?.inlineText !== undefined;
-    });
-    const selected = new Set(pending.slice(-MAX_HISTORY_ATTACHMENTS).map(({ item, resource }) => `${item.messageId}\0${resource.id}`));
+    const select = () => {
+      const pending = candidates.filter(({ item, resource }) => {
+        const key = attachmentKey({ ...trigger, messageId: item.messageId }, resource.id);
+        return !this.store.isAttachmentMounted(sessionId, key) || this.store.getAttachment(key)?.inlineText !== undefined;
+      });
+      return {
+        selected: pending.slice(-MAX_HISTORY_ATTACHMENTS).map(({ item, resource }) => `${item.messageId}\0${resource.id}`),
+        mounted: candidates.map(({ item, resource }) => {
+          const key = attachmentKey({ ...trigger, messageId: item.messageId }, resource.id), cached = this.store.getAttachment(key);
+          return this.store.isAttachmentMounted(sessionId, key) && cached?.fileId ? sessionVisibleFilePath(cached.mountPath) : null;
+        })
+    };
+    };
+    const selection = preparing ? await preparing.step(`${prefix}:selection`, "snapshot", { sessionId, history }, select) : select();
+    const selected = new Set(selection.selected);
     const updated = new Map<string, ChannelHistoryMessage>();
     let index = 0;
 
-    for (const { item, resource } of candidates) {
+    for (const [candidateIndex, { item, resource }] of candidates.entries()) {
       const key = `${item.messageId}\0${resource.id}`;
-      const storedKey = attachmentKey({ ...trigger, messageId: item.messageId }, resource.id);
-      const cached = this.store.getAttachment(storedKey);
-      if (this.store.isAttachmentMounted(sessionId, storedKey) && cached?.fileId) {
+      if (selection.mounted[candidateIndex]) {
         const current = updated.get(item.messageId) || item;
-        updated.set(item.messageId, { ...current, text: `${current.text}\n[该附件已挂载到：${sessionVisibleFilePath(cached.mountPath)}]` });
+        updated.set(item.messageId, { ...current, text: `${current.text}\n[该附件已挂载到：${selection.mounted[candidateIndex]}]` });
         continue;
       }
       if (!selected.has(key)) {
@@ -1344,7 +1436,7 @@ export class Gateway {
           mentionedBot: false,
           createTime: item.createTime
         };
-        const prepared = await this.prepareAttachment(sourceMessage, resource, index, budget);
+        const { value: prepared } = await this.plannedAttachment(preparing, `${prefix}:attachment:${candidateIndex}`, sessionId, sourceMessage, resource, index, budget);
         if (prepared.inlineText !== undefined) {
           // 旧版本的inline挂载标记可能写在派发前；宁可重新提供原文，不能据此省略。
           inlineKeys.set(item.messageId, [...(inlineKeys.get(item.messageId) || []), prepared.key]);
@@ -1354,15 +1446,26 @@ export class Gateway {
           });
           continue;
         }
-        if (!this.store.isAttachmentMounted(sessionId, prepared.key)) {
-          await this.mountAttachment(sourceMessage, prepared.key, sessionId, { type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath }, prepared);
-          this.store.markAttachmentMounted(sessionId, prepared.key);
-        }
+        const mount = async (recovering: boolean) => {
+          if (recovering && !this.store.attachmentTrace.latestMount(sourceMessage, prepared.key, sessionId)) {
+            throw new PreparationCheckpointError("原历史附件挂载缺少可核查意图，未重新提交");
+          }
+          try {
+            if (!this.store.isAttachmentMounted(sessionId, prepared.key)) {
+              await this.mountAttachment(sourceMessage, prepared.key, sessionId, { type: "file", file_id: prepared.fileId, mount_path: prepared.mountPath }, prepared);
+              this.store.markAttachmentMounted(sessionId, prepared.key);
+            }
+            return { error: null };
+          } catch (error) { return { error: attachmentError(error) }; }
+        };
+        const mounted = preparing ? await preparing.step(`${prefix}:mount:${candidateIndex}`, "mount", { sessionId, prepared }, mount) : await mount(false);
+        if (mounted.error) throw new Error(mounted.error);
         updated.set(item.messageId, {
           ...current,
           text: `${current.text}\n[该附件已挂载到：${sessionVisibleFilePath(prepared.mountPath)}]`
         });
       } catch (error) {
+        if (error instanceof PreparationCheckpointError) throw error;
         const reason = attachmentError(error);
         notices.push(`附件「${name}」未能读取：${reason}`);
         console.warn(`挂载历史群聊附件 ${name} 失败：`, reason);
@@ -1371,6 +1474,27 @@ export class Gateway {
     }
 
     return history.map(item => updated.get(item.messageId) || item);
+  }
+
+  private async plannedAttachment(preparing: PreparationRunner | undefined, id: string, sessionId: string | undefined,
+    message: IncomingMessage, resource: IncomingMessage["resources"][number], index: number, budget: { bytes: number; inlineBytes: number }) {
+    const key = attachmentKey(message, resource.id);
+    if (!preparing) return { value: await this.prepareAttachment(message, resource, index, budget),
+      wasMounted: Boolean(sessionId && this.store.isAttachmentMounted(sessionId, key)) };
+    const perform = async (recovering: boolean) => {
+      // 没有持久化字节时不把download回执冒充文件缓存；缺少上传意图便暂停。
+      if (recovering && !this.store.getAttachment(key) && !this.store.attachmentTrace.latestUpload(message, key)) {
+        throw new PreparationCheckpointError("原附件准备缺少可复用文件或上传意图，未重新下载或上传");
+      }
+      const nextBudget = { ...budget };
+      const wasMounted = Boolean(sessionId && this.store.isAttachmentMounted(sessionId, key));
+      try { return { value: await this.prepareAttachment(message, resource, index, nextBudget), budget: nextBudget, wasMounted, error: null }; }
+      catch (error) { return { value: null, budget: nextBudget, wasMounted, error: attachmentError(error) }; }
+    };
+    const outcome = await preparing.step(id, "attachment", { sessionId: sessionId ?? null, message, resource, index, budget }, perform);
+    Object.assign(budget, outcome.budget);
+    if (!outcome.value) throw new Error(outcome.error || "附件准备未完成");
+    return { value: outcome.value, wasMounted: outcome.wasMounted };
   }
 
   private mergeHistory(cached: ChannelHistoryMessage[], remote: ChannelHistoryMessage[], notices: string[] = []): ChannelHistoryMessage[] {
@@ -1615,6 +1739,8 @@ function historyFingerprint(message: ChannelHistoryMessage): string {
 
 function attachmentError(error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
+  if (reason === "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown"
+    || reason === "文件大小超过本轮剩余额度，请缩小文件或分批处理") return reason;
   if (reason === "附件挂载结果待核实，未重复提交挂载请求") return reason;
   if (reason === "附件上传结果待核实，未重复提交上传请求") return reason;
   if (/file type not supported/i.test(reason)) return "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown";

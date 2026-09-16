@@ -284,6 +284,36 @@ Session升级协议层增量（2026-09-16，本地基线34ecfa5）：上一轮�
 
 ## 验收编号与证据登记
 
+### 准备过程恢复增量（2026-09-17）
+
+## Stage P1: 冻结准备步骤
+**Goal**: 在实验持久队列中加密保存目标 Session、历史/引用、附件选择及步骤结果；旧任务不补造证据。
+**Success Criteria**: revision/owner/planId CAS；已完成输出不可替换；任意 hook 结果未知时冻结。
+**Tests**: 密文重开、旧版本兼容、错误绑定、过期回调、FIFO、日志大小边界。
+**Status**: Complete
+
+## Stage P2: 原任务恢复
+**Goal**: 重启后仅继续原任务未完成准备，复用已确认上传/挂载/创建，不重取已冻结历史。
+**Success Criteria**: 原 inboxId、原文件范围、原预算；未知写只读核查；ready 后沿已有派发逻辑。
+**Tests**: 实际子进程在历史、hook、上传、部分历史附件、ready 前退出；父进程不发送新消息。
+**Status**: Complete
+
+## Stage P3: 回归与证据
+**Goal**: 验证默认路径无额外调用，完整本地回归并记录未覆盖的真实场景。
+**Success Criteria**: 全测试、check、build、diff 通过；开发机保持稳定版，不默认启用实验队列。
+**Tests**: 全量测试与正常路径调用数/耗时对照。
+**Status**: Complete
+
+本增量结果：v3加密准备计划保存原目标Session、历史/引用观察、历史筛选和附件入选、逐项预算/结果、hook输出与最终创建请求；ready后删除中间计划。每步owner/revision/planId CAS、256步/单输出2MiB/计划8MiB限制，旧记录只兼容读取、不补造证据。completed跳过操作，pending上传/挂载/创建仅凭原journal恢复；pending观察/任意hook/本地选择结果未保存则冻结。下载无缓存且无upload意图暂停，不以Hash代替字节。未执行自定义hook缺少revision不重入，partial dualIdentity单聊尚无授权代次证明，保守暂停；ready恢复的每轮凭证维护不变。
+
+测试发现并修复三处边界：附件提示重复脱敏丢失超限说明；领取后新授权暂停仍可能派发；创建完成但映射被清除后仍向旧Session准备文件。新增95项，最终完整1220/1220通过、零失败/取消/跳过（10947.635083ms），check（语法）、build、diff检查通过。真实子进程仅恢复原Inbox，不用新消息替代：历史/引用保持旧快照、9文件只沿用原8文件选择、40MiB与256KiB预算不漂移、unknown上传仅GET核查、无下载缓存暂停、hook未知/配置/Session变更拒绝。WebUI原reconcile仍只允许已派发核查，未隐式扩大管理按钮权限。
+
+真实MA：scripts/probe-prepared-recovery.mjs新增--preparing（旧ready保持），创建1个无Vault Session后在session-create步骤确认、ready尚不存在时exit77。Session sesn-20260916165406-vl6sh，child创建1/模型0；parent核查1/模型POST1，创建、历史、资源hook、上传均0，原计划/input Hash匹配，nonce回复与原生事件一致。总9408ms（含子进程），0工具/0compact命令/0compact事件/0Session错误；未连接飞书。证据在docs/test-results/preparation-plan-2026-09-17.json，不把nonce回显当作真实飞书文件/OAuth完整验收。
+
+性能：默认路径200组普通文本与双4.5MiB附件，首次与全量并行的结果保留；独立复跑文本P95 0.429→0.437ms、文件7.675→8.797ms，文件P50 6.239→6.247ms，尾部差异尚未定位。均衡分段128组，durable终态落盘配对中位增加约1.3ms，主要在Store方法（加密/序列化/落盘合计）。所有组调用数一致，额外inspect=0。没有通过减少持久性来掩盖开销，也不宣称整体性能验收完成。
+
+继续保持Stage1–5完整范围：缺失下载内容/未知回调人工处理、稳定授权代次与维护hook安全重入、CLI实验队列启用、真实飞书卡片/OAuth、Session升级网关闭环、Memory/TOS组合、客户原PDF、受控续办与回退演练尚未完成。开发机保持稳定npm0.2.9，未部署/发布；本轮有开发与真实验证进展，不属于阻塞轮。
+
 - C01-C06：引用理解、窗口外定向获取、撤回/权限、Thread、注入防护、多人身份（待验证）。
 - S01-S05：无配置兼容、Memory/TOS挂载、合并资源、身份冲突拒绝、配置变化不重建（待验证）。
 - P01-P05：同样本防重、重启、无消息、串行压缩、失败不轮换（待验证）。

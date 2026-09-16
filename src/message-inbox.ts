@@ -4,6 +4,8 @@ import type { ChannelMessage, ReplyDeliveryEvent, ReplyObservation } from "./cha
 import { advanceReplyDelivery, replyContentFingerprint, replyInspectionQuery, replyProofMatches, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
 import type { CredentialStateStore } from "./credential-state.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
+import { createPreparationPlan, startPreparationStep, finishPreparationStep, preparationPlansEqual, validatePreparationPlan,
+  type PreparationJson, type PreparationPlan, type PreparationStepInput, type PreparationTarget } from "./preparation-plan.ts";
 
 export type InboxState = "queued" | "preparing" | "dispatched" | "awaiting_authorization" | "completed" | "failed" | "uncertain";
 export type InboxBinding = { scope: string; agentId: string; configFingerprint: string };
@@ -17,6 +19,7 @@ export type InboxTask = {
   message: ChannelMessage; binding: InboxBinding; sessionId?: string; requestFingerprint?: string;
   interruptedAt?: "preparing" | "dispatched";
   preparation?: InboxPreparation;
+  preparationPlan?: PreparationPlan;
   replyConfirmed?: true;
   replyResultFingerprint?: string;
   dispatchId?: string;
@@ -29,7 +32,7 @@ export type InboxTask = {
 type Row = Record<string, unknown>;
 const states = new Set<InboxState>(["queued", "preparing", "dispatched", "awaiting_authorization", "completed", "failed", "uncertain"]);
 
-// 接收日志与业务执行分离。只有queued或完整准备且未派发的检查点可领取，其他preparing不得重跑。
+// 接收日志与业务执行分离。准备计划只保存进度，pending步骤能否恢复由Gateway按外部回执判断。
 export class MessageInbox {
   private db: DatabaseSync;
   private credentials: CredentialStateStore;
@@ -111,7 +114,54 @@ export class MessageInbox {
       if (JSON.stringify(task.preparation) !== JSON.stringify(preparation)) throw new Error("已保存的准备检查点不能被替换");
       return task;
     }
-    return this.save(task, { ...task, preparation: structuredClone(preparation) });
+    return this.save(task, { ...task, preparation: structuredClone(preparation), preparationPlan: undefined });
+  }
+
+  beginPreparationPlan(expected: InboxTask, target: PreparationTarget): InboxTask {
+    return this.transaction(() => {
+      const task = this.expectedPreparing(expected), plan = createPreparationPlan(target);
+      if (task.preparationPlan) {
+        if (!preparationPlansEqual(task.preparationPlan, { ...task.preparationPlan, target: plan.target })) throw new Error("准备计划目标绑定不能被替换");
+        return task;
+      }
+      return this.save(task, { ...task, preparationPlan: plan });
+    });
+  }
+
+  beginPreparationStep(expected: InboxTask, planId: string, input: PreparationStepInput): InboxTask {
+    return this.transaction(() => {
+      const task = this.expectedPreparing(expected, planId);
+      const plan = startPreparationStep(task.preparationPlan!, input);
+      return plan === task.preparationPlan ? task : this.save(task, { ...task, preparationPlan: plan });
+    });
+  }
+
+  completePreparationStep(expected: InboxTask, planId: string, id: string, output: PreparationJson): InboxTask {
+    return this.transaction(() => {
+      const task = this.expectedPreparing(expected, planId);
+      const plan = finishPreparationStep(task.preparationPlan!, id, output);
+      return plan === task.preparationPlan ? task : this.save(task, { ...task, preparationPlan: plan });
+    });
+  }
+
+  claimPreparationPlan(expected: InboxTask, expectedBinding: InboxBinding): InboxTask {
+    const owner = this.runtimeOwner();
+    return this.transaction(() => {
+      const task = this.expectedUncertain(expected);
+      if (expected.state !== "uncertain" || expected.interruptedAt !== "preparing" || task.interruptedAt !== "preparing"
+        || task.owner !== expected.owner || !task.preparationPlan || task.preparation || expected.preparation
+        || hasDispatchEvidence(task) || hasDispatchEvidence(expected)
+        || task.message.text.trim().startsWith("/") || !preparationPlansEqual(task.preparationPlan, expected.preparationPlan)) {
+        throw new Error("任务缺少可领取的未派发准备计划");
+      }
+      if (!expectedBinding || task.binding.scope !== expectedBinding.scope || task.binding.agentId !== expectedBinding.agentId
+        || task.binding.configFingerprint !== expectedBinding.configFingerprint) throw new Error("准备计划配置绑定已变化");
+      const blocker = this.db.prepare(`SELECT 1 FROM gateway_message_inbox WHERE channel_type=? AND installation_id=? AND scope=?
+        AND id<>? AND (state IN ('preparing', 'dispatched', 'uncertain', 'awaiting_authorization') OR (state='queued' AND sequence<?)) LIMIT 1`)
+        .get(task.message.channelType, task.message.installationId, task.binding.scope, task.id, task.sequence);
+      if (blocker) throw new Error("此会话前序任务尚未完成，不能领取准备计划");
+      return this.save(task, { ...task, state: "preparing", owner, interruptedAt: undefined });
+    });
   }
 
   claimPreparation(expected: InboxTask, expectedBinding: InboxBinding): InboxTask {
@@ -136,7 +186,7 @@ export class MessageInbox {
   transitionAuthorization(id: string, state: "preparing" | "failed"): InboxTask {
     const owner = this.runtimeOwner(), task = this.get(id);
     if (!task || task.state !== "awaiting_authorization") throw new Error("任务不在授权等待状态");
-    return this.save(task, { ...task, owner, state, preparation: undefined });
+    return this.save(task, { ...task, owner, state, preparation: undefined, preparationPlan: undefined });
   }
 
   dispatched(id: string, sessionId: string, requestFingerprint: string): InboxTask {
@@ -145,7 +195,7 @@ export class MessageInbox {
     if (task.preparation && (task.preparation.sessionId !== sessionId || task.preparation.fingerprint !== requestFingerprint)) {
       throw new Error("派发的Session或输入指纹与准备检查点不一致");
     }
-    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, preparation: undefined, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, replyInspection: undefined, inspection: undefined });
+    return this.save(task, { ...task, state: "dispatched", sessionId, requestFingerprint, preparation: undefined, preparationPlan: undefined, dispatchId: randomUUID(), replyConfirmed: undefined, replyResultFingerprint: undefined, replyIntent: undefined, delivery: undefined, replyInspection: undefined, inspection: undefined });
   }
 
   planReply(id: string, result: RunResult, text: string, dispatchId?: string): InboxTask {
@@ -269,7 +319,7 @@ export class MessageInbox {
     // 准备阶段也可能创建过Session或上传文件；不能因尚未调用模型就假定无副作用。
     const uncertain = outcome === "failed";
     return this.save(task, { ...task, state: uncertain ? "uncertain" : outcome,
-      ...(!uncertain ? { preparation: undefined } : {}),
+      ...(!uncertain ? { preparation: undefined, preparationPlan: undefined } : {}),
       ...(uncertain ? { interruptedAt: task.state as "preparing" | "dispatched" } : {}) });
   }
 
@@ -312,8 +362,23 @@ export class MessageInbox {
     return task;
   }
 
+  private expectedPreparing(expected: InboxTask, planId?: string): InboxTask {
+    const task = this.owned(expected.id);
+    if (task.revision !== expected.revision || task.owner !== expected.owner || task.state !== expected.state
+      || task.binding.scope !== expected.binding.scope || task.binding.agentId !== expected.binding.agentId
+      || task.binding.configFingerprint !== expected.binding.configFingerprint
+      || !preparationPlansEqual(task.preparationPlan, expected.preparationPlan)) throw new Error("准备计划版本、归属或绑定已变化");
+    if (task.state !== "preparing" || task.interruptedAt !== undefined || task.preparation || expected.preparation
+      || hasDispatchEvidence(task) || hasDispatchEvidence(expected)
+      || task.message.text.trim().startsWith("/")) throw new Error("任务状态或派发证据不允许修改准备计划");
+    if (planId !== undefined && (!task.preparationPlan || task.preparationPlan.id !== planId)) throw new Error("准备计划代次已变化");
+    return task;
+  }
+
   private save(previous: InboxTask, update: InboxTask): InboxTask {
-    const task = { ...update, revision: previous.revision + 1 }, secret = this.encode(task);
+    const task = { ...update, revision: previous.revision + 1 };
+    if (task.preparationPlan === undefined) delete task.preparationPlan;
+    const secret = this.encode(task);
     const result = this.db.prepare(`UPDATE gateway_message_inbox SET state=?, owner=?, revision=?,
       session_id=?, request_fingerprint=?, interrupted_at=?, secret=? WHERE id=? AND revision=?`)
       .run(task.state, task.owner, task.revision, task.sessionId ?? null, task.requestFingerprint ?? null,
@@ -333,8 +398,8 @@ export class MessageInbox {
   }
 
   private encode(task: InboxTask): string {
-    const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint,
-      preparation: task.preparation, dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection, resolution: task.resolution };
+    const payload = { version: 3, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint,
+      preparation: task.preparation, preparationPlan: task.preparationPlan, dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection, resolution: task.resolution };
     return this.credentials.sealAuthorization(JSON.stringify(payload), this.context({ ...task,
       eventKey: this.eventKey(task.message), channelType: task.message.channelType, installationId: task.message.installationId }));
   }
@@ -349,12 +414,21 @@ export class MessageInbox {
     const cleartext = this.credentials.openAuthorization(String(row.secret), this.context({ ...metadata,
       eventKey: String(row.event_key), channelType: String(row.channel_type), installationId: String(row.installation_id) }));
     let message: ChannelMessage;
-    let checkpoint: Pick<InboxTask, "preparation" | "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection" | "resolution"> = {};
+    let checkpoint: Pick<InboxTask, "preparation" | "preparationPlan" | "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection" | "resolution"> = {};
     try {
       const payload = JSON.parse(cleartext);
       // 旧密文仅包含ChannelMessage，首次状态更新时升级；不补造旧回复的送达证明。
-      if (payload.version === 2 && payload.message) {
+      if ((payload.version === 2 || payload.version === 3) && payload.message) {
         message = payload.message;
+        if (payload.preparationPlan !== undefined) {
+          validatePreparationPlan(payload.preparationPlan);
+          if (payload.version !== 3 || payload.preparation !== undefined
+            || !((metadata.state === "preparing" && metadata.interruptedAt === undefined)
+              || (metadata.state === "uncertain" && metadata.interruptedAt === "preparing"))
+            || hasDispatchEvidence({ ...payload, ...metadata }) || typeof message.text !== "string" || message.text.trim().startsWith("/")) {
+            throw new Error("invalid preparation plan state");
+          }
+        }
         if (payload.preparation !== undefined) {
           validatePreparation(payload.preparation);
           if (!((metadata.state === "preparing" && metadata.interruptedAt === undefined)
@@ -388,6 +462,7 @@ export class MessageInbox {
             || payload.inspection.observation.result?.authorizationRequired) throw new Error("invalid resolution");
         }
         checkpoint = { ...(payload.preparation ? { preparation: payload.preparation } : {}),
+          ...(payload.preparationPlan ? { preparationPlan: payload.preparationPlan } : {}),
           ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}),
           ...(payload.dispatchId ? { dispatchId: payload.dispatchId } : {}), ...(payload.replyIntent ? { replyIntent: payload.replyIntent } : {}),
           ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.replyInspection ? { replyInspection: payload.replyInspection } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}),
