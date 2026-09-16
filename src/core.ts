@@ -20,6 +20,7 @@ export {
   type IncomingMessage,
   type Reply
 } from "./gateway.ts";
+export type { RecoveryTaskSummary, RecoveryTaskPage } from "./gateway.ts";
 export type {
   ChannelAdapter,
   ChannelCapabilities,

@@ -354,6 +354,18 @@ export class GatewayStore {
     });
   }
 
+  discardInspectedMessage(expected: InboxTask): InboxTask {
+    return this.messageTransaction(() => {
+      const task = this.inbox.discardInspection(expected), message = task.message;
+      this.updateMessageEvent(task, "failed", true, "uncertain");
+      this.addAuditLog({ channelType: message.channelType, installationId: message.installationId,
+        tenantKey: message.tenantId, openId: message.senderId, chatId: message.conversationId, messageId: message.messageId,
+        sessionId: task.sessionId, action: "queue_task_discarded", status: "failed",
+        summary: "本地管理员确认放弃任务；原MA运行已结束，未重跑任务或撤销外部操作", messageCreateTime: message.createTime });
+      return task;
+    });
+  }
+
   recoverMessages(channelType: string, installationId: string): ReturnType<MessageInbox["recover"]> {
     return this.messageTransaction(() => {
       const recovered = this.inbox.recover(channelType, installationId);

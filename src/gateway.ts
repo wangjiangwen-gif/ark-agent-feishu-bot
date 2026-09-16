@@ -31,6 +31,14 @@ export type IncomingMessage = ChannelMessage;
 
 export type Reply = (message: IncomingMessage, outbound: ChannelOutbound, observer?: ReplyDeliveryObserver) => Promise<void>;
 
+export type RecoveryTaskSummary = {
+  id: string; revision: number; sequence: number; state: InboxTask["state"];
+  chatId: string; threadId: string; messageId: string; sessionId?: string;
+  interruptedAt?: InboxTask["interruptedAt"]; runStatus: "unchecked" | RunInspection["status"];
+  deliveryPhase?: string; replyConfirmed: boolean; bindingMatches: boolean;
+};
+export type RecoveryTaskPage = { enabled: boolean; items: RecoveryTaskSummary[]; next?: number };
+
 export class KeyedQueue {
   private scopes = new Map<string, { running: boolean; paused: boolean; tasks: { run: () => Promise<void>; control: boolean }[]; priority: (() => Promise<void>)[] }>();
 
@@ -180,6 +188,64 @@ export class Gateway {
       configFingerprint: this.configurationFingerprint(message) };
   }
 
+  listRecoveryTasks(channelType: string, installationId: string, after = 0): RecoveryTaskPage {
+    if (!this.options.durableQueue) return { enabled: false, items: [] };
+    const page = this.store.inbox.listPending(channelType, installationId, this.options.agentId, after);
+    return { enabled: true, ...(page.next ? { next: page.next } : {}), items: page.tasks.map(task => ({
+      id: task.id, revision: task.revision, sequence: task.sequence, state: task.state,
+      chatId: task.message.conversationId, threadId: task.message.threadId, messageId: task.message.messageId,
+      sessionId: task.sessionId, interruptedAt: task.interruptedAt, runStatus: task.inspection?.observation.status || "unchecked",
+      deliveryPhase: task.delivery?.phase, replyConfirmed: Boolean(task.replyConfirmed), bindingMatches: this.recoveryBindingMatches(task)
+    })) };
+  }
+
+  // 仅供持有本地控制台管理凭证的调用方使用；不暴露为群聊命令。
+  async controlRecoveryTask(channelType: string, installationId: string, id: string, revision: number, action: "reconcile" | "discard"): Promise<void> {
+    if (!this.options.durableQueue) throw new Error("持久化队列未启用");
+    const task = this.store.inbox.findTask(id);
+    if (!task || task.message.channelType !== channelType || task.message.installationId !== installationId
+      || task.binding.agentId !== this.options.agentId) throw new Error("任务不存在或不属于当前数字员工");
+    if (!Number.isSafeInteger(revision) || task.revision !== revision || task.state !== "uncertain") throw new Error("任务版本或状态已变化，请刷新后再处理");
+    if (!["reconcile", "discard"].includes(action)) throw new Error("任务操作无效");
+    if (this.inboxReconciliations.has(task.id)) throw new Error("任务正在核查，请等待后刷新");
+    if (!this.recoveryBindingMatches(task)) throw new Error("任务绑定已变化，不能处理旧运行");
+    if (!this.ark.inspectRun || task.interruptedAt !== "dispatched" || !task.sessionId || !task.requestFingerprint) throw new Error("任务缺少可核查的派发证据，不能确认执行已结束");
+    if (action === "reconcile") return this.reconcilePendingMessage(task.message);
+    this.blockInboxScope(task.binding.scope);
+    const operation = Promise.resolve().then(async () => {
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let observation: RunInspection;
+      try {
+        observation = await Promise.race([this.ark.inspectRun!(task.sessionId!, task.requestFingerprint!, controller.signal),
+          new Promise<RunInspection>(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ status: "unknown", reason: "history_unavailable" }); }, 10_000); })]);
+      } catch { observation = { status: "unknown", reason: "history_unavailable" }; }
+      finally { clearTimeout(timer); controller.abort(); }
+      if (!this.recoveryBindingMatches(task)) throw new Error("任务绑定已变化，未放弃原任务");
+      const inspected = this.store.recordMessageInspection(task, observation);
+      this.store.discardInspectedMessage(inspected);
+      this.releaseInboxScope(task);
+    }).finally(() => this.inboxReconciliations.delete(task.id));
+    this.inboxReconciliations.set(task.id, operation);
+    return operation;
+  }
+
+  private recoveryBindingMatches(task: InboxTask): boolean {
+    try {
+      this.store.assertSessionAgent(this.conversationKey(task.message), this.options.agentId);
+      const binding = this.inboxBinding(task.message);
+      return binding.scope === task.binding.scope && binding.agentId === task.binding.agentId && binding.configFingerprint === task.binding.configFingerprint
+        && (!task.sessionId || this.store.getSession(this.conversationKey(task.message)) === task.sessionId);
+    } catch { return false; }
+  }
+
+  private releaseInboxScope(task: InboxTask): void {
+    if (!this.store.inbox.hasBlockingTasks(task.message, task.binding)) {
+      this.inboxBlockedScopes.delete(task.binding.scope);
+      if (!this.authorizationWaits.get(task.binding.scope)?.size) this.queue.resume(task.binding.scope);
+    }
+  }
+
   recoverPendingMessages(channelType: string, installationId: string): void {
     if (!this.options.durableQueue) return;
     const pending = this.store.recoverMessages(channelType, installationId);
@@ -239,10 +305,7 @@ export class Gateway {
       }
       if (!inspected.replyConfirmed) return;
       this.store.settleInspectedMessage(inspected);
-      if (!this.store.inbox.hasBlockingTasks(task.message, task.binding)) {
-        this.inboxBlockedScopes.delete(task.binding.scope);
-        if (!this.authorizationWaits.get(task.binding.scope)?.size) this.queue.resume(task.binding.scope);
-      }
+      this.releaseInboxScope(task);
     }).catch(() => {
       this.blockInboxScope(task.binding.scope);
       console.warn("原运行核查或检查点保存失败，未重发任务或解除暂停");

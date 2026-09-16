@@ -1,7 +1,8 @@
-import { createServer, type AddressInfo, type Server, type ServerResponse } from "node:http";
+import { createServer, type AddressInfo, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { EmployeeConfig } from "./config.ts";
 import { getConnectedIdentities } from "./identities.ts";
 import type { GatewayStore } from "./store.ts";
+import type { Gateway } from "./gateway.ts";
 
 export type EmployeeOverview = {
   id: string;
@@ -22,6 +23,7 @@ export async function startEmployeeWeb(options: {
   store: GatewayStore;
   config: EmployeeConfig;
   botName?: string;
+  recovery?: Pick<Gateway, "listRecoveryTasks" | "controlRecoveryTask">;
 }): Promise<{ server: Server; url: string }> {
   const startedAt = new Date().toISOString();
   const employeeId = options.config.arkAgentId;
@@ -34,12 +36,33 @@ export async function startEmployeeWeb(options: {
       const url = new URL(request.url || "/", `http://${options.config.webHost}:${options.config.webPort}`);
       if (request.method === "GET" && url.pathname === "/") return html(response, WEB_HTML);
       if (!authorized(request.headers.authorization, options.config.webToken)) return json(response, 401, { error: "unauthorized" });
+      const employeePath = `/api/employees/${encodeURIComponent(employeeId)}`;
+      if (url.pathname === `${employeePath}/recovery`) {
+        if (request.method === "GET") {
+          const cursor = url.searchParams.get("after") || "0";
+          if (!/^\d{1,16}$/.test(cursor) || !Number.isSafeInteger(Number(cursor))) return json(response, 400, { error: "任务分页游标无效" });
+          return json(response, 200, options.recovery?.listRecoveryTasks("lark", options.config.feishuAppId, Number(cursor)) || { enabled: false, items: [] });
+        }
+        if (request.method === "POST") {
+          if (!options.recovery) return json(response, 409, { error: "任务恢复未启用" });
+          if (request.headers["sec-fetch-site"] === "cross-site" || (request.headers.origin && request.headers.origin !== `http://${request.headers.host}`)) return json(response, 403, { error: "禁止跨站管理操作" });
+          if (request.headers["content-type"]?.split(";")[0].trim() !== "application/json") return json(response, 415, { error: "需要JSON请求" });
+          let body: Record<string, unknown>;
+          try { body = await readControlBody(request); }
+          catch { return json(response, 400, { error: "任务操作参数无效或超过限制" }); }
+          if (typeof body.id !== "string" || !/^[a-f0-9-]{36}$/.test(body.id) || !Number.isSafeInteger(body.revision) || Number(body.revision) < 1
+            || !["reconcile", "discard"].includes(String(body.action)) || (body.action === "discard" && body.confirmDiscard !== body.id)) return json(response, 400, { error: "需要有效任务版本和显式放弃确认" });
+          try { await options.recovery.controlRecoveryTask("lark", options.config.feishuAppId, body.id, Number(body.revision), body.action as "reconcile" | "discard"); }
+          catch { return json(response, 409, { error: "任务未能处理：请刷新检查状态。运行未结束、仍需授权、版本或绑定变化时不能放弃；结果未知请保留原任务。" }); }
+          return json(response, 200, { ok: true });
+        }
+        return json(response, 405, { error: "method_not_allowed" });
+      }
       const users = options.store.listEmployeeUsers();
       const audit = options.store.listAuditLogs();
       if (request.method === "GET" && url.pathname === "/api/employees") return json(response, 200, [{
         ...overview(), status: "online", userCount: users.length, lastActivityAt: audit[0]?.createdAt
       } satisfies EmployeeSummary]);
-      const employeePath = `/api/employees/${encodeURIComponent(employeeId)}`;
       if (request.method === "GET" && url.pathname === employeePath) return json(response, 200, overview());
       if (request.method === "GET" && url.pathname === `${employeePath}/identities`) return json(response, 200, getConnectedIdentities(options.config));
       if (request.method === "GET" && url.pathname === `${employeePath}/users`) return json(response, 200, users);
@@ -60,6 +83,21 @@ export async function startEmployeeWeb(options: {
   });
   const address = server.address() as AddressInfo;
   return { server, url: `http://${options.config.webHost}:${address.port}/#token=${encodeURIComponent(options.config.webToken)}` };
+}
+
+async function readControlBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []; let size = 0;
+  request.setTimeout(5000, () => request.destroy());
+  try {
+    for await (const chunk of request) {
+      const bytes = Buffer.from(chunk); size += bytes.length;
+      if (size > 4096) throw new Error("oversize");
+      chunks.push(bytes);
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("invalid body");
+    return body;
+  } finally { request.setTimeout(0); }
 }
 
 function authorized(header: string | undefined, token: string): boolean {
@@ -88,12 +126,15 @@ const WEB_HTML = `<!doctype html>
 <section id="detail-view" class="view"><button id="back" class="back">← 返回数字员工列表</button><div class="detail-head"><div><h2 id="detail-name" class="detail-title"></h2><div id="detail-meta" class="meta"></div></div><span class="status">● 在线</span></div>
 <nav class="tabs"><button class="active" data-tab="identities">身份</button><button data-tab="audit">行为日志</button><button data-tab="users">访问过的用户</button></nav>
 <section id="identities" class="panel active"><div id="identities-list" class="grid"></div></section>
-<section id="audit" class="panel"><div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>状态</th><th>耗时</th><th>Session</th></tr></thead><tbody id="audit-body"></tbody></table></div></section>
+<section id="audit" class="panel"><div class="toolbar"><h3>待处理任务</h3><div><button id="recovery-refresh" type="button">刷新</button> <button id="recovery-next" type="button" hidden>下一页</button></div></div><div class="note">重新核查不会重跑任务。放弃仅结束网关记录，要求原MA运行已经结束；不会撤销已创建的文档、日程等操作，也不代表回复已送达。管理操作使用当前控制台凭证。</div><div id="recovery-status" class="muted" role="status"></div><div class="table-wrap"><table><thead><tr><th>消息 / 会话</th><th>任务状态</th><th>MA核查 / 回复</th><th>操作</th></tr></thead><tbody id="recovery-body"></tbody></table></div><h3>行为日志</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>状态</th><th>耗时</th><th>Session</th></tr></thead><tbody id="audit-body"></tbody></table></div></section>
 <section id="users" class="panel"><div class="note">使用权限由飞书应用可用范围管理；此处只展示实际访问过该数字员工的用户。</div><div class="table-wrap"><table><thead><tr><th>用户 open_id</th><th>租户</th><th>首次访问</th><th>最近访问</th><th>访问次数</th></tr></thead><tbody id="users-body"></tbody></table></div></section>
 </section></main><script>
 const token=new URLSearchParams(location.hash.slice(1)).get('token')||'';const headers={Authorization:'Bearer '+token};let currentEmployee='';const esc=v=>String(v??'');
 async function api(path){const r=await fetch(path,{headers});if(!r.ok)throw new Error((await r.json()).error||r.statusText);return r.json()}
 function showError(e){const n=document.querySelector('#error');n.textContent=e.message||String(e);n.style.display='block'}
+let recoveryNext=0;
+async function loadRecovery(after=0){const base=employeeBase(),page=await api(base+'/recovery?after='+after);if(base!==employeeBase())return;const body=document.querySelector('#recovery-body');recoveryNext=page.next||0;document.querySelector('#recovery-next').hidden=!recoveryNext;document.querySelector('#recovery-status').textContent=page.enabled?'按到达顺序展示，每页最多100条；核查状态是最近一次记录，不代表实时状态。':'持久化队列尚未启用，当前不提供任务恢复管理。';body.replaceChildren(...page.items.map(x=>{const tr=document.createElement('tr');[x.messageId+' / '+(x.sessionId||'尚无Session'),x.state+(x.bindingMatches?'':'（绑定已变化）'),x.runStatus+' / '+(x.replyConfirmed?'已确认回复':x.deliveryPhase||'未确认回复')].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td)});const actions=document.createElement('td');if(x.state==='uncertain'&&x.bindingMatches){for(const action of ['reconcile','discard']){const button=document.createElement('button');button.type='button';button.textContent=action==='reconcile'?'重新核查':'放弃任务';button.onclick=async()=>{if(action==='discard'&&!window.confirm('确认放弃此任务？系统会先核查MA是否已结束。不会撤销已有外部操作，不会重新执行或补发回复，后续排队消息可能开始执行。'))return;actions.querySelectorAll('button').forEach(b=>b.disabled=true);try{const r=await fetch(base+'/recovery',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({id:x.id,revision:x.revision,action,...(action==='discard'?{confirmDiscard:x.id}:{})})});if(!r.ok)throw new Error((await r.json()).error);if(base===employeeBase()){await loadRecovery();await loadAudit()}}catch(e){showError(e);if(base===employeeBase())await loadRecovery().catch(showError)}};actions.append(button)}}else actions.textContent='—';tr.append(actions);return tr}));if(!page.items.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=4;td.className='empty';td.textContent='本页暂无待处理任务';tr.append(td);body.append(tr)}}
+document.querySelector('#recovery-refresh').onclick=()=>loadRecovery().catch(showError);document.querySelector('#recovery-next').onclick=()=>loadRecovery(recoveryNext).catch(showError);
 function employeeBase(){return '/api/employees/'+encodeURIComponent(currentEmployee)}
 async function loadEmployees(){const xs=await api('/api/employees'),list=document.querySelector('#employee-list');document.querySelector('#employee-count').textContent=xs.length+' 个数字员工';list.replaceChildren(...xs.map(x=>{const row=document.createElement('button');row.className='employee-row';row.type='button';const identity=document.createElement('div');const name=document.createElement('div');name.className='employee-name';name.textContent=x.botName;const id=document.createElement('div');id.className='meta';id.textContent=x.agentId;identity.append(name,id);const bot=document.createElement('div');bot.innerHTML='<div class="label">飞书身份</div>';const botValue=document.createElement('div');botValue.className='value';botValue.textContent='Bot · '+x.appId;bot.append(botValue);const status=document.createElement('div');status.innerHTML='<span class="status">● 在线</span>';const users=document.createElement('div');users.innerHTML='<div class="label">访问用户</div>';const userValue=document.createElement('div');userValue.className='value';userValue.textContent=x.userCount+' 人';users.append(userValue);const activity=document.createElement('div');activity.innerHTML='<div class="label">最近活动</div>';const activityValue=document.createElement('div');activityValue.className='value';activityValue.textContent=x.lastActivityAt?new Date(x.lastActivityAt).toLocaleString():'暂无';activity.append(activityValue);const arrow=document.createElement('div');arrow.className='arrow';arrow.textContent='›';row.append(identity,bot,status,users,activity,arrow);row.onclick=()=>openEmployee(x);return row}));if(!xs.length){const n=document.createElement('div');n.className='empty';n.textContent='暂无数字员工';list.append(n)}}
 async function openEmployee(employee){currentEmployee=employee.id;document.querySelector('#detail-name').textContent=employee.botName;document.querySelector('#detail-meta').textContent='飞书 Bot · '+employee.appId+'　|　Agent '+employee.agentId;document.querySelector('#list-view').classList.remove('active');document.querySelector('#detail-view').classList.add('active');activateTab('identities')}
@@ -102,6 +143,6 @@ function chips(label,values,scope=false){const n=document.createElement('div'),a
 async function loadIdentities(){const xs=await api(employeeBase()+'/identities'),list=document.querySelector('#identities-list');list.replaceChildren(...xs.map(x=>{const c=document.createElement('article');c.className='identity';const head=document.createElement('div');head.className='identity-head';const title=document.createElement('div'),name=document.createElement('div'),meta=document.createElement('div'),status=document.createElement('span');name.className='identity-title';name.textContent=x.displayName;meta.className='identity-meta';meta.textContent=x.providerName+' · '+x.identityTypeLabel;title.append(name,meta);status.className='status';status.textContent='已配置';head.append(title,status);const details=document.createElement('div');details.className='identity-details';details.append(detail(x.identifierLabel,x.identifier),detail('认证方式',x.authMode),detail('凭证来源',x.credentialSource),detail('凭证引用',x.credentialRef),chips('可用能力',x.capabilities),chips('授权范围',x.scopes,true));c.append(head,details);return c}))}
 async function loadUsers(){const xs=await api(employeeBase()+'/users'),body=document.querySelector('#users-body');body.replaceChildren(...xs.map(x=>{const tr=document.createElement('tr');[x.openId,x.tenantKey,new Date(x.firstUsedAt).toLocaleString(),new Date(x.lastUsedAt).toLocaleString(),x.usageCount].forEach(v=>{const td=document.createElement('td');td.textContent=esc(v);tr.append(td)});return tr}));if(!xs.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=5;td.className='empty';td.textContent='暂无访问记录';tr.append(td);body.append(tr)}}
 async function loadAudit(){const xs=await api(employeeBase()+'/audit'),body=document.querySelector('#audit-body');body.replaceChildren(...xs.map(x=>{const tr=document.createElement('tr');[new Date(x.createdAt).toLocaleString(),x.openId,x.action,x.status,x.durationMs==null?'—':x.durationMs+' ms',x.sessionId||'—'].forEach(v=>{const td=document.createElement('td');td.textContent=esc(v);tr.append(td)});return tr}));if(!xs.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.className='empty';td.textContent='暂无行为日志';tr.append(td);body.append(tr)}}
-function activateTab(name){document.querySelectorAll('[data-tab],.panel').forEach(x=>x.classList.remove('active'));document.querySelector('[data-tab="'+name+'"]').classList.add('active');document.querySelector('#'+name).classList.add('active');if(name==='identities')loadIdentities().catch(showError);if(name==='users')loadUsers().catch(showError);if(name==='audit')loadAudit().catch(showError)}
+function activateTab(name){document.querySelectorAll('[data-tab],.panel').forEach(x=>x.classList.remove('active'));document.querySelector('[data-tab="'+name+'"]').classList.add('active');document.querySelector('#'+name).classList.add('active');if(name==='identities')loadIdentities().catch(showError);if(name==='users')loadUsers().catch(showError);if(name==='audit'){loadAudit().catch(showError);loadRecovery().catch(showError)}}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>activateTab(b.dataset.tab));document.querySelector('#back').onclick=()=>{currentEmployee='';document.querySelector('#detail-view').classList.remove('active');document.querySelector('#list-view').classList.add('active');loadEmployees().catch(showError)};loadEmployees().catch(showError);
 </script></body></html>`;

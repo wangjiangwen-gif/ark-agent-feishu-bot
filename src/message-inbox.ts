@@ -18,6 +18,7 @@ export type InboxTask = {
   delivery?: ReplyDeliveryState;
   replyInspection?: ReplyObservation;
   inspection?: { checkedAt: number; observation: RunInspection };
+  resolution?: { action: "discard"; actor: "local_admin"; at: number; runCheckedAt: number };
 };
 type Row = Record<string, unknown>;
 const states = new Set<InboxState>(["queued", "preparing", "dispatched", "awaiting_authorization", "completed", "failed", "uncertain"]);
@@ -145,6 +146,30 @@ export class MessageInbox {
     return this.save(task, { ...task, owner: this.runtimeOwner(), state: "completed" });
   }
 
+  discardInspection(expected: InboxTask): InboxTask {
+    const task = this.expectedUncertain(expected), inspection = task.inspection, now = Date.now();
+    if (task.interruptedAt !== "dispatched" || !task.sessionId || !task.requestFingerprint || !inspection
+      || inspection.observation.status !== "ended" || inspection.observation.result.authorizationRequired
+      || typeof inspection.observation.anchorEventId !== "string" || !inspection.observation.anchorEventId.trim()
+      || typeof inspection.observation.terminalEventId !== "string" || !inspection.observation.terminalEventId.trim()
+      || !Number.isSafeInteger(inspection.checkedAt) || inspection.checkedAt > now || now - inspection.checkedAt > 30_000) {
+      throw new Error("尚未确认原运行已结束，或仍需处理授权，不能放弃任务");
+    }
+    this.resultFingerprint(inspection.observation.result);
+    // 放弃不补造回复确认，不撤销已经发生的外部业务操作。
+    return this.save(task, { ...task, owner: this.runtimeOwner(), state: "failed",
+      resolution: { action: "discard", actor: "local_admin", at: now, runCheckedAt: inspection.checkedAt } });
+  }
+
+  listPending(channelType: string, installationId: string, agentId: string, after = 0): { tasks: InboxTask[]; next?: number } {
+    this.runtimeOwner();
+    if (!Number.isSafeInteger(after) || after < 0) throw new Error("任务分页游标无效");
+    const rows = this.db.prepare(`SELECT * FROM gateway_message_inbox WHERE channel_type=? AND installation_id=? AND agent_id=?
+      AND state NOT IN ('completed', 'failed') AND sequence>? ORDER BY sequence LIMIT 101`).all(channelType, installationId, agentId, after);
+    const tasks = rows.slice(0, 100).map(row => this.decode(row));
+    return { tasks, ...(rows.length > 100 ? { next: tasks.at(-1)!.sequence } : {}) };
+  }
+
   recordReplyInspection(expected: InboxTask, observation: ReplyObservation): InboxTask {
     const task = this.expectedUncertain(expected), run = task.inspection, now = Date.now();
     const query = replyInspectionQuery(task.delivery, task.replyIntent?.contentFingerprint);
@@ -260,7 +285,7 @@ export class MessageInbox {
 
   private encode(task: InboxTask): string {
     const payload = { version: 2, message: task.message, replyConfirmed: task.replyConfirmed, replyResultFingerprint: task.replyResultFingerprint,
-      dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection };
+      dispatchId: task.dispatchId, replyIntent: task.replyIntent, delivery: task.delivery, replyInspection: task.replyInspection, inspection: task.inspection, resolution: task.resolution };
     return this.credentials.sealAuthorization(JSON.stringify(payload), this.context({ ...task,
       eventKey: this.eventKey(task.message), channelType: task.message.channelType, installationId: task.message.installationId }));
   }
@@ -275,7 +300,7 @@ export class MessageInbox {
     const cleartext = this.credentials.openAuthorization(String(row.secret), this.context({ ...metadata,
       eventKey: String(row.event_key), channelType: String(row.channel_type), installationId: String(row.installation_id) }));
     let message: ChannelMessage;
-    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection"> = {};
+    let checkpoint: Pick<InboxTask, "replyConfirmed" | "replyResultFingerprint" | "dispatchId" | "replyIntent" | "delivery" | "replyInspection" | "inspection" | "resolution"> = {};
     try {
       const payload = JSON.parse(cleartext);
       // 旧密文仅包含ChannelMessage，首次状态更新时升级；不补造旧回复的送达证明。
@@ -296,9 +321,18 @@ export class MessageInbox {
               || proof.elementId !== payload.delivery.elementId || !Number.isSafeInteger(proof.observedAt) || proof.observedAt <= 0) throw new Error("invalid remote receipt");
           } else if (proof.status !== "unknown" || !["unsupported", "unavailable", "invalid_response", "identity_mismatch", "content_mismatch", "streaming", "cancelled"].includes(proof.reason)) throw new Error("invalid remote inspection");
         }
+        if (payload.resolution) {
+          const value = payload.resolution;
+          if (metadata.state !== "failed" || value.action !== "discard" || value.actor !== "local_admin"
+            || !Number.isSafeInteger(value.at) || !Number.isSafeInteger(value.runCheckedAt) || value.runCheckedAt <= 0
+            || value.at < value.runCheckedAt || value.at - value.runCheckedAt > 30_000
+            || payload.inspection?.checkedAt !== value.runCheckedAt || payload.inspection?.observation?.status !== "ended"
+            || payload.inspection.observation.result?.authorizationRequired) throw new Error("invalid resolution");
+        }
         checkpoint = { ...(payload.replyConfirmed ? { replyConfirmed: true, replyResultFingerprint: payload.replyResultFingerprint } : {}),
           ...(payload.dispatchId ? { dispatchId: payload.dispatchId } : {}), ...(payload.replyIntent ? { replyIntent: payload.replyIntent } : {}),
-          ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.replyInspection ? { replyInspection: payload.replyInspection } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}) };
+          ...(payload.delivery ? { delivery: payload.delivery } : {}), ...(payload.replyInspection ? { replyInspection: payload.replyInspection } : {}), ...(payload.inspection ? { inspection: payload.inspection } : {}),
+          ...(payload.resolution ? { resolution: payload.resolution } : {}) };
       } else message = payload;
     }
     catch { throw new Error("持久化消息结构损坏，未恢复任务"); }

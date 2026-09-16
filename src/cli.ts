@@ -125,7 +125,7 @@ async function runEmployee(): Promise<void> {
     readMessage: channel.readMessage
   });
   await gateway.validateConfiguration();
-  const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName });
+  const web = await startEmployeeWeb({ store, config, botName: config.feishuBotName, recovery: gateway });
   console.log("数字员工配置：");
   console.log(`- 飞书 App ID：${config.feishuAppId}`);
   console.log(`- 方舟 Agent ID：${config.arkAgentId}`);
