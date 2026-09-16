@@ -10,6 +10,7 @@ import { loadSessionConfiguration } from "./session-config.ts";
 import { startChannelAfterRecovery } from "./channel-startup.ts";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource, ChannelInspectReaction, ReplyDeliveryObserver, ChannelInspectReply } from "./channel.ts";
 import { replyContentFingerprint } from "./reply-delivery.ts";
+import { inspectLarkReply } from "./lark-reply-inspection.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -275,16 +276,20 @@ async function createFeishuRuntime(appId: string, appSecret: string, onSent?: (m
     reply: async (message, outbound, observer) => {
       const msgType = outbound.type === "card" ? "interactive" : "text";
       const content = outbound.type === "card" ? JSON.stringify(outbound.card) : JSON.stringify({ text: outbound.type === "markdown" ? outbound.markdown : outbound.text });
-      await observer?.({ type: "begin", mode: "message" });
+      const contentFingerprint = observer ? replyContentFingerprint(outbound.type === "text" ? outbound.text
+        : outbound.type === "markdown" ? outbound.markdown : content) : undefined;
+      await observer?.({ type: "begin", mode: "message", ...(outbound.type !== "card"
+        ? { textFingerprint: contentFingerprint } : {}) });
       await observer?.({ type: "sending" });
       const response = await client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: message.conversationId, msg_type: msgType, content } });
       assertLarkResponse(response, outbound.type === "card" ? "发送授权卡片" : "发送文本消息");
       await observer?.({ type: "sent", messageIds: response.data?.message_id ? [response.data.message_id] : [] });
-      await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(outbound.type === "text" ? outbound.text : outbound.type === "markdown" ? outbound.markdown : JSON.stringify(outbound.card)) });
+      await observer?.({ type: "completed", contentFingerprint: contentFingerprint! });
       if (response.data?.message_id) onSent?.(message, response.data.message_id);
     },
     loadRecentHistory: message => loadLarkRecentHistory(client, message),
     readMessage: (message, id, signal) => readLarkMessage(client, message, id, signal),
+    inspectReply: (message, query, signal) => inspectLarkReply(client, appId, message, query, signal),
     download
   };
 }

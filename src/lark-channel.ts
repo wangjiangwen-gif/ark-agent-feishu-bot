@@ -122,11 +122,16 @@ export class LarkChannelAdapter implements ChannelAdapter {
 
   async reply(message: ChannelMessage, outbound: ChannelOutbound, observer?: ReplyDeliveryObserver): Promise<void> {
     const input = toLarkSendInput(outbound);
-    await observer?.({ type: "begin", mode: "message" });
+    // 发送前固定正文指纹，复用至最终确认；不受调用方在异步发送期间改写文本影响。
+    const contentFingerprint = observer && outbound.type !== "card"
+      ? replyContentFingerprint(outbound.type === "text" ? outbound.text : outbound.markdown) : undefined;
+    await observer?.({ type: "begin", mode: "message",
+      ...(outbound.type === "text" ? { textFingerprint: contentFingerprint } : {}) });
     await observer?.({ type: "sending" });
     const sent = await this.channel.send(message.conversationId, input, replyOptions(message));
     await observer?.({ type: "sent", messageIds: [sent.messageId, ...(sent.chunkIds || [])].filter(Boolean) });
-    await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(outbound.type === "text" ? outbound.text : outbound.type === "markdown" ? outbound.markdown : JSON.stringify(outbound.card)) });
+    await observer?.({ type: "completed", contentFingerprint: contentFingerprint ?? replyContentFingerprint(
+      outbound.type === "card" ? JSON.stringify(outbound.card) : outbound.type === "text" ? outbound.text : outbound.markdown) });
     for (const id of [sent.messageId, ...(sent.chunkIds || [])]) if (id) this.onSent?.(message, id);
   }
 

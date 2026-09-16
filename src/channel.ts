@@ -53,7 +53,7 @@ export type ChannelInspectReaction = (message: ChannelMessage, query: ReactionQu
 
 // 每次投递独立的检查点；onSent仅用于历史去重，不能证明最终正文送达。
 export type ReplyDeliveryEvent =
-  | { type: "begin"; mode: "native_card" | "message" | "sdk_stream" }
+  | { type: "begin"; mode: "native_card" | "message" | "sdk_stream"; textFingerprint?: string }
   | { type: "card_created"; cardId: string; elementId: string }
   | { type: "sending" }
   | { type: "sent"; messageIds: string[] }
@@ -61,9 +61,12 @@ export type ReplyDeliveryEvent =
   | { type: "finalizing" | "finalized"; sequence: number }
   | { type: "completed"; contentFingerprint: string };
 export type ReplyDeliveryObserver = (event: ReplyDeliveryEvent) => Promise<void>;
-export type ReplyInspectionQuery = { mode: "native_card"; messageId: string; elementId: string; contentFingerprint: string };
+export type ReplyInspectionQuery =
+  | { mode: "native_card"; messageId: string; elementId: string; contentFingerprint: string }
+  | { mode: "text_messages"; messageIds: string[]; contentFingerprint: string };
 export type ReplyObservation =
-  | { status: "confirmed"; messageId: string; elementId: string; contentFingerprint: string; observedAt: number }
+  | { status: "confirmed"; mode?: "native_card"; messageId: string; elementId: string; contentFingerprint: string; observedAt: number }
+  | { status: "confirmed"; mode: "text_messages"; messageIds: string[]; contentFingerprint: string; observedAt: number }
   | { status: "unknown"; reason: "unsupported" | "unavailable" | "invalid_response" | "identity_mismatch" | "content_mismatch" | "streaming" | "cancelled" };
 export type ChannelInspectReply = (message: ChannelMessage, query: ReplyInspectionQuery, signal: AbortSignal) => Promise<ReplyObservation>;
 

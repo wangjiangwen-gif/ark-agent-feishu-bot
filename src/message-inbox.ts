@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ChannelMessage, ReplyDeliveryEvent, ReplyObservation } from "./channel.ts";
-import { advanceReplyDelivery, replyContentFingerprint, replyInspectionQuery, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
+import { advanceReplyDelivery, replyContentFingerprint, replyInspectionQuery, replyProofMatches, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
 import type { CredentialStateStore } from "./credential-state.ts";
 import type { RunInspection, RunResult } from "./ark.ts";
 
@@ -179,11 +179,11 @@ export class MessageInbox {
       if (!["unsupported", "unavailable", "invalid_response", "identity_mismatch", "content_mismatch", "streaming", "cancelled"].includes(observation.reason)) throw new Error("回复核查原因无效");
       return this.save(task, { ...task, replyInspection: { status: "unknown", reason: observation.reason } });
     }
-    if (observation.status !== "confirmed" || observation.messageId !== query.messageId || observation.elementId !== query.elementId
-      || observation.contentFingerprint !== query.contentFingerprint || !Number.isSafeInteger(observation.observedAt)
+    if (observation.status !== "confirmed" || !replyProofMatches(query, observation) || !Number.isSafeInteger(observation.observedAt)
       || observation.observedAt < run.checkedAt || observation.observedAt > now || now - observation.observedAt > 30_000) throw new Error("回复核查证明过期或不匹配");
-    const proof: ReplyObservation = { status: "confirmed", messageId: query.messageId, elementId: query.elementId,
-      contentFingerprint: query.contentFingerprint, observedAt: observation.observedAt };
+    const proof: ReplyObservation = query.mode === "text_messages"
+      ? { status: "confirmed", mode: "text_messages", messageIds: [...query.messageIds], contentFingerprint: query.contentFingerprint, observedAt: observation.observedAt }
+      : { status: "confirmed", messageId: query.messageId, elementId: query.elementId, contentFingerprint: query.contentFingerprint, observedAt: observation.observedAt };
     return this.save(task, { ...task, replyInspection: proof, replyConfirmed: true, replyResultFingerprint: task.replyIntent!.resultFingerprint,
       delivery: { ...task.delivery!, phase: "completed", contentFingerprint: query.contentFingerprint, pendingContentFingerprint: undefined } });
   }
@@ -316,9 +316,10 @@ export class MessageInbox {
         if (payload.replyInspection) {
           const proof = payload.replyInspection;
           if (proof.status === "confirmed") {
+            const delivered = payload.delivery;
+            const query = delivered ? replyInspectionQuery({ ...delivered, phase: delivered.mode === "message" ? "sent" : "finalized" }, payload.replyIntent?.contentFingerprint) : undefined;
             if (!payload.replyConfirmed || proof.contentFingerprint !== payload.replyIntent?.contentFingerprint
-              || payload.delivery?.messageIds?.length !== 1 || proof.messageId !== payload.delivery.messageIds[0]
-              || proof.elementId !== payload.delivery.elementId || !Number.isSafeInteger(proof.observedAt) || proof.observedAt <= 0) throw new Error("invalid remote receipt");
+              || !query || !replyProofMatches(query, proof) || !Number.isSafeInteger(proof.observedAt) || proof.observedAt <= 0) throw new Error("invalid remote receipt");
           } else if (proof.status !== "unknown" || !["unsupported", "unavailable", "invalid_response", "identity_mismatch", "content_mismatch", "streaming", "cancelled"].includes(proof.reason)) throw new Error("invalid remote inspection");
         }
         if (payload.resolution) {

@@ -1,0 +1,345 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "572401e",
+  "node": "22.22.1",
+  "scope": "普通文本及全部已保存ID的文本分片回复：最终确认前退出后的只读恢复；不是完整队列或投递补偿验收",
+  "contract": {
+    "source": "https://open.feishu.cn/document/server-docs/im-v1/message/get.md",
+    "verifiedPreviouslyInThisIncrement": [
+      "GET /open-apis/im/v1/messages/:message_id",
+      "code=0/data.items、message_id/chat_id/thread_id/deleted/msg_type/body.content",
+      "sender.id/id_type=app_id/sender_type=app/tenant_key",
+      "text正文为JSON字符串"
+    ],
+    "sdk": "@larksuite/channel 0.4.1源码：sendText按原字符切分；chunkIds包含首条ID；Markdown转换为post不走纯文本核查"
+  },
+  "testFirst": {
+    "initialTextRecoveryTests": 18,
+    "initialPassed": 12,
+    "initialFailed": 6,
+    "note": "最初失败包含1项子进程夹具语法错误，非生产缺陷；扩展测试中修正了JSON省略undefined字段的对比方式。",
+    "additionalProductionFailure": "异步发送期间调用方改写文本会使完成指纹与实际发送正文不同；新增失败测试后固定发送前指纹并复用。"
+  },
+  "finalTests": {
+    "new": 30,
+    "total": 750,
+    "passed": 750,
+    "failed": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "durationMs": 6568.919708,
+    "syntaxCheck": "passed（不等于TypeScript全量类型检查）",
+    "build": "passed",
+    "diffCheck": "passed",
+    "log": "/tmp/ark-text-final-full-tests.log"
+  },
+  "coverage": [
+    "发送前正文意图落盘，失败时不发送；正文完成指纹一致",
+    "真实Node子进程在保存全部ID后退出，单聊/群聊/话题三种Gateway+SQLite恢复",
+    "重启复用原Session，仅GET核查全部分片，不重复MA.run或发送",
+    "缺片/跨话题时后续同scope消息等待；重新核查完整后仅执行后续消息",
+    "逐条应用/租户/群/话题/消息ID/type/deleted校验，正文空白和顺序保留",
+    "空/重复/超50ID拒绝，单体1MiB和总4MiB上限，取消不发后续查询",
+    "查询参数和作用域快照，调用方改写不影响当前读取",
+    "证明错误模式/ID顺序/缺片/Hash/时效拒绝，MA结果不符拒绝",
+    "CAS拒绝迟到证明、SQLite触发器故障注入、成功证明跨DB重开保留",
+    "50片顺序读取最大并发1，正常发送0额外GET，SDK Markdown无text证明"
+  ],
+  "bounds": {
+    "maxMessages": 50,
+    "maxBodyBytesPerMessage": 1048576,
+    "maxTotalBodyBytes": 4194304,
+    "waitMs": 5000,
+    "note": "body字节限制在SDK完整返回后检查，不是整个HTTP响应流上限；SDK底层HTTP仍依赖自身超时。"
+  },
+  "performance": {
+    "status": "未通过完整性能验收，长文本默认队列关闭场景的P95回退待定位",
+    "method": "同进程基线/当前代码真实Gateway+SQLite+Channel适配层交替对照；MA和发送为模拟；每组短文本和长文本各samples次，预热各10次。",
+    "script": "scripts/benchmark-text-reply-recovery.mjs",
+    "runs": [
+      {
+        "baseline": "/tmp/ark-text-baseline-vUmQuO",
+        "samples": 200,
+        "warmup": 10,
+        "externalServices": "mock",
+        "alternatingOrder": true,
+        "groups": [
+          {
+            "label": "before",
+            "durableQueue": false,
+            "calls": {
+              "create": 1,
+              "run": 420,
+              "send": 420,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 0.9541249999999764,
+                "p95Ms": 2.5083340000001044
+              },
+              "long": {
+                "p50Ms": 0.8493330000001151,
+                "p95Ms": 3.1805420000000595
+              }
+            }
+          },
+          {
+            "label": "before",
+            "durableQueue": true,
+            "calls": {
+              "create": 1,
+              "run": 420,
+              "send": 420,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 2.764041000000134,
+                "p95Ms": 8.147832999999991
+              },
+              "long": {
+                "p50Ms": 3.4104999999999563,
+                "p95Ms": 8.206874999999854
+              }
+            }
+          },
+          {
+            "label": "after",
+            "durableQueue": false,
+            "calls": {
+              "create": 1,
+              "run": 420,
+              "send": 420,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 1.0479580000001079,
+                "p95Ms": 2.5419999999999163
+              },
+              "long": {
+                "p50Ms": 0.9230420000003505,
+                "p95Ms": 3.139874999999847
+              }
+            }
+          },
+          {
+            "label": "after",
+            "durableQueue": true,
+            "calls": {
+              "create": 1,
+              "run": 420,
+              "send": 420,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 2.708458000000064,
+                "p95Ms": 10.557250000000067
+              },
+              "long": {
+                "p50Ms": 3.3371250000000146,
+                "p95Ms": 9.05441699999983
+              }
+            }
+          }
+        ]
+      },
+      {
+        "baseline": "/tmp/ark-text-baseline-vUmQuO",
+        "samples": 1000,
+        "warmup": 10,
+        "externalServices": "mock",
+        "alternatingOrder": true,
+        "groups": [
+          {
+            "label": "before",
+            "durableQueue": false,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 0.4677499999997963,
+                "p95Ms": 0.963207999999895
+              },
+              "long": {
+                "p50Ms": 0.7551659999990079,
+                "p95Ms": 1.3158330000005662
+              }
+            }
+          },
+          {
+            "label": "before",
+            "durableQueue": true,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 1.7980419999998958,
+                "p95Ms": 2.5752499999999827
+              },
+              "long": {
+                "p50Ms": 2.9489999999996144,
+                "p95Ms": 4.931750000001557
+              }
+            }
+          },
+          {
+            "label": "after",
+            "durableQueue": false,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 0.49662499999976717,
+                "p95Ms": 1.0228749999998854
+              },
+              "long": {
+                "p50Ms": 0.8088750000006257,
+                "p95Ms": 2.5378749999999854
+              }
+            }
+          },
+          {
+            "label": "after",
+            "durableQueue": true,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 1.791374999999789,
+                "p95Ms": 2.986041
+              },
+              "long": {
+                "p50Ms": 2.859707999999955,
+                "p95Ms": 4.481915999999728
+              }
+            }
+          }
+        ]
+      },
+      {
+        "baseline": "/tmp/ark-text-baseline-vUmQuO",
+        "samples": 1000,
+        "warmup": 10,
+        "externalServices": "mock",
+        "alternatingOrder": true,
+        "groups": [
+          {
+            "label": "before",
+            "durableQueue": false,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 0.47758300000077725,
+                "p95Ms": 1.132959000000028
+              },
+              "long": {
+                "p50Ms": 0.7892499999998108,
+                "p95Ms": 1.5526249999993524
+              }
+            }
+          },
+          {
+            "label": "before",
+            "durableQueue": true,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 1.846082999999453,
+                "p95Ms": 2.905041999999412
+              },
+              "long": {
+                "p50Ms": 3.157499999999345,
+                "p95Ms": 5.593999999999141
+              }
+            }
+          },
+          {
+            "label": "after",
+            "durableQueue": false,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 0.4968330000001515,
+                "p95Ms": 1.1750419999999622
+              },
+              "long": {
+                "p50Ms": 0.8577079999995476,
+                "p95Ms": 2.695208000001003
+              }
+            }
+          },
+          {
+            "label": "after",
+            "durableQueue": true,
+            "calls": {
+              "create": 1,
+              "run": 2020,
+              "send": 2020,
+              "inspect": 0
+            },
+            "times": {
+              "short": {
+                "p50Ms": 1.8303340000002208,
+                "p95Ms": 3.0756249999999454
+              },
+              "long": {
+                "p50Ms": 3.001832999999351,
+                "p95Ms": 5.057958999999755
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "observations": [
+      "三次均无额外外部调用，每组仅创建1次Session，MA.run和send次数一致，inspect=0",
+      "最终1000样本：默认队列关闭，短文本P95 1.133→1.175ms，长文本1.553→2.695ms",
+      "最终1000样本：实验队列开启，短文本P95 2.905→3.076ms，长文本5.594→5.058ms",
+      "原样保留全部结果；不将波动归因于已证实的GC、磁盘或代码原因，不宣称用户端性能提升。"
+    ],
+    "next": "已达同一基准3次尝试上限，停止直接重跑；下一步先拆分SQLite/调度/适配层计时，并评估固定交替顺序的偏差。"
+  },
+  "externalServices": "全部新增回复恢复使用模拟MA/飞书传输，含真实Node进程退出与SQLite重开；没有访问真实客户数据/发送消息。",
+  "remaining": [
+    "发送成功但所有ID未保存、SDK只发送部分分片后失败、无正文意图旧记录",
+    "SDK流式回退、Markdown/post及仍在流式的卡片恢复",
+    "完整准备事务、CLI持久化队列启用、部分写入受控续跑",
+    "Session upgrade网关接入与真实资源生效、Memory/TOS",
+    "客户PDF提前idle复现、真实飞书/MA全模式端到端、性能定位与回退演练"
+  ],
+  "deployment": "未部署/发布，durableQueue默认关闭，开发机保留原版本。"
+}
