@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ChannelMessage } from "./channel.ts";
 import { validMountQuery, type FileMountProof } from "./mount-inspection.ts";
+import { newUploadName, validUploadName, validUploadQuery, type FileUploadProof } from "./upload-inspection.ts";
 
-export type AttachmentStage = "download" | "upload" | "mount" | "mount_check" | "inline" | "cache";
-export type AttachmentStageDetails = { bytes?: number; sha256?: string; fileId?: string; mountPath?: string; sessionId?: string; resourceId?: string; checkedAt?: number; rejected?: true };
+export type AttachmentStage = "download" | "upload" | "upload_check" | "mount" | "mount_check" | "inline" | "cache";
+export type AttachmentStageDetails = { bytes?: number; sha256?: string; fileId?: string; mountPath?: string; sessionId?: string; resourceId?: string; checkedAt?: number; rejected?: true; uploadName?: string };
 export type AttachmentStageReceipt = AttachmentStageDetails & {
   id: string; sequence: number; attachmentKey: string; stage: AttachmentStage;
   status: "pending" | "succeeded" | "error"; startedAt: number; finishedAt?: number; durationMs?: number;
@@ -23,6 +24,10 @@ function details(value: AttachmentStageDetails): AttachmentStageDetails {
     result.sha256 = value.sha256;
   }
   if (value.rejected === true) result.rejected = true;
+  if (value.uploadName !== undefined) {
+    if (!validUploadName(value.uploadName)) throw new Error("上传操作标识无效");
+    result.uploadName = value.uploadName;
+  }
   if (value.checkedAt !== undefined) {
     if (!Number.isSafeInteger(value.checkedAt) || value.checkedAt < 0) throw new Error("附件核查时间无效");
     result.checkedAt = value.checkedAt;
@@ -59,11 +64,13 @@ export class AttachmentTraceStore {
     CREATE INDEX IF NOT EXISTS attachment_mount_lookup ON attachment_stage_receipts(
       scope, attachment_key, json_extract(details, '$.sessionId'), sequence
     ) WHERE stage='mount' OR (stage='mount_check' AND status='succeeded');
+    CREATE INDEX IF NOT EXISTS attachment_upload_lookup ON attachment_stage_receipts(attachment_key, sequence)
+      WHERE stage='upload' OR (stage='upload_check' AND status='succeeded');
     `);
   }
 
   begin(message: ChannelMessage, key: string, stage: AttachmentStage, value: AttachmentStageDetails = {}): string {
-    if (!/^[a-f0-9]{64}$/.test(key) || !["download", "upload", "mount", "mount_check", "inline", "cache"].includes(stage)) throw new Error("附件阶段无效");
+    if (!/^[a-f0-9]{64}$/.test(key) || !["download", "upload", "upload_check", "mount", "mount_check", "inline", "cache"].includes(stage)) throw new Error("附件阶段无效");
     const id = randomUUID();
     this.db.prepare(`INSERT INTO attachment_stage_receipts (id, scope, attachment_key, stage, status, started_at, details)
       VALUES (?, ?, ?, ?, 'pending', ?, ?)`)
@@ -111,13 +118,56 @@ export class AttachmentTraceStore {
   }
 
   confirmedUpload(message: ChannelMessage, key: string): AttachmentStageDetails | undefined {
-    const row = this.db.prepare(`SELECT details FROM attachment_stage_receipts
-      WHERE scope=? AND attachment_key=? AND stage='upload' AND status='succeeded'
-      ORDER BY sequence DESC LIMIT 1`).get(this.scope(message), key) as { details: string } | undefined;
-    if (!row) return undefined;
-    const value = details(JSON.parse(row.details));
+    const row = this.latestUpload(message, key);
+    if (!row || row.status !== "succeeded") return undefined;
+    const value = details(row);
     if (!value.fileId || value.bytes === undefined || !value.sha256) throw new Error("已确认附件上传记录不完整，不能自动重复上传");
     return value;
+  }
+
+  latestUpload(message: ChannelMessage, key: string): AttachmentStageReceipt | undefined {
+    // 同一源消息可能同时出现在群背景和话题引用中，上传缓存键本身不含Thread。
+    // 只合并同应用/租户/群/源消息/附件的上传，保留首次回执的真实Thread归属。
+    const row = this.db.prepare(`SELECT * FROM attachment_stage_receipts WHERE attachment_key=?
+      AND json_extract(scope, '$[0]')=? AND json_extract(scope, '$[1]')=? AND json_extract(scope, '$[2]')=?
+      AND json_extract(scope, '$[3]')=? AND json_extract(scope, '$[5]')=?
+      AND (stage='upload' OR (stage='upload_check' AND status='succeeded')) ORDER BY sequence DESC LIMIT 1`)
+      .get(key, message.channelType, message.installationId, message.tenantId, message.conversationId, message.messageId);
+    return row ? receipt(row) : undefined;
+  }
+
+  beginUpload(message: ChannelMessage, key: string, originalName: string, value: { bytes: number; sha256: string }): AttachmentStageReceipt {
+    this.db.exec("SAVEPOINT attachment_upload_start");
+    try {
+      const previous = this.latestUpload(message, key);
+      if (previous && !(previous.status === "error" && previous.rejected)) throw new Error("附件上传结果待核实，未重复提交上传请求");
+      const id = this.begin(message, key, "upload", { ...value, uploadName: newUploadName(originalName) });
+      const started = receipt(this.db.prepare("SELECT * FROM attachment_stage_receipts WHERE id=?").get(id)!);
+      this.db.exec("RELEASE attachment_upload_start");
+      return started;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO attachment_upload_start; RELEASE attachment_upload_start");
+      throw error;
+    }
+  }
+
+  confirmUpload(message: ChannelMessage, key: string, expectedId: string, proof: FileUploadProof, checkedAfter: number): void {
+    if (proof.status !== "confirmed" || !validUploadQuery(proof) || !proof.fileId || !Number.isSafeInteger(proof.checkedAt)
+      || proof.checkedAt < checkedAfter || proof.checkedAt > Date.now() || Date.now() - proof.checkedAt > 30_000) throw new Error("附件上传核查证据无效");
+    this.db.exec("SAVEPOINT attachment_upload_confirmation");
+    try {
+      const previous = this.latestUpload(message, key);
+      if (!previous || previous.id !== expectedId || previous.uploadName !== proof.uploadName || previous.bytes !== proof.bytes
+        || previous.startedAt !== proof.startedAt || !previous.sha256 || previous.rejected
+        || (previous.status === "succeeded" && previous.fileId !== proof.fileId)) throw new Error("附件上传记录已变化");
+      const id = this.begin(message, key, "upload_check", { bytes: previous.bytes, sha256: previous.sha256,
+        uploadName: proof.uploadName, fileId: proof.fileId, checkedAt: proof.checkedAt });
+      this.finish(id, "succeeded");
+      this.db.exec("RELEASE attachment_upload_confirmation");
+    } catch (error) {
+      this.db.exec("ROLLBACK TO attachment_upload_confirmation; RELEASE attachment_upload_confirmation");
+      throw error;
+    }
   }
 
   latestMount(message: ChannelMessage, key: string, sessionId: string): AttachmentStageReceipt | undefined {

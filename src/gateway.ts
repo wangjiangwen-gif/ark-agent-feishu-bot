@@ -95,7 +95,7 @@ export class Gateway {
   private configurationWarnings = new Set<string>();
   private store: GatewayStore;
   private ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
-    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "inspectFileMount" | "getSessionStats" | "inspectCompaction" | "inspectRun"
+    ArkClient, "buildSessionCreateRequest" | "uploadFile" | "inspectFileUpload" | "addSessionFile" | "addSessionResource" | "inspectFileMount" | "getSessionStats" | "inspectCompaction" | "inspectRun"
   >>;
   private reply: Reply;
   private options: GatewayOptions;
@@ -103,7 +103,7 @@ export class Gateway {
   constructor(
     store: GatewayStore,
     ark: Pick<ArkClient, "createSession" | "run"> & Partial<Pick<
-      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "addSessionFile" | "addSessionResource" | "inspectFileMount" | "getSessionStats" | "inspectCompaction" | "inspectRun"
+      ArkClient, "buildSessionCreateRequest" | "uploadFile" | "inspectFileUpload" | "addSessionFile" | "addSessionResource" | "inspectFileMount" | "getSessionStats" | "inspectCompaction" | "inspectRun"
     >>,
     reply: Reply,
     options: GatewayOptions
@@ -1277,8 +1277,20 @@ export class Gateway {
     let cached = this.store.getAttachment(key);
     const mountPath = `/mnt/data/${key.slice(0, 24)}/${name}`;
     if (!cached && !isInlineTextFile(name)) {
-      const confirmed = this.store.attachmentTrace.confirmedUpload(message, key);
+      const previous = this.store.attachmentTrace.latestUpload(message, key);
+      let confirmed: AttachmentStageDetails | undefined = previous?.status === "succeeded" ? previous : undefined;
+      if (!confirmed && previous && !(previous.status === "error" && previous.rejected)) {
+        if (!this.ark.inspectFileUpload || !previous.uploadName || previous.bytes === undefined || !previous.sha256) {
+          throw new Error("附件上传结果待核实，未重复提交上传请求");
+        }
+        const checkedAfter = Date.now();
+        const proof = await this.ark.inspectFileUpload({ uploadName: previous.uploadName, bytes: previous.bytes, startedAt: previous.startedAt });
+        if (proof.status !== "confirmed") throw new Error("附件上传结果待核实，未重复提交上传请求");
+        this.store.attachmentTrace.confirmUpload(message, key, previous.id, proof, checkedAfter);
+        confirmed = { bytes: previous.bytes, sha256: previous.sha256, fileId: proof.fileId };
+      }
       if (confirmed) {
+        if (!confirmed.fileId || confirmed.bytes === undefined || !confirmed.sha256) throw new Error("附件上传结果待核实，未重复提交上传请求");
         cached = { name, mountPath, bytes: confirmed.bytes!, fileId: confirmed.fileId!, sha256: confirmed.sha256 };
         // 上传回执已落盘、缓存尚未保存时退出，使用原File ID补全本地记录。
         this.store.saveAttachment(key, cached);
@@ -1315,8 +1327,16 @@ export class Gateway {
       return { ...cached, key };
     }
     if (!this.ark.uploadFile) throw new Error("当前 Gateway 未配置方舟文件上传能力");
-    const file = await this.traceAttachment(message, key, "upload", () => this.ark.uploadFile!(name, downloaded!.mimeType, downloaded!.bytes),
-      { bytes, sha256 }, result => ({ fileId: result.id }));
+    const intent = this.store.attachmentTrace.beginUpload(message, key, name, { bytes, sha256: sha256! });
+    let file: { id: string; name: string };
+    try { file = await this.ark.uploadFile(name, downloaded!.mimeType, downloaded!.bytes, { uploadName: intent.uploadName! }); }
+    catch (error) {
+      this.store.attachmentTrace.finish(intent.id, "error", error instanceof ArkHttpError && error.status === 400
+        && error.code === "InvalidParameter" ? { rejected: true } : {});
+      throw error;
+    }
+    // 本地保存失败不改写成“远端上传失败”；下一次先核查此操作，不重传。
+    this.store.attachmentTrace.finish(intent.id, "succeeded", { fileId: file.id });
     const value = { name, mountPath, bytes, sha256, fileId: file.id };
     // 先记录上传结果，挂载失败后可以继续使用原 File ID，避免反复产生孤儿文件。
     this.store.saveAttachment(key, value);
@@ -1480,6 +1500,7 @@ function historyFingerprint(message: ChannelHistoryMessage): string {
 function attachmentError(error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
   if (reason === "附件挂载结果待核实，未重复提交挂载请求") return reason;
+  if (reason === "附件上传结果待核实，未重复提交上传请求") return reason;
   if (/file type not supported/i.test(reason)) return "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown";
   if (reason === "不是有效的 UTF-8 编码，请转为 UTF-8 后发送") return reason;
   if (/^单轮附件总量(?:达到|超过) 40 MB，请分批处理$/.test(reason)) return reason;

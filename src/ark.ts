@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
 import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
+import { inspectUploadedFile, validUploadName, type FileUploadQuery, type FileUploadInspection } from "./upload-inspection.ts";
 
 export class ArkHttpError extends Error {
   status: number;
@@ -361,10 +362,11 @@ export class ArkClient {
     return id;
   }
 
-  async uploadFile(name: string, mimeType: string, bytes: Uint8Array): Promise<{ id: string; name: string }> {
+  async uploadFile(name: string, mimeType: string, bytes: Uint8Array, options: { uploadName: string } | undefined = undefined): Promise<{ id: string; name: string }> {
+    if (options && !validUploadName(options.uploadName)) throw new Error("上传操作标识无效");
     const form = new FormData();
     form.set("purpose", "user_data");
-    form.set("file", new Blob([new Uint8Array(bytes)], { type: mimeType || "application/octet-stream" }), name);
+    form.set("file", new Blob([new Uint8Array(bytes)], { type: mimeType || "application/octet-stream" }), options?.uploadName || name);
     const response = await this.request("/files", { method: "POST", body: form });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
@@ -399,6 +401,25 @@ export class ArkClient {
       combined.throwIfAborted();
       return inspectMountResources(JSON.parse(body), query);
     } catch { return { status: "unknown", reason: "resources_unavailable" }; }
+  }
+
+  async inspectFileUpload(query: FileUploadQuery, signal?: AbortSignal): Promise<FileUploadInspection> {
+    const deadline = AbortSignal.timeout(this.options.inspectionTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    let remaining = 4 * 1024 * 1024;
+    try {
+      return await inspectUploadedFile(query, async path => {
+        combined.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}${path}`, {
+          headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, signal: combined
+        });
+        if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error("文件核查接口不可用"); }
+        const body = await boundedHistoryBody(response, remaining, combined);
+        remaining -= Buffer.byteLength(body);
+        combined.throwIfAborted();
+        return JSON.parse(body);
+      });
+    } catch { return { status: "unknown", reason: "files_unavailable" }; }
   }
 
   async sendMessage(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
