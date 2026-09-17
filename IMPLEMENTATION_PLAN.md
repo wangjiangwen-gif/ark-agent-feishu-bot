@@ -1,5 +1,27 @@
 # 数字员工可靠性与资源配置实施计划
 
+## 本轮交付：PDF经File API直接提供模型输入（2026-09-17）
+
+### Stage PDF1: 核实契约与最小真实探针
+**Goal**: 核实Files上传就绪状态及MA文档URL输入，区别现有沙箱挂载后read的base64链路。
+**Success Criteria**: 用隔离Session和合成PDF证明直接文件引用可被模型读取；不改生产Agent或会话。
+**Tests**: 官方文档核对、合成PDF事实提取与终态/错误事件检查。
+**Status**: Complete
+
+### Stage PDF2: 实现与回归
+**Goal**: 复用Gateway下载/上传缓存，PDF直接进入MA文档输入；保留沙箱文件、TXT/Markdown原文和既有身份隔离。
+**Success Criteria**: 上传未就绪不触发模型；当前/引用/历史PDF行为一致；普通消息和非PDF不回退。
+**Tests**: 请求结构、上传状态、缓存复用、跨scope隔离、异常与完整回归。
+**Status**: Complete
+
+### Stage PDF3: 备份部署与交付
+**Goal**: 部署到10.36.3.236供用户测试，保留rc.2与冷备回退。
+**Success Criteria**: 独立版本号与构建哈希，服务/飞书/WebUI正常，原配置和会话不变。
+**Tests**: 干净打包、实际链路探针、迁移副本与部署健康检查。
+**Status**: In Progress
+
+PDF进展（2026-09-17）：官方事件接口确认使用document/source.type=file/file_id，不将URL作为普通文本。隔离MA探针：小PDF Session sesn-20260917040407-mxdf9，模型约6067ms；两份约4.5MB PDF Session sesn-20260917040447-2gxrh，约5909ms；四项事实均正确、无工具调用/错误。不是客户原文件验收。正式Gateway已覆盖当前/引用/群背景/Thread文件引用、最多8份、就绪等待与回退模式；保留挂载与现有Session。全量1709/1709通过，新增恢复指纹测试后将再次回归；初次新增mock错误已修正，未修改已有测试或跳过用例。check/build/diff通过。待rc.3候选包真实Gateway探针及备份部署。
+
 基线：33fa31c / 0.2.9。依据本对话已确认的十二节开发与验收方案。
 保留现有未跟踪 PDF 复现文件；不将其视为本次端到端验收证据。
 仅内部开发跟踪，不创建飞书方案文档。目标完成前不删除未完成项。

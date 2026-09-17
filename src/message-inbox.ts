@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { runInputFingerprint, type PdfInputFile } from "./pdf-input.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { ChannelMessage, ReplyDeliveryEvent, ReplyObservation } from "./channel.ts";
 import { advanceReplyDelivery, replyContentFingerprint, replyInspectionQuery, replyProofMatches, validateReplyDelivery, validReplyFingerprint, type ReplyDeliveryState } from "./reply-delivery.ts";
@@ -15,6 +16,7 @@ export type InboxPreparation = {
   sessionId: string; input: string; fingerprint: string; notices: string[];
   contextReceipts: Array<{ id: string; fingerprint: string }>; preparedAt: number;
   inlineDeliveryKeys?: string[];
+  pdfFiles?: PdfInputFile[];
   userAuthorization?: PreparedAuthorization;
 };
 export type InboxTask = {
@@ -109,9 +111,10 @@ export class MessageInbox {
       throw new Error("准备检查点结构无效");
     }
     const preparation: InboxPreparation = { sessionId: value.sessionId, input: value.input,
-      fingerprint: createHash("sha256").update(value.input).digest("hex"), notices: value.notices,
+      fingerprint: runInputFingerprint(value.input, value.pdfFiles), notices: value.notices,
       contextReceipts: value.contextReceipts, preparedAt: task.preparation?.preparedAt ?? Date.now(),
       ...(value.inlineDeliveryKeys !== undefined ? { inlineDeliveryKeys: value.inlineDeliveryKeys } : {}),
+      ...(value.pdfFiles !== undefined ? { pdfFiles: value.pdfFiles } : {}),
       ...(value.userAuthorization !== undefined ? { userAuthorization: value.userAuthorization } : {}) };
     validatePreparation(preparation);
     if (preparation.userAuthorization) validateAuthorizationBinding(task.message, preparation.userAuthorization);
@@ -529,7 +532,7 @@ function validatePreparation(value: unknown): asserts value is InboxPreparation 
   if (!hasPreparationKeys(value, ["sessionId", "input", "fingerprint", "notices", "contextReceipts", "preparedAt"])
     || !boundedIdentifier(value.sessionId, 256) || typeof value.input !== "string" || Buffer.byteLength(value.input, "utf8") > 2 * 1024 * 1024
     || typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.fingerprint)
-    || createHash("sha256").update(value.input).digest("hex") !== value.fingerprint
+    || runInputFingerprint(value.input, value.pdfFiles as PdfInputFile[] | undefined) !== value.fingerprint
     || !Number.isSafeInteger(value.preparedAt) || Number(value.preparedAt) <= 0 || Number(value.preparedAt) > Date.now()
     || !Array.isArray(value.notices) || value.notices.length > 128
     || Array.from(value.notices).some(notice => typeof notice !== "string" || Buffer.byteLength(notice, "utf8") > 4096)
@@ -546,7 +549,7 @@ function validatePreparation(value: unknown): asserts value is InboxPreparation 
 }
 
 function hasPreparationKeys(value: unknown, required: string[]): value is Record<string, unknown> {
-  return hasExactKeys(value, [...required, ...["inlineDeliveryKeys", "userAuthorization"].filter(key => value && typeof value === "object" && Object.hasOwn(value, key))]);
+  return hasExactKeys(value, [...required, ...["inlineDeliveryKeys", "userAuthorization", "pdfFiles"].filter(key => value && typeof value === "object" && Object.hasOwn(value, key))]);
 }
 
 function validateAuthorizationBinding(message: ChannelMessage, proof: unknown): void {

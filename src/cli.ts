@@ -11,6 +11,7 @@ import { startChannelAfterRecovery } from "./channel-startup.ts";
 import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelReadMessage, ChannelResource, ChannelInspectReaction, ReplyDeliveryObserver, ChannelInspectReply } from "./channel.ts";
 import { replyContentFingerprint } from "./reply-delivery.ts";
 import { inspectLarkReply } from "./lark-reply-inspection.ts";
+import { pdfInputMode } from "./pdf-input.ts";
 
 const command = process.argv[2] || "run";
 const employeeCommand = process.argv[3] || "run";
@@ -108,6 +109,7 @@ async function runEmployee(): Promise<void> {
   closeAuthorization = () => auth.close();
   gateway = new Gateway(store, ark, (message, outbound, observer) => channel.reply(message, outbound, observer), {
     appId: config.feishuAppId, sessionConfiguration, sessionConfigurationRevision: "employee-runtime-v1",
+    pdfInputMode: pdfInputMode(process.env.ARKAGENT_PDF_INPUT_MODE),
     agentId: config.arkAgentId, environmentId: config.arkEnvironmentId, vaultId: config.arkVaultId,
     timeoutMs: config.sessionTimeoutMs, platformAccess: true, downloadAttachment: (resource, message, maxBytes) => channel.download(resource, message, maxBytes),
     streamReply: channel.streamReply, addReaction: channel.addReaction, removeReaction: channel.removeReaction,
@@ -220,6 +222,7 @@ async function run(): Promise<void> {
   const channel = await createFeishuRuntime(config.feishuAppId, config.feishuAppSecret, (message, id) => store.recordOutgoing(message, id));
   const gateway = new Gateway(store, ark, (message, outbound, observer) => channel.reply(message, outbound, observer), {
     appId: config.feishuAppId, sessionConfiguration,
+    pdfInputMode: pdfInputMode(process.env.ARKAGENT_PDF_INPUT_MODE),
     agentId: config.arkAgentId,
     environmentId: config.arkEnvironmentId,
     vaultId: config.arkVaultId,

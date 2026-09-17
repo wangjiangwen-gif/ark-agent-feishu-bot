@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { pdfDocumentBlocks, runInputFingerprint, eventInputFingerprint, type PdfInputFile } from "./pdf-input.ts";
 import { ArkHttpError, ArkNetworkError, failureDiagnostic, safeErrorCode, safeRequestId, sessionFailure, type FailureDiagnostic } from "./ark-errors.ts";
 export { ArkHttpError } from "./ark-errors.ts";
 import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
@@ -64,7 +65,7 @@ type ArkClientOptions = {
   inspectionTimeoutMs?: number;
 };
 
-type RunBoundary = { startedAt: number; input: string; previousIds: Set<string>; anchored: boolean; page?: string };
+type RunBoundary = { startedAt: number; fingerprint: string; previousIds: Set<string>; anchored: boolean; page?: string };
 
 export type AgentConfig = {
   name: string;
@@ -617,11 +618,35 @@ export class ArkClient {
     } catch { return { status: "unknown", reason: "files_unavailable" }; }
   }
 
-  async sendMessage(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
+  async waitForFileActive(fileId: string, options: { timeoutMs?: number; pollIntervalMs?: number } = {}): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(fileId)) throw new Error("PDF 文件引用无效");
+    const timeout = options.timeoutMs ?? 60_000;
+    const interval = options.pollIntervalMs ?? 500;
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000 || !Number.isSafeInteger(interval) || interval < 1 || interval > 5_000) throw new Error("PDF 就绪等待参数无效");
+    const signal = AbortSignal.timeout(timeout);
+    try {
+      while (true) {
+        signal.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}/files/${encodeURIComponent(fileId)}`, {
+          method: "GET", headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, signal, redirect: "error"
+        });
+        if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error(); }
+        const payload = JSON.parse(await boundedHistoryBody(response, 256 * 1024, signal));
+        const file = payload.data || payload;
+        if (file.id !== fileId || file.purpose !== "user_data" || file.mime_type !== "application/pdf" || file.error ||
+          (file.expire_at != null && (!Number.isFinite(file.expire_at) || file.expire_at * 1000 <= Date.now()))) throw new Error();
+        if (file.status === "active") return;
+        if (file.status !== "processing") throw new Error();
+        await waitFor(interval, signal);
+      }
+    } catch { throw new Error("PDF 文件尚未就绪、已失效或不可读取，请稍后重试；未发送模型请求"); }
+  }
+
+  async sendMessage(sessionId: string, text: string, signal?: AbortSignal, pdfFiles: PdfInputFile[] = []): Promise<void> {
     await this.request(`/sessions/${encodeURIComponent(sessionId)}/events`, {
       method: "POST",
       signal,
-      body: JSON.stringify({ events: [{ type: "user.message", content: [{ type: "text", text }] }] })
+      body: JSON.stringify({ events: [{ type: "user.message", content: [{ type: "text", text }, ...pdfDocumentBlocks(pdfFiles)] }] })
     });
   }
 
@@ -696,8 +721,11 @@ export class ArkClient {
     timeoutMs: number,
     onProgress?: (progress: string) => Promise<void>,
     onDelta?: (snapshot: string) => Promise<void>,
-    assertBeforeSend?: () => void
+    assertBeforeSend?: () => void,
+    pdfFiles: PdfInputFile[] = []
   ): Promise<RunResult> {
+    pdfDocumentBlocks(pdfFiles);
+    pdfFiles = pdfFiles.map(file => ({ ...file }));
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
@@ -705,7 +733,7 @@ export class ArkClient {
     let dispatchGuardFailed = false;
     try {
       const previous = await this.readSessionEvents(sessionId, controller.signal);
-      boundary = { startedAt, input: text, previousIds: new Set(previous.events.flatMap(event => event.id ? [event.id] : [])), anchored: false, page: previous.lastPage };
+      boundary = { startedAt, fingerprint: runInputFingerprint(text, pdfFiles), previousIds: new Set(previous.events.flatMap(event => event.id ? [event.id] : [])), anchored: false, page: previous.lastPage };
       // 先发起 SSE 请求，但不等待服务端返回响应头。部分环境建立事件流约需
       // 15 秒；若在这里 await，会让 user.message 也被无谓阻塞。
       const eventStream = this.openEventStream(sessionId, controller.signal, Boolean(onDelta));
@@ -729,7 +757,7 @@ export class ArkClient {
           throw new Error("发送前校验未通过，已停止发送消息");
         }
       }
-      await this.sendMessage(sessionId, text, controller.signal);
+      await this.sendMessage(sessionId, text, controller.signal, pdfFiles);
       let result = await Promise.any([
         this.consumeEventStream(eventStream, boundary, onProgress, onDelta),
         this.pollRunResult(sessionId, boundary, controller.signal)
@@ -1068,9 +1096,7 @@ function inspectRunHistory(events: ArkEvent[], requestFingerprint: string): RunI
     if (previous && previous !== hash) return { status: "unknown", reason: "conflicting_event" };
     if (!previous) { seen.set(id, hash); unique.push(event); }
   }
-  const anchors = unique.filter(event => event.type === "user.message" && Array.isArray(event.content)
-    && event.content.length > 0 && event.content.every(item => item && item.type === "text" && typeof item.text === "string")
-    && createHash("sha256").update(eventText(event)).digest("hex") === requestFingerprint);
+  const anchors = unique.filter(event => event.type === "user.message" && eventInputFingerprint(event.content) === requestFingerprint);
   if (anchors.length !== 1) return { status: "unknown", reason: anchors.length ? "ambiguous_anchor" : "anchor_not_found" };
   const anchorEventId = anchors[0].id!;
   const unknown = (reason: Extract<RunInspection, { status: "unknown" }>["reason"]): RunInspection => ({ status: "unknown", reason, anchorEventId });
@@ -1183,7 +1209,7 @@ function belongsToRun(event: ArkEvent, boundary: RunBoundary): boolean {
   const preview = event.type === "event_start" ? event.event as ArkEvent | undefined : undefined;
   const id = preview?.id || (typeof event.event_id === "string" ? event.event_id : undefined) || event.id;
   if (id && boundary.previousIds.has(id)) return false;
-  if (event.type === "user.message" && eventText(event) === boundary.input) boundary.anchored = true;
+  if (event.type === "user.message" && eventInputFingerprint(event.content) === boundary.fingerprint) boundary.anchored = true;
   const stamp = Date.parse(String(event.processed_at || preview?.processed_at || ""));
   // 用户事件建立本轮边界后不再依赖本机时钟；无边界的旧事件不能触发终态。
   return boundary.anchored || (Number.isFinite(stamp) ? stamp >= boundary.startedAt : boundary.previousIds.size === 0);
