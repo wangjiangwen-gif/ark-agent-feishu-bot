@@ -206,7 +206,7 @@ async function uninterruptedInput(bytes: number): Promise<{ input: string; uploa
   } finally { await flush(); store.close(); }
 }
 
-for (const bytes of [3, 6 * 1024 * 1024]) test(`original inbox keeps the selected historical eight and byte budget after two mounts (${bytes} bytes each)`, async () => {
+for (const bytes of [3, 30 * 1024 * 1024]) test(`original inbox keeps the selected historical eight and byte budget after two mounts (${bytes} bytes each)`, async () => {
   const baseline = await uninterruptedInput(bytes), files = fixture(), incoming = message();
   assert.deepEqual(baseline.uploads, Array.from({ length: bytes === 3 ? 8 : 6 }, (_, i) => `part-${i + 1}.pdf`));
   exitPreparing(files, incoming, `extra.loadRecentHistory=async()=>${JSON.stringify(historyFiles())};

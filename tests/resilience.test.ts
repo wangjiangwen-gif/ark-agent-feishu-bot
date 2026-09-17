@@ -219,13 +219,26 @@ test("attachment download receives the remaining aggregate budget", async t => {
   const limits: number[] = [];
   const h = harness({ options: { downloadAttachment: async (_resource, _message, limit) => {
     limits.push(limit);
-    return { bytes: new Uint8Array(15 * 1024 * 1024), mimeType: "application/pdf" };
+    return { bytes: new Uint8Array(75 * 1024 * 1024), mimeType: "application/pdf" };
   } } }); t.after(() => h.store.close());
   h.gateway.accept(message("files", { resources: ["a", "b", "c"].map(id => ({ id, name: `${id}.pdf`, type: "file" })) }));
   await until(() => h.replies.length === 1);
-  assert.deepEqual(limits, [20, 20, 10].map(mb => mb * 1024 * 1024));
+  assert.deepEqual(limits, [200, 125, 50].map(mb => mb * 1024 * 1024));
   assert.equal(h.uploads(), 2);
-  assert.match(h.replies[0], /40 MB/);
+  assert.match(h.replies[0], /单文件上限 100 MiB，本轮剩余 50 MiB/);
+});
+
+test("two 100 MiB files fit one turn and a third is rejected before downloading", async t => {
+  const limits: number[] = [];
+  const bytes = new Uint8Array(100 * 1024 * 1024);
+  const h = harness({ options: { downloadAttachment: async (_resource, _message, limit) => {
+    limits.push(limit); return { bytes, mimeType: "application/pdf" };
+  } } }); t.after(() => h.store.close());
+  h.gateway.accept(message("files", { resources: ["a", "b", "c"].map(id => ({ id, name: `${id}.pdf`, type: "file" })) }));
+  await until(() => h.replies.length === 1);
+  assert.deepEqual(limits, [200, 100].map(mb => mb * 1024 * 1024));
+  assert.equal(h.uploads(), 2);
+  assert.match(h.replies[0], /单轮附件总量达到 200 MiB/);
 });
 
 test("history, upload receipts and inline originals survive a real SQLite close and reopen", async t => {

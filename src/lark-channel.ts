@@ -4,6 +4,7 @@ import { replyContentFingerprint, validReplyMessageIds } from "./reply-delivery.
 import { streamFailureText } from "./ark-errors.ts";
 import { withDeliveredFailureNotice } from "./failure-notice.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
+import { attachmentSizeError } from "./attachment-limits.ts";
 import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
 import { inspectLarkReply } from "./lark-reply-inspection.ts";
 import type { ReactionQuery, ReactionObservation, ReplyInspectionQuery, ReplyObservation } from "./channel.ts";
@@ -106,7 +107,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
       safety: { chatQueue: { enabled: false }, staleMessageWindowMs: 5 * 60_000 }
     });
     // Channel SDK 的 downloadResource 返回完整 Buffer。真实 SDK 同时公开 rawClient，
-    // 用它流式读取可在下载过程中执行 20 MB 上限，避免超大附件先占满内存。
+    // 用它流式读取可在下载过程中执行大小上限，避免超大附件先占满内存。
     if (this.channel.rawClient) this.streamingDownloader = createFeishuResourceDownloader(this.channel.rawClient, this.maxFileBytes);
   }
 
@@ -302,7 +303,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
     if (this.streamingDownloader) return this.streamingDownloader(resource, message, remainingBytes);
     const bytes = await this.channel.downloadResource(message.messageId, resource.id, resource.type);
     const limit = Math.min(this.maxFileBytes, remainingBytes);
-    if (bytes.byteLength > limit) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(limit)} 限制`);
+    if (bytes.byteLength > limit) throw attachmentSizeError(bytes.byteLength, this.maxFileBytes, remainingBytes);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
 }
@@ -642,8 +643,4 @@ function inferMimeType(name: string, type: "file" | "image"): string {
   if (/\.(?:md|markdown)$/i.test(name)) return "text/markdown";
   if (/\.txt$/i.test(name)) return "text/plain";
   return "application/octet-stream";
-}
-
-function formatBytes(value: number): string {
-  return value >= 1024 * 1024 ? `${Math.round(value / 1024 / 1024)} MB` : `${Math.round(value / 1024)} KB`;
 }

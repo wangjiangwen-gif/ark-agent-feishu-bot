@@ -8,6 +8,7 @@ import { assertEnvironmentAppId, configFingerprint, finalizeSessionRequest, merg
 import type { AuditLog, ConversationKey, GatewayStore } from "./store.ts";
 import { createHash } from "node:crypto";
 import { MAX_PDF_INPUT_FILES, runInputFingerprint, type PdfInputFile } from "./pdf-input.ts";
+import { MAX_FILE_BYTES, MAX_TURN_ATTACHMENT_BYTES, attachmentSizeError, isAttachmentSizeMessage } from "./attachment-limits.ts";
 import { baselineCompaction, startCompaction, finishCompaction } from "./session-compaction.ts";
 import { authorizationContinuation, authorizationRecoveryDecision, type RunEvidence } from "./run-evidence.ts";
 import type { InboxBinding, InboxTask, InboxPreparation } from "./message-inbox.ts";
@@ -1671,17 +1672,18 @@ export class Gateway {
         this.store.saveAttachment(key, cached);
       }
     }
-    if (budget.bytes >= 40 * 1024 * 1024) throw new Error("单轮附件总量达到 40 MB，请分批处理");
+    if (budget.bytes >= MAX_TURN_ATTACHMENT_BYTES) throw new Error("单轮附件总量达到 200 MiB，请分批处理");
     if (isInlineTextFile(name) && budget.inlineBytes >= MAX_INLINE_TEXT_BYTES) throw new Error("单轮纯文本总量达到 256 KB，请分批处理");
-    const remainingBytes = Math.min(40 * 1024 * 1024 - budget.bytes, isInlineTextFile(name) ? MAX_INLINE_TEXT_BYTES - budget.inlineBytes : 20 * 1024 * 1024);
+    const remainingBytes = Math.min(MAX_TURN_ATTACHMENT_BYTES - budget.bytes, isInlineTextFile(name) ? MAX_INLINE_TEXT_BYTES - budget.inlineBytes : MAX_TURN_ATTACHMENT_BYTES);
     const downloaded = cached ? undefined : await this.traceAttachment(message, key, "download", async () => {
       const result = await this.options.downloadAttachment!(resource, message, remainingBytes);
       return { ...result, sha256: createHash("sha256").update(result.bytes).digest("hex") };
     }, {}, result => ({ bytes: result.bytes.byteLength, sha256: result.sha256 }));
     const bytes = cached?.bytes ?? downloaded!.bytes.byteLength;
     const sha256 = cached?.sha256 ?? downloaded?.sha256;
+    if (!isInlineTextFile(name) && bytes > Math.min(MAX_FILE_BYTES, remainingBytes)) throw attachmentSizeError(bytes, MAX_FILE_BYTES, remainingBytes);
     budget.bytes += bytes;
-    if (budget.bytes > 40 * 1024 * 1024) throw new Error("单轮附件总量超过 40 MB，请分批处理");
+    if (budget.bytes > MAX_TURN_ATTACHMENT_BYTES) throw new Error("单轮附件总量超过 200 MiB，请分批处理");
     if (isInlineTextFile(name)) {
       budget.inlineBytes += bytes;
       if (budget.inlineBytes > MAX_INLINE_TEXT_BYTES) throw new Error("单轮纯文本总量超过 256 KB，请分批处理");
@@ -1878,6 +1880,7 @@ function historyFingerprint(message: ChannelHistoryMessage): string {
 
 function attachmentError(error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
+  if (isAttachmentSizeMessage(reason)) return reason;
   if (reason === "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown"
     || reason === "文件大小超过本轮剩余额度，请缩小文件或分批处理") return reason;
   if (reason === "附件挂载结果待核实，未重复提交挂载请求") return reason;
@@ -1885,6 +1888,7 @@ function attachmentError(error: unknown): string {
   if (/file type not supported/i.test(reason)) return "MA 暂不支持此文件类型，可转为 PDF 或发送 UTF-8 TXT/Markdown";
   if (reason === "不是有效的 UTF-8 编码，请转为 UTF-8 后发送") return reason;
   if (/^单轮附件总量(?:达到|超过) 40 MB，请分批处理$/.test(reason)) return reason;
+  if (/^单轮附件总量(?:达到|超过) 200 MiB，请分批处理$/.test(reason)) return reason;
   if (/^单轮纯文本总量(?:达到|超过) 256 KB，请分批处理$/.test(reason)) return reason;
   if (/^文件 .* 超过(?:本轮剩余 )?.* 限制$/.test(reason)) return "文件大小超过本轮剩余额度，请缩小文件或分批处理";
   if (reason === "当前 Gateway 未配置附件下载能力" || reason === "当前 Gateway 未配置方舟文件上传能力") return reason;

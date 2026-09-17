@@ -1,5 +1,27 @@
 # 数字员工可靠性与资源配置实施计划
 
+## 本轮交付：100 MiB附件下载上限（2026-09-17）
+
+### Stage SIZE1: 边界与诊断测试
+**Goal**: 单文件100 MiB、单轮200 MiB，明确剩余额度与单文件上限，保留纯文本256 KiB边界。
+**Success Criteria**: 默认Channel/legacy下载器、流式和响应头都执行相同限制。
+**Tests**: 100 MiB恰好通过，超1字节拒绝，单轮预算和安全错误提示。
+**Status**: Complete
+
+### Stage SIZE2: 实现与回归
+**Goal**: 统一常量与诊断，保持PDF File API输入和原Session不变。
+**Success Criteria**: 边界及完整回归通过、check/build通过。
+**Tests**: 新增尺寸测试、全量npm test、check/build/diff检查。
+**Status**: Complete
+
+### Stage SIZE3: 备份部署
+**Goal**: 部署rc.4到10.36.3.236，保留rc.3和冷备回退。
+**Success Criteria**: 配置/会话/附件保留，WebUI和飞书连接正常。
+**Tests**: 干净打包、冷备及迁移副本、部署健康检查。
+**Status**: In Progress
+
+SIZE回归：新增边界4项先红后绿，覆盖流式100MiB/超1字节响应头拒绝、单轮剩余量与安全诊断；另验证两份100MiB和总量200MiB拒绝。最终1716/1716通过（16193.297208ms），check/build/diff通过。首次全量有1项旧40MiB预算样本预期失效，按新200MiB边界将该恢复用例的单附件样本从6MiB提高到30MiB，仍验证6份成功、2份受限及恢复输入完全一致；未禁用测试。待rc.4部署。
+
 ## 本轮交付：PDF经File API直接提供模型输入（2026-09-17）
 
 ### Stage PDF1: 核实契约与最小真实探针

@@ -17,7 +17,7 @@ Gateway 默认使用飞书官方 `@larksuite/channel` 接收和归一化消息�
 
 ## 安装与升级
 
-### 当前源码测试版：0.2.10-rc.3
+### 当前源码测试版：0.2.10-rc.4
 
 这是基于当前已实现功能收敛的候选版本，未发布到 npm；下方 `@latest` 命令不会安装此测试版。通过交付的安装包或源码启动，并用 `arkagent --version` 核对版本。
 
@@ -125,7 +125,7 @@ npx --yes arkagent@latest login
 创建一篇标题为“办公助手测试”的飞书文档，正文写“lark-cli 已可用”，完成后把链接发给我。
 ```
 
-也可以在与 Bot 的单聊中直接发送 PDF、Office 文档、Markdown、TXT 或图片。Markdown/TXT 会按 UTF-8 提取原文并直接放入本次消息（单轮合计上限 256 KB）；其他文件会上传到方舟 Files，并以只读方式挂载到当前 Managed Agents Session。同名文件使用独立子目录，不会互相遮盖。未附带文字指令时默认总结文件。二进制文件单个上限为 20 MB，单轮附件总量上限为 40 MB，实际可解析格式仍以方舟 Files API 支持范围为准。某个附件失败时，其他可用附件与文字请求仍继续处理，并在回复中明确告知失败文件。
+也可以在与 Bot 的单聊中直接发送 PDF、Office 文档、Markdown、TXT 或图片。Markdown/TXT 会按 UTF-8 提取原文并直接放入本次消息（单轮合计上限 256 KiB）；其他文件会上传到方舟 Files，并以只读方式挂载到当前 Managed Agents Session。PDF默认同时通过File API引用直接提供给模型。同名文件使用独立子目录，不会互相遮盖。未附带文字指令时默认总结文件。二进制文件单个上限为 **100 MiB（104,857,600字节）**，单轮附件总量上限为 **200 MiB**（包含本轮处理的历史附件）；这不是账号配额，实际可解析格式、PDF页数和模型能力仍以方舟支持范围为准。超限提示会分别说明文件大小（流式读取时为已知下界）、本次下载限制、单文件上限和本轮剩余量。某个附件失败时，其他可用附件与文字请求仍继续处理，并在回复中明确告知失败文件。
 
 源码开发版（尚未发布 npm）仅在用户主动输入 `/compact` 时向当前 Session 提交压缩请求，兼容 `/Compact`、`/COMPACT`；群聊和 Thread 需要 @Bot，命令与当前会话业务串行执行。Session ID、挂载资源和会话映射保持不变。Gateway 不再按 token 数、事件数主动发送 `/compact`，常规上下文压缩由 MA Session 自身管理，实际是否发生以平台事件为准。旧 `sessionCompaction`、`sessionRotation` 阈值和 `sessionStatsCheckIntervalMs` 仅保留配置类型兼容，不再生效。已发布 npm 0.2.9 仍有自动阈值逻辑，需升级到包含此改动的版本才会移除。`/new` 会清除当前飞书会话到方舟 Session 的映射；下一条消息将创建新 Session。
 
