@@ -12,23 +12,27 @@
 **Goal**: 明确候选版本、默认可用路径与已知限制，审查默认CLI兼容性。
 **Success Criteria**: 独立版本号、干净可复现源码提交、包内无配置/数据库/密钥，默认不启用实验功能。
 **Tests**: 默认启动路径只读审查、无密钥版本/帮助入口、包清单检查。
-**Status**: In Progress
+**Status**: Complete
 
 ### Stage RC2: 本地完整回归
 **Goal**: 对冻结版本执行全量测试、构建及交付包验证，不新增无界开发任务。
 **Success Criteria**: 全部确定性测试通过；严重发布阻塞修复后重测；真实平台与模拟边界明确。
 **Tests**: npm test、npm run check、npm run build、独立目录安装包烟测。
-**Status**: In Progress
+**Status**: Complete
 
 ### Stage RC3: 开发机部署与交付
 **Goal**: 备份旧服务，先验证数据库副本迁移，再切换并检查服务与WebUI，交付可直接测试的Bot。
 **Success Criteria**: 原Agent/Environment/AppID配置及会话映射不变，版本可核实、单实例、WebUI/飞书连接正常，备份与回退路径明确。
 **Tests**: SSH只读检查、备份副本quick_check和会话映射比较、部署后版本/健康/连接核验；失败回退旧服务。
-**Status**: Not Started
+**Status**: In Progress
 
 部署前置：首次SSH返回Kerberos Permission denied，已请用户重新kinit；此时未改动开发机。
 
 本地回归：冻结产品源码121dfc7，仅更新候选版本标记及交付说明；1677/1677通过，零失败/取消/跳过（24243.153542ms），check（语法）、build、diff检查通过。独立默认路径门禁92/92通过，未发现P0/P1；正式CLI仍不启用durableQueue，无自动compact/handoff，用户输入文件准备完成后才进入模型。MA/飞书边界模拟，未称真实用户验收完成。系统klist确认当前无Kerberos票据。
+
+旧库副本门禁6/6通过：使用真实33fa31c Store创建合成旧库，再复制给当前Store/Auth验证；原样本SHA256不变。会话/附件保留、旧OAuth加密及唯一归属迁移、歧义归属不阻断基础启动、缺失/不安全密钥拒绝与恢复、双进程锁均符合预期。不是开发机实际数据库迁移验收；该步骤仍须登录后在冷备副本上执行。
+
+候选包：从干净worktree的94b5a2e构建，build-info.dirty=false；82个包文件不含配置/数据库/密钥/PDF复现材料。独立解包字节一致，版本/帮助/9个公开core导出与无密钥doctor入口通过。TGZ复制至工作区output/arkagent-0.2.10-rc.1；证据见docs/test-results/release-candidate-2026-09-17.json。等待用户kinit后执行RC3，尚未改动开发机或发布GitHub/npm。
 
 ## 本轮增量：仅手动压缩与运行失败收尾（2026-09-16）
 

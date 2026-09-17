@@ -1,0 +1,56 @@
+{
+  "date": "2026-09-17",
+  "version": "0.2.10-rc.1",
+  "productSourceCommit": "121dfc7",
+  "candidateCommit": "94b5a2e88fcfb08eed828241d397f1ddcf2718d3",
+  "scope": "基于已有实现冻结可测试版本；不继续扩展原完整目标",
+  "runtimePolicy": {
+    "cliDurableQueue": false,
+    "gatewayAutomaticCompaction": false,
+    "sessionUpgradeUserEntry": false,
+    "dynamicMemoryUserEntry": false,
+    "githubOrNpmPublished": false
+  },
+  "checks": {
+    "fullSuite": { "command": "npm test", "passed": 1677, "failed": 0, "cancelled": 0, "skipped": 0, "durationMs": 24243.153542 },
+    "syntaxCheck": "passed; not a full TypeScript type check",
+    "build": "passed",
+    "diffCheck": "passed",
+    "defaultPathIndependentReview": { "passed": 92, "p0p1Blockers": 0 },
+    "syntheticLegacyDatabaseMigration": {
+      "passed": 6,
+      "baseline": "33fa31c",
+      "sourceSamplesUnchanged": true,
+      "cases": ["session and attachment preservation", "legacy OAuth encryption", "unique identity migration", "ambiguous identity does not stop base startup", "key refusal and restoration", "single process lock"]
+    },
+    "package": {
+      "files": 82,
+      "noConfigurationDatabaseKeysOrUserPdfFixtures": true,
+      "unpackedBytesMatchCleanBuild": true,
+      "versionAndHelp": "passed",
+      "declaredCoreExports": 9,
+      "emptyConfigurationDoctor": "safe expected rejection without state files",
+      "manualSmokeCorrection": "首次人工烟测误要求未声明的GatewayStore导出；按src/core.ts实际9个公开导出复核通过，无需修改产品接口"
+    }
+  },
+  "artifact": {
+    "path": "/Users/bytedance/Desktop/second_brain/output/arkagent-0.2.10-rc.1/arkagent-0.2.10-rc.1.tgz",
+    "sha256": "e69f7efb695ef43c40d11f8723b8227d1e4cadb463e77e8842c10dcb3097f39a",
+    "build": { "commit": "94b5a2e88fcfb08eed828241d397f1ddcf2718d3", "dirty": false, "sourceHash": "a8b24e6dad33147a7d0943679042f8e354edd43b13c5daaefe8d3fa0c4234a68" }
+  },
+  "deployment": {
+    "target": "10.36.3.236",
+    "authorizedByUser": true,
+    "status": "awaiting_kerberos",
+    "remoteMutations": 0,
+    "evidence": "SSH rejected gssapi authentication; local system klist reported Cache not found",
+    "next": "恢复Kerberos登录后，核实服务路径和状态、冷备配置数据库及密钥、在副本迁移验证，随后切换候选包并检查版本/WebUI/飞书连接"
+  },
+  "limits": [
+    "本轮MA/飞书为模拟，未完成真实飞书业务验收",
+    "客户原PDF超时/稍后早停未确认修复",
+    "手动compact真实成功契约仍待验证",
+    "未启用实验持久队列或承诺全部中断任务自动恢复",
+    "回退必须恢复升级前数据库及配套密钥配置，外部Token轮换不能由文件回退撤销"
+  ]
+}
