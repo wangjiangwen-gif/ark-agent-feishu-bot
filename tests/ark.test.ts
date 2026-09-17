@@ -80,11 +80,12 @@ test("resultFromEvents preserves user authorization requirements despite MA is_e
   });
 });
 
-test("run stops streaming Agent denial text after lark-cli requests user authorization", async () => {
+for (const subtype of ["token_missing", "token_invalid"] as const) {
+test(`run stops streaming Agent denial text after lark-cli ${subtype}`, async () => {
   const snapshots: string[] = [];
   const events = [
     { type: "agent.tool_use", id: "call-one", name: "bash", input: { command: "lark-cli calendar +agenda --as user" } },
-    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_missing"}}` }] },
+    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"${subtype}"}}` }] },
     { type: "agent.message", content: [{ type: "text", text: "你没有凭证，请自行授权" }] },
     { type: "session.status_idle" }
   ];
@@ -99,6 +100,40 @@ test("run stops streaming Agent denial text after lark-cli requests user authori
 
   assert.deepEqual(snapshots, []);
   assert.equal(result.authorizationRequired?.domain, "calendar");
+  assert.equal(result.authorizationRequired?.subtype, subtype);
+});
+}
+
+for (const numbered of [false, true]) {
+  test(`actual user token_invalid error 99991668 is recognized (numbered=${numbered})`, () => {
+    const payload = JSON.stringify({ ok: false, identity: "user", error: {
+      type: "authentication", subtype: "token_invalid", code: 99991668,
+      message: "Invalid access token for authorization. Please make a request with token attached."
+    } }, null, 2);
+    const text = numbered ? payload.split("\n").map((line, i) => `${i + 1}\t${line}`).join("\n") : payload;
+    const event = { type: "agent.tool_result", tool_use_id: "call", is_error: false,
+      content: [{ type: "text", text: `exit_code: 3\n--- ${numbered ? "output (stdout + stderr)" : "stderr"} ---\n${text}` }] };
+    assert.deepEqual(eventUserAuthorizationRequired(event, new Map([["call", "calendar"]])), {
+      identity: "user", errorType: "authentication", subtype: "token_invalid", domain: "calendar"
+    });
+  });
+}
+
+for (const changed of [
+  { identity: "bot" }, { ok: true }, { error: { type: "authorization", subtype: "token_invalid" } },
+  { error: { type: "authorization", subtype: "scope_missing" } },
+  { error: { type: "authentication", subtype: "unknown_error" } }
+]) {
+  test(`unrelated error must not initiate OAuth: ${JSON.stringify(changed)}`, () => {
+    const payload = { ok: false, identity: "user", error: { type: "authentication", subtype: "token_invalid" }, ...changed };
+    assert.equal(eventUserAuthorizationRequired({ type: "agent.tool_result",
+      content: [{ type: "text", text: `exit_code: 3\n--- stderr ---\n${JSON.stringify(payload)}` }] }), undefined);
+  });
+}
+
+test("Agent denial text alone does not initiate OAuth", () => {
+  assert.equal(eventUserAuthorizationRequired({ type: "agent.message",
+    content: [{ type: "text", text: 'exit_code: 3\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_invalid"}}' }] }), undefined);
 });
 
 test("Ark requests configure lark-cli, Vault credential and Session binding", async () => {

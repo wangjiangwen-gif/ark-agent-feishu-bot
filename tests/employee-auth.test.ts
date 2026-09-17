@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readOnlyEvidence } from "./helpers/run-evidence.ts";
 import { setTimeout as delay } from "node:timers/promises";
 import { EmployeeAuthorizationManager, EMPLOYEE_CALENDAR_USER_SCOPES } from "../src/employee-auth.ts";
 import { Gateway, type IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
 import { OAuthError } from "../src/oauth.ts";
+import { resultFromEvents } from "../src/ark.ts";
 
 const identity = { channelType: "lark", installationId: "cli", tenantId: "tenant", openId: "ou-one" };
 
@@ -112,13 +112,15 @@ test("an expired refresh token keeps the pre-mounted Vault and falls through to 
   store.close();
 });
 
-test("gateway mounts the placeholder Vault once and resumes the same Session after OAuth", async () => {
+for (const subtype of ["token_missing", "token_invalid"] as const) {
+test(`gateway mounts the placeholder Vault once and resumes the same Session after ${subtype} OAuth`, async t => {
   const store = new GatewayStore(":memory:");
   let releasePoll: ((value: { accessToken: string; refreshToken: string; expiresAt: number }) => void) | undefined;
   const poll = new Promise<{ accessToken: string; refreshToken: string; expiresAt: number }>(resolve => { releasePoll = resolve; });
   const createdVaultLists: string[][] = [];
   const runSessions: string[] = [];
   const credentialWrites: string[] = [];
+  const cards: string[] = [];
   let gateway: Gateway;
   const ark = {
     listVaults: async () => [], createVault: async () => "vlt-user", listCredentials: async () => [],
@@ -134,7 +136,15 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
     run: async (sessionId: string) => {
       runSessions.push(sessionId);
       return runSessions.length === 1
-        ? { terminal: "idle" as const, messages: [], authorizationRequired: calendarRequest(), evidence: readOnlyEvidence() }
+        ? resultFromEvents([
+          { id: "original-user-event", type: "user.message", content: [{ type: "text", text: "查看我的日程" }] },
+          { id: "calendar-call", type: "agent.tool_use", name: "bash", input: { command: "lark-cli calendar +agenda --as user" } },
+          { id: "calendar-result", type: "agent.tool_result", tool_use_id: "calendar-call", is_error: false,
+            content: [{ type: "text", text: `exit_code: 3\n--- stderr ---\n${JSON.stringify({ ok: false, identity: "user",
+              error: { type: "authentication", subtype, code: 99991668 } })}` }] },
+          { id: "denial", type: "agent.message", content: [{ type: "text", text: "请自行授权" }] },
+          { id: "idle", type: "session.status_idle" }
+        ].map(event => ({ ...event, processed_at: new Date().toISOString() })), 0)!
         : { terminal: "idle" as const, messages: ["已查询日程"] };
     }
   };
@@ -142,7 +152,8 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
     begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }),
     poll: async () => poll,
     getUserIdentity: async () => ({ openId: "ou-one", tenantKey: "tenant" })
-  } as never, async () => undefined, (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId));
+  } as never, async message => { cards.push(message.messageId); }, (message, userVaultId) => gateway.resumeAfterAuthorization(message, userVaultId));
+  t.after(() => { auth.close(); store.close(); });
   gateway = new Gateway(store, ark, async () => undefined, {
     agentId: "agent", environmentId: "env", vaultId: "vlt-bot", timeoutMs: 5_000, platformAccess: true,
     getUserVaultIds: message => auth.vaultIds(message), ensureAuthorization: (message, request) => auth.ensure(message, request),
@@ -150,16 +161,47 @@ test("gateway mounts the placeholder Vault once and resumes the same Session aft
   });
 
   gateway.accept(authMessage("om-hot-reload", "direct"));
-  await delay(30);
+  await until(() => cards.length === 1);
   releasePoll?.({ accessToken: "valid-uat", refreshToken: "refresh", expiresAt: Date.now() + 60 * 60_000 });
-  await delay(50);
+  await until(() => store.getAuthorizationRecovery(authMessage("om-hot-reload", "direct"))?.state === "completed");
 
   assert.deepEqual(createdVaultLists, [["vlt-bot", "vlt-user"]]);
   assert.deepEqual(runSessions, ["session-original", "session-original"]);
   assert.deepEqual(credentialWrites, ["ARKAGENT_USER_AUTH_PENDING", "valid-uat"]);
   assert.equal(store.credentials.get(identity)?.credentialId, "vcrd-user");
-  store.close();
+  assert.deepEqual(cards, ["om-hot-reload"]);
+  assert.ok(store.listAuditLogs().some(log => log.action === "authorization_required" && log.summary?.includes(subtype)));
 });
+}
+
+test("a locally ready but rejected credential opens one reauthorization card without discarding its binding", async t => {
+  const store = new GatewayStore(":memory:");
+  store.credentials.save(identity, { status: "ready", vaultId: "vlt-user", credentialId: "vcrd-user",
+    refreshToken: "refresh", expiresAt: Date.now() + 3_600_000, scopes: EMPLOYEE_CALENDAR_USER_SCOPES }, 0);
+  let cards = 0;
+  const auth = new EmployeeAuthorizationManager(store, {
+    updateEnvironmentCredential: async () => { throw new Error("不得在等待授权时改写凭证"); }
+  } as never, {
+    begin: async () => ({ verificationUrl: "https://example.com/oauth", deviceCode: "device", expiresAt: Date.now() + 60_000, intervalMs: 1000 }),
+    poll: async () => new Promise(() => undefined),
+    refresh: async () => { throw new Error("不得因工具错误盲目重试刷新"); }
+  } as never, async () => { cards++; }, () => { throw new Error("尚未授权不能续跑"); });
+  t.after(() => { auth.close(); store.close(); });
+  const request = { ...calendarRequest(), subtype: "token_invalid" as const };
+  const message = authMessage("om-invalid-ready", "direct");
+  assert.equal(await auth.ensure(message, request), false);
+  assert.equal(await auth.ensure(message, request), false);
+  assert.equal(cards, 1);
+  assert.equal(store.authorizations.get(identity)?.phase, "waiting");
+  assert.equal(store.credentials.get(identity)?.credentialId, "vcrd-user");
+  assert.equal(store.credentials.get(identity)?.refreshToken, "refresh");
+});
+
+async function until(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (!predicate() && Date.now() < deadline) await delay(5);
+  assert.ok(predicate(), "后台授权任务应在测试期限内完成");
+}
 
 function authMessage(messageId: string, conversationType: "direct" | "group" = "group"): IncomingMessage {
   return {

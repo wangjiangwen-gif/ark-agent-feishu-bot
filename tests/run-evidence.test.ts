@@ -9,6 +9,23 @@ const result = (id: string, payload: unknown, exit = 0): ArkEvent => ({ id: `res
   is_error: false, content: [{ type: "text", text: `exit_code: ${exit}\n--- stdout ---\n\n--- stderr ---\n${JSON.stringify(payload)}` }] });
 const auth = result("calendar", { ok: false, identity: "user", error: { type: "authentication", subtype: "token_missing" } }, 3);
 const readUse = use("calendar", "lark-cli calendar +agenda --as user");
+
+for (const prior of ["read_only", "writes_present", "uncertain"] as const) {
+  test(`token_invalid preserves authorization continuation safety: ${prior}`, () => {
+    const earlier = prior === "read_only" ? [] : [
+      use("earlier", prior === "writes_present" ? "lark-cli docs +create" : "custom-command"),
+      result("earlier", { ok: true, data: {} })
+    ];
+    const invalid = result("calendar", { ok: false, identity: "user",
+      error: { type: "authentication", subtype: "token_invalid", code: 99991668 } }, 3);
+    const observed = resultFromEvents([anchor, ...earlier, readUse, invalid, { id: "idle", type: "session.status_idle" }]
+      .map(event => ({ ...event, processed_at: "2026-09-17T14:26:25Z" })), 0);
+    assert.equal(observed?.authorizationRequired?.subtype, "token_invalid");
+    assert.equal(observed?.authorizationRequired?.domain, "calendar");
+    assert.equal(authorizationRecoveryDecision(observed?.evidence), prior);
+  });
+}
+
 function collect(events: ArkEvent[]) {
   const collector = new RunEvidenceCollector();
   for (const event of events) collector.observe(event, event === auth);

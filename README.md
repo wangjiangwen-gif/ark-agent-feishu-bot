@@ -175,7 +175,7 @@ npx --yes arkagent@latest employee doctor
 
 ### 在对话中申请用户授权
 
-数字员工默认使用 Bot 身份工作。单聊任务确实需要读取用户个人数据时，Agent 调用 `lark-cli --as user`；只有工具返回结构化 `token_missing`，Gateway 才按当前消息发送者发起 OAuth，不依赖关键词猜测。例如：
+数字员工默认使用 Bot 身份工作。单聊任务确实需要读取用户个人数据时，Agent 调用 `lark-cli --as user`；只有工具返回用户身份的结构化 `authentication/token_missing`（凭证缺失）或 `authentication/token_invalid`（凭证无效），Gateway 才按当前消息发送者发起 OAuth，不依赖关键词猜测。预置 Credential 不代表已完成授权；现有凭证仍按原策略在请求前刷新，运行中被拒绝的凭证进入重新授权。Bot 错误、应用权限不足和群聊不会触发个人授权。例如：
 
 ```text
 帮我安排明天下午 3 点到 3 点半的测试日程，先检查我的日程冲突。
@@ -184,7 +184,7 @@ npx --yes arkagent@latest employee doctor
 完整流程：
 
 1. 用户首次单聊时，Gateway 预先创建该用户独立的 Vault 和占位 Credential，并在创建 Session 时完成挂载；
-2. Agent 调用用户身份工具，`lark-cli` 返回结构化 `token_missing`；Gateway 发送“授权查看你的日程”卡片；
+2. Agent 调用用户身份工具，`lark-cli` 返回结构化 `token_missing` 或 `token_invalid`；Gateway 发送“授权查看你的日程”卡片；
 3. 用户点击卡片，以自己的飞书账号授权日历读取与忙闲权限；
 4. Gateway 校验授权账号的 `open_id` 必须等于消息发送者；
 5. 用户短期 access token 更新到已挂载的 Credential，refresh token 留在本地；

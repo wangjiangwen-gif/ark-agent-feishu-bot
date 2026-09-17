@@ -26,6 +26,8 @@ test("employee prompt clarifies ambiguous requests before using tools", () => {
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /可用范围由飞书平台的应用可用范围和事件投递决定/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /可以说明凭证类型.*tenant access token/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /token_missing/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /token_invalid/);
+  assert.match(EMPLOYEE_AGENT_CONFIG.system, /预置 Credential 不代表已完成用户授权/);
   assert.match(EMPLOYEE_AGENT_CONFIG.system, /不得运行 lark-cli auth login/);
 });
 

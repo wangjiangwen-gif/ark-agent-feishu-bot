@@ -1,0 +1,47 @@
+{
+  "date": "2026-09-17",
+  "scope": "单聊用户凭证无效错误接入既有OAuth流程",
+  "rootCause": {
+    "observedSubtype": "token_invalid",
+    "observedCode": 99991668,
+    "previouslyRecognizedSubtype": "token_missing"
+  },
+  "tests": {
+    "added": 18,
+    "red": { "passed": 41, "failed": 4 },
+    "focused": { "passed": 110, "failed": 0 },
+    "full": { "passed": 1734, "failed": 0, "skipped": 0, "cancelled": 0, "durationMs": 20929.166208 },
+    "check": "passed (Node语法检查，不是TypeScript类型检查)",
+    "build": "passed",
+    "diffCheck": "passed",
+    "initialRestrictedRun": "21项本地HTTP监听因沙箱权限失败；批准本地监听后全量通过，未修改或禁用测试"
+  },
+  "coverage": [
+    "真实99991668错误结构、普通与带行号工具输出",
+    "SSE抑制误导性的自行授权回复、历史回放保留授权类型",
+    "token_missing兼容、Bot及权限不足和未知错误不误触发",
+    "占位Credential授权后原地更新、保留原Session",
+    "本地ready但实际invalid时发一张重新授权卡片、等待时不清除原绑定",
+    "群聊和话题不发个人授权卡片、重复错误不无限续跑",
+    "读取证据可续办，已写入或未知操作仍禁止整轮自动重放",
+    "既有过期前刷新和刷新失败恢复流程全量回归"
+  ],
+  "readOnlyReplay": {
+    "sessionId": "sesn-20260916134002-26pc2",
+    "userEventId": "sevt-20260917142601-4nk7h",
+    "authorizationRequired": { "identity": "user", "errorType": "authentication", "subtype": "token_invalid", "domain": "calendar" },
+    "terminal": "idle",
+    "continuationDecision": "uncertain",
+    "reason": "前两步命令无法被既有安全规则证实为纯读取；未放宽续跑限制",
+    "sentMessages": 0,
+    "executedTools": 0
+  },
+  "boundaries": {
+    "externalServicesInTests": "mock",
+    "liveOAuthScanTested": false,
+    "deployed": false,
+    "published": false,
+    "liveAgentPromptChanged": false,
+    "officialDocs": "官方入口读取失败；本次仅扩展已取得真实运行证据的CLI错误类型，不修改MA请求契约"
+  }
+}

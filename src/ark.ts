@@ -32,7 +32,7 @@ export type RunInspection =
 export type UserAuthorizationRequired = {
   identity: "user";
   errorType: "authentication";
-  subtype: "token_missing";
+  subtype: "token_missing" | "token_invalid";
   domain?: string;
 };
 
@@ -1272,10 +1272,13 @@ export function eventUserAuthorizationRequired(
   try { payload = JSON.parse(normalized.slice(jsonStart, jsonEnd + 1)) as Record<string, unknown>; }
   catch { return undefined; }
   const error = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : undefined;
-  if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication" || error.subtype !== "token_missing") return undefined;
+  if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication") return undefined;
+  // 已预置但未授权的Credential或被撤销的UAT可能存在值，CLI会返回token_invalid而非token_missing。
+  // 只接入已确认的用户凭证错误，Bot、应用权限不足和未知错误不能借此申请个人授权。
+  if (error.subtype !== "token_missing" && error.subtype !== "token_invalid") return undefined;
   const toolUseId = typeof event.tool_use_id === "string" ? event.tool_use_id : "";
   const domain = toolDomains.get(toolUseId);
-  return { identity: "user", errorType: "authentication", subtype: "token_missing", ...(domain ? { domain } : {}) };
+  return { identity: "user", errorType: "authentication", subtype: error.subtype, ...(domain ? { domain } : {}) };
 }
 
 function parseEventBlock(block: string): ArkEvent[] {

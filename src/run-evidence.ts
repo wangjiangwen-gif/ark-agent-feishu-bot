@@ -141,5 +141,5 @@ export function authorizationRecoveryDecision(evidence: RunEvidence | undefined)
 export function authorizationContinuation(evidence: RunEvidence): string {
   if (authorizationRecoveryDecision(evidence) !== "read_only") throw new Error("执行证据不足，不能自动续跑");
   const ids = evidence.steps.filter(step => step.outcome === "auth_required").map(step => step.toolUseId);
-  return `用户身份凭证已更新。这是原任务的授权恢复事件，不是重新开始原任务。\n仅继续本Session上轮因缺少用户凭证而未完成的步骤；不要重新执行已完成步骤。\n原任务事件：${evidence.anchorEventId}\n待继续的工具调用：${JSON.stringify(ids)}\n已核查此前步骤仅有读取。若任务状态与此记录不一致，停止并说明差异。`;
+  return `用户身份凭证已更新。这是原任务的授权恢复事件，不是重新开始原任务。\n仅继续本Session上轮因用户凭证缺失或无效而未完成的步骤；不要重新执行已完成步骤。\n原任务事件：${evidence.anchorEventId}\n待继续的工具调用：${JSON.stringify(ids)}\n已核查此前步骤仅有读取。若任务状态与此记录不一致，停止并说明差异。`;
 }

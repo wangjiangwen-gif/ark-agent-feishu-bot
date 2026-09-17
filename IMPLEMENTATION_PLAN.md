@@ -491,3 +491,24 @@ Session升级协议层增量（2026-09-16，本地基线34ecfa5）：上一轮�
 - U01：upgrade顶层协议、单次提交和有界状态轮询已完成本地测试；嵌套契约、网关身份边界/互斥/持久化恢复及实际生效待完成。
 - 平台依赖：MA官方页面此前读取失败；本轮重新寻找可验证契约。测试额度使用已有授权账号，生产Agent不自动修改。
 - 发布：本次开发目标不等于授权推送npm/GitHub或切换生产网关；完成后提供可验收代码与证据，外部发布按明确请求执行。
+## 单聊 token_invalid 授权修复（2026-09-17）
+
+### Stage AUTH1: 复现漏识别
+**Goal**: 用实际错误结构验证 token_invalid 被漏识别，并覆盖身份、错误类型及纯文本误触发边界。
+**Success Criteria**: 新用例在修复前失败，既有 token_missing 行为保持。
+**Tests**: MA 工具结果解析、SSE、历史结果回放。
+**Status**: Complete
+
+### Stage AUTH2: 最小兼容修复
+**Goal**: 将已确认的用户 token_invalid 接入现有 OAuth 卡片流程，同步提示词与说明。
+**Success Criteria**: 原地更新 Credential、不创建替代 Session；群聊不授权；不扩大自动续跑权限。保留已有过期凭证前置刷新，运行中被拒绝的凭证进入重新授权，不盲目重试业务。
+**Tests**: 占位凭证、重新授权、重复错误防循环、群聊与话题隔离。
+**Status**: Complete
+
+### Stage AUTH3: 完整回归
+**Goal**: 运行全量测试、check、build 和脱敏真实事件回放。
+**Success Criteria**: 本地回归通过，明确未部署和未做真实扫码验收的边界。
+**Tests**: 全量自动化与只读 MA 事件解析验证。
+**Status**: Complete
+
+AUTH修复结果：新增18项回归，修复前4项token_invalid用例失败，修复后定向110/110、全量1734/1734通过（20929.166208ms），check/build/diff通过。首次全量在受限环境下21项因本地端口监听权限失败，放开本地测试服务器权限后全通过，未禁用任何测试。真实Session `sesn-20260916134002-26pc2` 的 `sevt-20260917142601-4nk7h` 轮次只读回放识别到calendar/authentication/token_invalid；0消息提交、0工具执行。前两步证据为unknown，因此继续保留不自动续跑整轮的限制。仅本地修复，未部署、未发布、未改线上Agent提示词，未做真实扫码验收。证据见 `docs/test-results/user-token-invalid-2026-09-17.json`。本段完成不代表上方历史大目标全部完成，原计划保留。

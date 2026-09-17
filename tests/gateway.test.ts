@@ -503,7 +503,9 @@ test("legacy per-message employee group mode cannot bypass Bot-only OAuth restri
   store.close();
 });
 
-test("shared group mode never starts user OAuth when the Agent requests UAT", async () => {
+for (const subtype of ["token_missing", "token_invalid"] as const) {
+for (const threadId of ["", "thread-auth"]) {
+test(`shared group never starts user OAuth for ${subtype} (thread=${threadId})`, async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
   let authorizationCalls = 0;
@@ -511,7 +513,7 @@ test("shared group mode never starts user OAuth when the Agent requests UAT", as
     createSession: async () => "session-group",
     run: async () => ({
       terminal: "idle" as const, messages: ["缺少用户凭证"],
-      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype, domain: "calendar" }
     })
   }, collectText(replies), {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
@@ -519,7 +521,7 @@ test("shared group mode never starts user OAuth when the Agent requests UAT", as
     ensureAuthorization: async () => { authorizationCalls++; return true; }
   });
 
-  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "查询我的私人日程" }));
+  gateway.accept(message({ conversationType: "group", mentionedBot: true, text: "查询我的私人日程", threadId }));
   await delay(40);
 
   assert.equal(authorizationCalls, 0);
@@ -527,15 +529,16 @@ test("shared group mode never starts user OAuth when the Agent requests UAT", as
   assert.match(replies[0], /群聊场景仅使用 Bot 身份/);
   store.close();
 });
+}
 
-test("repeated token_missing stops after one automatic authorization retry", async () => {
+test(`repeated ${subtype} stops after one automatic authorization retry`, async () => {
   const store = new GatewayStore(":memory:");
   const replies: string[] = [];
   const gateway = new Gateway(store, {
     createSession: async () => "session",
     run: async () => ({
       terminal: "idle" as const, messages: ["没有用户凭证"], evidence: readOnlyEvidence(),
-      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype: "token_missing" as const, domain: "calendar" }
+      authorizationRequired: { identity: "user" as const, errorType: "authentication" as const, subtype, domain: "calendar" }
     })
   }, collectText(replies), {
     agentId: "agent-1", environmentId: "env-1", vaultId: "vlt-bot", timeoutMs: 5_000,
@@ -549,6 +552,7 @@ test("repeated token_missing stops after one automatic authorization retry", asy
   assert.match(replies[0], /授权后仍未获得用户凭证/);
   store.close();
 });
+}
 
 test("result requires both a successful terminal and a business message", () => {
   assert.throws(() => resultToReply({ terminal: "idle", messages: [] }), /没有产生回复/);
