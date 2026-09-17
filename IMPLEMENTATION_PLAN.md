@@ -18,7 +18,9 @@
 **Goal**: 部署到10.36.3.236供用户测试，保留rc.2与冷备回退。
 **Success Criteria**: 独立版本号与构建哈希，服务/飞书/WebUI正常，原配置和会话不变。
 **Tests**: 干净打包、实际链路探针、迁移副本与部署健康检查。
-**Status**: In Progress
+**Status**: Complete
+
+PDF交付完成（2026-09-17 12:20 CST）：0.2.10-rc.3 / 936bf4e，最终1710/1710通过（17009.926708ms）、check/build/diff通过。真实Gateway隔离探针sesn-20260917041944-lrfmw：两份约4.5MB合成PDF，群背景首轮总耗时8845ms/模型6653ms，再次引用7715ms/模型7633ms；四项事实均正确，无工具调用/错误，同一Session且仅下载/上传两次。开发机切换通过，PID2674147、重启0、飞书ws ready、Web200/API鉴权200/未鉴权401；6会话、11附件/11挂载和配置哈希不变。冷备`/home/wangjiangwen/.local/src/arkagent-backup-before-rc3-gB0cRn`，rc.2程序保留。未发布GitHub/npm，未宣称客户原PDF验收通过。证据`docs/test-results/pdf-file-input-2026-09-17.json`。
 
 PDF进展（2026-09-17）：官方事件接口确认使用document/source.type=file/file_id，不将URL作为普通文本。隔离MA探针：小PDF Session sesn-20260917040407-mxdf9，模型约6067ms；两份约4.5MB PDF Session sesn-20260917040447-2gxrh，约5909ms；四项事实均正确、无工具调用/错误。不是客户原文件验收。正式Gateway已覆盖当前/引用/群背景/Thread文件引用、最多8份、就绪等待与回退模式；保留挂载与现有Session。全量1709/1709通过，新增恢复指纹测试后将再次回归；初次新增mock错误已修正，未修改已有测试或跳过用例。check/build/diff通过。待rc.3候选包真实Gateway探针及备份部署。
 
