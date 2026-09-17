@@ -162,6 +162,21 @@ test("optional metadata fields stay absent and networking has no guessed default
   assert.doesNotMatch(JSON.stringify(detail), /PRIVATE|secret_value/);
 });
 
+for (const operation of ["vault-list", "credential-list", "vault-detail", "credential-detail"] as const) {
+  test(`${operation} accepts MA null metadata as absent without inventing ownership`, async () => {
+    const isVault = operation.startsWith("vault-");
+    const item = isVault ? vault("vault-one", { metadata: null }) : credential("credential-one", { metadata: null });
+    const { client } = fixture([operation.endsWith("list") ? { data: [item] } : item]);
+    const result = operation === "vault-list" ? (await client.listVaults())[0]
+      : operation === "credential-list" ? (await client.listCredentials("vault-one"))[0]
+      : operation === "vault-detail" ? await client.getVault("vault-one")
+      : await client.getCredential("vault-one", "credential-one");
+    assert.equal(Object.hasOwn(result, "metadata"), false);
+    assert.equal(result.id, item.id);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE|secret_value/);
+  });
+}
+
 for (const [name, payload] of [
   ["missing data", {}], ["nested envelope", { data: { items: [] } }], ["data null", { data: null }],
   ["error envelope", { data: [], error: { message: "PRIVATE-UPSTREAM" } }], ["number cursor", { data: [], next_page: 3 }],

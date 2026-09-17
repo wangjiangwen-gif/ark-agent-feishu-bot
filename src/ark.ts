@@ -947,7 +947,8 @@ function projectResource(value: unknown, type: string): { record: Record<string,
     // Credential名称可省略；空字符串仅维持旧投影，不可作为预置资源归属的证明。
     id: value.id, displayName: typeof value.display_name === "string" ? value.display_name : ""
   };
-  if (value.metadata !== undefined) fields.metadata = resourceMetadata(value.metadata);
+  // MA 对未设置的元信息可能返回 null；按缺省处理，不能据此推定资源归属。
+  if (value.metadata !== undefined && value.metadata !== null) fields.metadata = resourceMetadata(value.metadata);
   for (const [raw, normalized] of [["created_at", "createdAt"], ["updated_at", "updatedAt"]] as const) {
     if (value[raw] === undefined) continue;
     const stamp = value[raw];
