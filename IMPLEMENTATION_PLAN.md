@@ -18,7 +18,9 @@
 **Goal**: 部署rc.4到10.36.3.236，保留rc.3和冷备回退。
 **Success Criteria**: 配置/会话/附件保留，WebUI和飞书连接正常。
 **Tests**: 干净打包、冷备及迁移副本、部署健康检查。
-**Status**: In Progress
+**Status**: Complete
+
+SIZE交付完成（2026-09-17 18:26 CST）：10.36.3.236运行0.2.10-rc.4 / b95d7b0；实际包常量单文件104857600字节、单轮209715200字节。PID2842743、重启0、飞书ready、Web200、鉴权API200/未鉴权401。原配置、6会话、11附件/11挂载与冷备一致；回退目录`/home/wangjiangwen/.local/src/arkagent-backup-before-rc4-QptMaP`，rc.3程序保留。未发布GitHub/npm。证据`docs/test-results/attachment-limit-2026-09-17.json`；100MiB传输边界为本地模拟流验证，不宣称客户PDF理解测试通过。
 
 SIZE回归：新增边界4项先红后绿，覆盖流式100MiB/超1字节响应头拒绝、单轮剩余量与安全诊断；另验证两份100MiB和总量200MiB拒绝。最终1716/1716通过（16193.297208ms），check/build/diff通过。首次全量有1项旧40MiB预算样本预期失效，按新200MiB边界将该恢复用例的单附件样本从6MiB提高到30MiB，仍验证6份成功、2份受限及恢复输入完全一致；未禁用测试。待rc.4部署。
 

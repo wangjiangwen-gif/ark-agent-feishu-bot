@@ -1,0 +1,42 @@
+{
+  "date": "2026-09-17",
+  "version": "0.2.10-rc.4",
+  "commit": "b95d7b0930e01c5cc110f4cac94616c484c85d45",
+  "sourceHash": "b01c13ccde89817a6c211d6cbfc137641b846cf5bec811de107183bc750e3b3f",
+  "packageSha256": "9eef77dcbfc17cb6fb2e6b7d8d414535c49fe33454aa51fefa29e03c3539c067",
+  "limits": {
+    "singleBytes": 104857600,
+    "turnBytes": 209715200,
+    "inlineBytes": 262144
+  },
+  "tests": {
+    "total": 1716,
+    "passed": 1716,
+    "failed": 0,
+    "skipped": 0,
+    "durationMs": 16193.297208,
+    "check": "passed",
+    "build": "passed",
+    "diff": "passed",
+    "boundary": "100MiB byte-stream success, +1 byte declared rejection, 2x100MiB accepted and third file rejected before download"
+  },
+  "deployment": {
+    "host": "10.36.3.236",
+    "startedAt": "2026-09-17T10:26:17.923Z",
+    "pid": 2842743,
+    "restarts": 0,
+    "state": "active",
+    "web": 200,
+    "authenticatedApi": 200,
+    "unauthenticatedApi": 401,
+    "feishuWebSocket": "ready",
+    "configUnchanged": true,
+    "sessions": 6,
+    "attachments": 11,
+    "mounts": 11,
+    "sessionHash": "2817682133f8a2baa8beb1ec4f7ee4121a5aa33aba97c06371c6762e2420ded7",
+    "backup": "/home/wangjiangwen/.local/src/arkagent-backup-before-rc4-QptMaP",
+    "previousVersion": "0.2.10-rc.3"
+  },
+  "scope": "本轮仅放大网关下载上限和改善提示；未调用MA验证100MiB客户PDF理解，不保证模型页数/解析能力；未发布GitHub/npm。"
+}
