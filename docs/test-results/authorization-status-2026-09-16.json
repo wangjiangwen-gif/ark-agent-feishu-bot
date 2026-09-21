@@ -1,0 +1,39 @@
+{
+  "date": "2026-09-16",
+  "baseline_commit": "a5c2112",
+  "scope": "数字员工授权状态查询，只读控制入口与隔离回归",
+  "targeted": {
+    "command": "node --experimental-strip-types --test tests/authorization-status.test.ts",
+    "passed": 27,
+    "failed": 0,
+    "skipped": 0
+  },
+  "regression": {
+    "command": "npm test",
+    "passed": 337,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 2852.388708,
+    "permission": "允许WebUI测试监听127.0.0.1；普通沙箱此前336通过、仅监听EPERM失败"
+  },
+  "checks": ["npm run check（语法检查，非完整TypeScript类型检查）", "npm run build", "git diff --check"],
+  "coverage": [
+    "12种授权阶段和6种凭证状态的中文描述",
+    "授权结束与业务恢复受阻/执行中分开展示",
+    "只读快照不修改检查点、不延长过期时间",
+    "应用、租户、用户、Channel和会话隔离",
+    "数据库重新打开后可查询，不恢复OAuth或发起外部请求",
+    "不泄露Token、设备码、授权链接、原始请求或工具输入",
+    "最多10条关联任务、非法标识隐藏",
+    "暂停业务队列时可查询，重复消息只回复一次",
+    "群聊不读取个人状态、查询失败脱敏、个人助手路由兼容"
+  ],
+  "limitations": [
+    "本轮仅单元及本地模拟集成测试，不是飞书与MA真实端到端",
+    "状态为本地记录，不实时验证服务端Token或资源权限",
+    "未证明A07部分成功写入后的完整自动安全续跑",
+    "普通业务队列进程退出后的持久化恢复仍未完成",
+    "文件、原生挂载、upgrade和真实端到端及性能验收仍待完成",
+    "未部署开发机、未推送GitHub、未发布npm"
+  ]
+}

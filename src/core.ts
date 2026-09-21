@@ -3,12 +3,18 @@ export {
   type AgentConfig,
   type EnvironmentConfig,
   type RunResult,
+  type RunInspection,
   type SessionCreateDefaults,
   type SessionCreateRequest,
+  type SessionCreationQuery,
+  type SessionCreationInspection,
   type SessionResource,
   type SessionStats,
   type UserAuthorizationRequired
 } from "./ark.ts";
+export type {
+  SessionUpgradeRequest, SessionUpgradeSnapshot, SessionUpgradeSubmission, SessionUpgradeObservation, SessionUpgradeWaitOptions
+} from "./session-upgrade.ts";
 export {
   Gateway,
   KeyedQueue,
@@ -19,12 +25,31 @@ export {
   type IncomingMessage,
   type Reply
 } from "./gateway.ts";
+export type { RecoveryTaskSummary, RecoveryTaskPage } from "./gateway.ts";
+export type { PreparedAuthorization, UserCredentialPreparationIntent, UserCredentialLifecycle } from "./prepared-authorization.ts";
 export type {
   ChannelAdapter,
   ChannelCapabilities,
   ChannelHistoryMessage,
   ChannelMessage,
+  ChannelMessageLookup,
+  ChannelReadMessage,
+  ChannelInspectReaction,
+  ReactionQuery,
+  ReactionObservation,
+  ReplyDeliveryEvent,
+  ReplyDeliveryObserver,
+  ChannelInspectReply,
+  ReplyInspectionQuery,
+  ReplyObservation,
   ChannelOutbound,
   ChannelResource,
   ChannelType
 } from "./channel.ts";
+export {
+  loadSessionConfiguration,
+  mergeSessionRequest,
+  selectSessionRequest,
+  type SessionConfiguration,
+  type SessionScope
+} from "./session-config.ts";

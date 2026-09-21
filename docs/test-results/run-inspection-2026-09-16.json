@@ -1,0 +1,39 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "5793e32",
+  "scope": "原MA运行只读核查，未接入Gateway自动恢复",
+  "red": { "command": "node --experimental-strip-types --test tests/run-inspection.test.ts", "failed": 27, "cause": "inspectRun尚未实现" },
+  "targeted": { "passed": 33, "failed": 0, "skipped": 0, "note": "最后新增数量上限用例随全量回归执行" },
+  "regression": { "command": "npm test", "passed": 421, "failed": 0, "skipped": 0, "durationMs": 2408.127042 },
+  "checks": { "syntax": "passed", "build": "passed", "diffWhitespace": "passed", "fullTypecheck": "未执行，现有check仅检查语法" },
+  "sandbox": "普通沙箱初次回归只有WebUI回环监听EPERM；允许本机监听后重新运行全部测试通过，没有跳过用例",
+  "coverage": [
+    "完整输入指纹唯一定位，旧idle和近似输入不作为证据",
+    "分页与同ID去重，冲突、缺页、损坏信封、重复游标拒绝完成判断",
+    "后续其他请求、多线程、可见时间倒序及终态后活动保持unknown",
+    "idle空回复只表示运行结束，不代表业务成功",
+    "structured OAuth错误与原工具调用证据保留",
+    "只使用GET，不发送用户消息，不读取失败错误正文到输出",
+    "超时取消响应体，100页/20000事件/64MiB上限，UTF-8分片与损坏编码"
+  ],
+  "liveReadOnly": {
+    "sessionId": "sesn-20260916030636-vf5pc",
+    "eventCount": 74,
+    "latestUserEventId": "sevt-20260916035644-7457h",
+    "requestFingerprint": "52e657bd1470bb75a808df9dbe93b8f82606f0b614db4d82e9a09dd291bf3f74",
+    "status": "unknown",
+    "reason": "ambiguous_anchor",
+    "inspectionDurationMs": 87,
+    "mutationCount": 0,
+    "interpretation": "重复输入无法唯一归属；验证真实事件读取及保守拒绝，不证明完整恢复E2E"
+  },
+  "remaining": [
+    "Gateway核查调度与暂停解除",
+    "回复/表情投递核查及恢复",
+    "准备阶段资源副作用核实",
+    "授权续跑跨进程衔接",
+    "CLI默认启动接入",
+    "真实飞书与MA崩溃恢复端到端及性能对照",
+    "其余既定文件、Memory/TOS、upgrade与整体验收目标"
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "date": "2026-09-16",
+  "sourceBase": "43c0bb0",
+  "policy": "Gateway仅显式用户compact；MA负责常规自动压缩；不换Session",
+  "local": {
+    "tests": 798,
+    "passed": 798,
+    "failed": 0,
+    "skipped": 0,
+    "cancelled": 0,
+    "durationMs": 7085.572834,
+    "newTests": 41,
+    "checks": ["npm run check (syntax only)", "npm run build", "git diff --check", "node --check scripts/probe-manual-compaction.mjs"],
+    "notRealChannelE2E": true
+  },
+  "existingFailureReadOnly": {
+    "sessionId": "sesn-20260916140817-r74bc",
+    "eventId": "sevt-20260916141212-voclg",
+    "eventTime": "2026-09-16T22:12:12.104215260+08:00",
+    "type": "model_request_failed_error",
+    "code": "InvalidParameter",
+    "param": "file_url",
+    "reason": "Timeout while processing file_url",
+    "retryStatus": "exhausted",
+    "requestId": "021789567820234d6bdab3051f46472bfd942e874cc5db08e552e-Wh7Ms_eY2vBSmsZKyAIZ9",
+    "rootCauseFixed": false
+  },
+  "liveProbes": [
+    {
+      "fixture": "synthetic CSV",
+      "sessionId": "sesn-20260916145350-wwvmp",
+      "result": "failed",
+      "reason": "MA file type rejected; not a file persistence pass",
+      "creates": 1,
+      "uploadAttempts": 1,
+      "gatewayStatsCalls": 0,
+      "runDurationMs": 22329
+    },
+    {
+      "fixture": "two small synthetic PDFs",
+      "sessionId": "sesn-20260916145729-lnrdx",
+      "result": "passed",
+      "fileBytes": [2013, 2096],
+      "runDurationMs": [16833, 16479, 13370],
+      "creates": 1,
+      "uploads": 2,
+      "gatewayStatsCalls": 0,
+      "compactCommands": 0,
+      "userMessages": 3,
+      "readCalls": 2,
+      "successfulPdfDocumentResults": 2,
+      "documentBase64Chars": [2796, 2684],
+      "sessionErrors": 0,
+      "sameFileHashesBeforeAfter": true,
+      "understanding": { "retention43": true, "batch17": true, "async202": true, "ifMatch": true }
+    },
+    {
+      "fixture": "two large synthetic PDFs with image padding",
+      "sessionId": "sesn-20260916145843-w4bvj",
+      "result": "passed",
+      "fileBytes": [4492499, 4492583],
+      "runDurationMs": [13459, 14003, 18395],
+      "creates": 1,
+      "uploads": 2,
+      "gatewayStatsCalls": 0,
+      "compactCommands": 0,
+      "userMessages": 3,
+      "readCalls": 2,
+      "successfulPdfDocumentResults": 2,
+      "documentBase64Chars": [5990000, 5990112],
+      "sessionErrors": 0,
+      "sameFileHashesBeforeAfter": true,
+      "understanding": { "retention43": true, "batch17": true, "async202": true, "ifMatch": true }
+    }
+  ],
+  "liveScope": {
+    "transport": "真实MA，模拟飞书入站/出站",
+    "agentId": "agent-20260819140401-nf7xw",
+    "environmentId": "env-20260820154731-qspjg",
+    "productionVaultsMounted": false,
+    "productionAgentModified": false,
+    "devboxDeploymentChanged": false,
+    "githubOrNpmPublished": false,
+    "resourcesRetainedForInspection": true
+  },
+  "openItems": [
+    "手动/compact文本触发原生压缩的公开契约与真实成功证明",
+    "客户具体PDF和原始长Session状态未复现，不能将合成PDF通过当作超时根因已修复",
+    "真实飞书CardKit失败收尾与完整Channel端到端",
+    "原Stage 1–5其余未完成项；整体目标未完成"
+  ]
+}

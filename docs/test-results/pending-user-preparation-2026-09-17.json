@@ -1,0 +1,239 @@
+{
+  "date": "2026-09-17",
+  "feature": "恢复尚未完成的原用户凭证准备，并继续原Inbox任务",
+  "baselineCommit": "84537a6929717281370aac8b21329922bcd22ac0",
+  "sourceFingerprint": {
+    "fileCount": 45,
+    "algorithm": "sha256(JSON.stringify(sorted path/sha256 records))",
+    "sha256": "bb0838ed54f176ce8c879b7711226d16104c613f2d9246248d97d58c9063ac54"
+  },
+  "scope": {
+    "included": [
+      "UserCredentialPreparationIntent与pending步骤同一次CAS加密持久化",
+      "原身份、flow、授权代次或固定预置operationId验证",
+      "初次占位binding与initialAuthorizationGeneration同事务保存",
+      "专用recover入口接回原消息；普通hook不重跑",
+      "原上下文/准备计划复用；同scope FIFO；跨scope独立恢复",
+      "核心类型导出、CLI生命周期v2接线、README说明"
+    ],
+    "unchanged": [
+      "Gateway仅用户显式/compact才主动压缩",
+      "CLI实验durableQueue仍默认关闭",
+      "默认非持久队列confirmed-loss的Bot降级路径",
+      "群聊/Thread仅Bot身份",
+      "开发机稳定npm0.2.9；未部署、未发布"
+    ]
+  },
+  "tests": {
+    "initialRed": {
+      "file": "tests/user-credential-intent.test.ts",
+      "tests": 29,
+      "passed": 0,
+      "failed": 29,
+      "reason": "新增capture接口尚未实现"
+    },
+    "intermediateFull": {
+      "tests": 1668,
+      "passed": 1658,
+      "failed": 10,
+      "cancelled": 0,
+      "skipped": 0,
+      "durationMs": 16818.753959,
+      "reason": "新进程E2E把ChannelOutbound对象当作字符串断言；修正模拟回复日志提取outbound.text，没有放宽生产检查"
+    },
+    "intermediateGreen": {
+      "tests": 1676,
+      "passed": 1676,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "durationMs": 18930.253334
+    },
+    "final": {
+      "command": "npm test",
+      "tests": 1677,
+      "passed": 1677,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "durationMs": 17178.648792,
+      "addedSinceBaseline": 141
+    },
+    "addedByArea": {
+      "provisioning-state-and-helper": 38,
+      "manager-intent": 29,
+      "intent-runner-inbox": 39,
+      "gateway-process-recovery": 35
+    },
+    "manualCompactionRegression": {
+      "tests": 29,
+      "passed": 29,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "durationMs": 489.047625
+    },
+    "check": "passed;现有check只做语法检查，不是全量TypeScript类型检查",
+    "build": "passed",
+    "benchmarkSyntax": "passed",
+    "diffCheck": "passed",
+    "independentReview": "未发现新增安全或兼容性阻塞；独立复跑102项通过，非真实平台验收",
+    "processE2E": {
+      "realComponents": [
+        "Node子进程直接退出/重启",
+        "SQLite及加密Store",
+        "Gateway.accept与recoverPendingMessages",
+        "EmployeeAuthorizationManager",
+        "ArkClient.run/HTTP请求构建/SSE解析"
+      ],
+      "mockedComponents": [
+        "远端MA HTTP通过fetch/Response合成，不经过真实网络",
+        "飞书OAuth",
+        "飞书消息/引用读取与回复"
+      ],
+      "cases": [
+        "Vault POST后退出",
+        "Vault确认后退出",
+        "Credential POST后退出",
+        "Credential确认后退出",
+        "初始binding完成但user-credential步骤未完成时退出",
+        "首次5断点不预调用auth、不重发原消息、不手动reconcile",
+        "原Inbox ID/准备plan/intent/引用原文不变",
+        "再次关闭重开不重复资源创建、业务POST或回复",
+        "同scope A1后A2；Alice核查挂起时Bob仍恢复完成",
+        "已落盘Token继续同Credential同步、不重复Token交换",
+        "refreshing/未知交换停止",
+        "新OAuth即使取消、generation/绑定变化停止",
+        "候选缺失/重复/metadata或更新时间变化停止",
+        "缺失接口/异步门禁/revision变化停止",
+        "旧pending无intent/普通hook不重跑",
+        "冻结bound intent确认授权失效后保持暂停"
+      ],
+      "expectedWrites": "首次预置每用户Vault/Credential总计各一次；原任务业务POST/最终回复各一次；同Credential同步可能重试同一已保存Token，不重复OAuth刷新"
+    }
+  },
+  "benchmark": {
+    "script": "scripts/benchmark-user-preparation-recovery.mjs",
+    "baselineExport": "git archive 84537a6 src | tar into separate mktemp directory; no checkout",
+    "environment": "同一进程交替前后顺序，文件SQLite，真实Gateway/Manager；外部接口立即返回合成结果",
+    "measurement": "Gateway.accept至Inbox/event完成；排除测试Session和已授权绑定预置；每组20次预热",
+    "first200": {
+      "samplesPerScenario": 200,
+      "scenarios": [
+        {
+          "durable": false,
+          "bound": false,
+          "before": {
+            "p50Ms": 2.094292,
+            "p95Ms": 3.503792
+          },
+          "after": {
+            "p50Ms": 2.168834,
+            "p95Ms": 3.444
+          }
+        },
+        {
+          "durable": false,
+          "bound": true,
+          "before": {
+            "p50Ms": 1.3275,
+            "p95Ms": 1.564084
+          },
+          "after": {
+            "p50Ms": 1.380542,
+            "p95Ms": 2.333625
+          }
+        },
+        {
+          "durable": true,
+          "bound": false,
+          "before": {
+            "p50Ms": 5.035291,
+            "p95Ms": 6.663583
+          },
+          "after": {
+            "p50Ms": 6.058541,
+            "p95Ms": 8.04125
+          }
+        },
+        {
+          "durable": true,
+          "bound": true,
+          "before": {
+            "p50Ms": 4.303708,
+            "p95Ms": 5.698916
+          },
+          "after": {
+            "p50Ms": 5.365542,
+            "p95Ms": 6.954875
+          }
+        }
+      ]
+    },
+    "second500": {
+      "samplesPerScenario": 500,
+      "scenarios": [
+        {
+          "durable": false,
+          "bound": false,
+          "before": {
+            "p50Ms": 2.276917,
+            "p95Ms": 3.693083
+          },
+          "after": {
+            "p50Ms": 2.330917,
+            "p95Ms": 3.009084
+          }
+        },
+        {
+          "durable": false,
+          "bound": true,
+          "before": {
+            "p50Ms": 1.953417,
+            "p95Ms": 3.671375
+          },
+          "after": {
+            "p50Ms": 1.991917,
+            "p95Ms": 3.592292
+          }
+        },
+        {
+          "durable": true,
+          "bound": false,
+          "before": {
+            "p50Ms": 5.303416,
+            "p95Ms": 7.627125
+          },
+          "after": {
+            "p50Ms": 6.383084,
+            "p95Ms": 8.790292
+          }
+        },
+        {
+          "durable": true,
+          "bound": true,
+          "before": {
+            "p50Ms": 5.276042,
+            "p95Ms": 7.552917
+          },
+          "after": {
+            "p50Ms": 6.466916,
+            "p95Ms": 8.641916
+          }
+        }
+      ]
+    },
+    "calls": "前后完全一致；每组500+20轮，first-bound=false时listVault/listCredential/createVault/createCredential各520；bound=true时均0；run/reply各520；inspect=0",
+    "interpretation": "默认路径P50增加约0.04至0.05ms；第一组已绑定P95上升，扩大样本后未持续出现，保留两组结果不归因真实提速。实验队列因多次本地意图/绑定检查及更大的加密检查点，P95约增加1.1ms；这是恢复能力成本，不是性能优化。未完成真实用户端延迟验收。"
+  },
+  "boundaries": [
+    "旧pending缺原始intent时不能事后补造证明",
+    "已有pending创建却无唯一完整远端证据时不能重POST；人工修正/放弃入口尚未提供",
+    "生命周期revision变化会保留旧任务暂停，需要明确迁移策略",
+    "实验队列冻结intent后确认授权失效会换代并暂停原任务，不替它降为Bot继续；默认非durable新消息保持原行为",
+    "CLI未默认启用durableQueue，没有部署开发机，没有发布GitHub/npm",
+    "未调用真实飞书/MA，未消耗真实账号资源；不声称端到端线上验收",
+    "无法原子隔离派发后外部管理员修改Credential或控制台并发改Session",
+    "原Stage 1–5中真实飞书/完整性能、CLI队列迁移/回退、未知准备人工处理、部分写入受控续跑、Session升级网关闭环、Memory/TOS复杂组合、客户PDF和原生compact真实契约验收仍未完成"
+  ]
+}

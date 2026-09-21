@@ -1,0 +1,77 @@
+{
+  "date": "2026-09-17",
+  "version": "0.2.10-rc.2",
+  "productSourceCommit": "121dfc7",
+  "candidateCommit": "b01425966e99ccf57632d9eef5235fb9d751518b",
+  "previousCandidateCommit": "94b5a2e88fcfb08eed828241d397f1ddcf2718d3",
+  "scope": "基于已有实现冻结可测试版本；不继续扩展原完整目标",
+  "runtimePolicy": {
+    "cliDurableQueue": false,
+    "gatewayAutomaticCompaction": false,
+    "sessionUpgradeUserEntry": false,
+    "dynamicMemoryUserEntry": false,
+    "githubOrNpmPublished": false
+  },
+  "checks": {
+    "fullSuite": { "command": "npm test", "passed": 1681, "failed": 0, "cancelled": 0, "skipped": 0, "durationMs": 18823.027542 },
+    "deploymentCompatibilityRegression": { "newTests": 4, "redThenGreen": true, "change": "MA响应metadata:null按缺省处理；资源身份、归属、分页及创建参数校验不变", "sandboxFirstRun": "21项本机HTTP监听被EPERM阻止；允许本机监听后全量通过，未跳过" },
+    "syntaxCheck": "passed; not a full TypeScript type check",
+    "build": "passed",
+    "diffCheck": "passed",
+    "defaultPathIndependentReview": { "passed": 92, "p0p1Blockers": 0 },
+    "syntheticLegacyDatabaseMigration": {
+      "passed": 6,
+      "baseline": "33fa31c",
+      "sourceSamplesUnchanged": true,
+      "cases": ["session and attachment preservation", "legacy OAuth encryption", "unique identity migration", "ambiguous identity does not stop base startup", "key refusal and restoration", "single process lock"]
+    },
+    "package": {
+      "files": 82,
+      "noConfigurationDatabaseKeysOrUserPdfFixtures": true,
+      "unpackedBytesMatchCleanBuild": true,
+      "versionAndHelp": "passed",
+      "declaredCoreExports": 9,
+      "emptyConfigurationDoctor": "safe expected rejection without state files",
+      "manualSmokeCorrection": "首次人工烟测误要求未声明的GatewayStore导出；按src/core.ts实际9个公开导出复核通过，无需修改产品接口"
+    }
+  },
+  "artifact": {
+    "path": "/Users/bytedance/Desktop/second_brain/output/arkagent-0.2.10-rc.2/arkagent-0.2.10-rc.2.tgz",
+    "sha256": "f5d640e3938166c1d0c8f47a8c0bf471701dc1487924fce27531eec4657fc80d",
+    "build": { "commit": "b01425966e99ccf57632d9eef5235fb9d751518b", "dirty": false, "sourceHash": "2bfa6f363388e8d18c1c882ec9d06bda65d96baf9bcd8c44644ed22fd4906cce" }
+  },
+  "deployment": {
+    "target": "10.36.3.236",
+    "authorizedByUser": true,
+    "status": "deployed",
+    "version": "0.2.10-rc.2",
+    "release": "/home/wangjiangwen/.local/src/arkagent-0.2.10-rc.2-b014259",
+    "backup": "/home/wangjiangwen/.local/src/arkagent-backup-before-rc2-ZSD6jX",
+    "oldExecutable": "/data00/home/wangjiangwen/.local/src/arkagent-npm-0.2.9-gwprIe/node_modules/arkagent/dist/cli.js",
+    "startedAt": "2026-09-17T03:26:34.633Z",
+    "pid": 2649264,
+    "restarts": 0,
+    "web": 200,
+    "authenticatedApi": 200,
+    "unauthenticatedApi": 401,
+    "feishuWebSocket": "ready",
+    "configUnchanged": true,
+    "realCredentialListPreflight": { "passed": true, "count": 2 },
+    "coldBackupAndMigrationCopy": "quick_check通过，迁移副本和启动后会话/附件/挂载快照与备份一致",
+    "preserved": { "sessions": 6, "sessionHash": "10a67b12e3077d4a03f42e6b505cff947258b7f7f40ad7d3bbb615a8323f82e3", "attachments": 11, "mounts": 11 },
+    "attempts": [
+      { "version": "0.2.10-rc.1", "result": "自动回退0.2.9", "reason": "真实MA凭证metadata:null被误拒绝，启动退出", "backup": "/home/wangjiangwen/.local/src/arkagent-backup-before-rc1-dr9E9v" },
+      { "version": "0.2.10-rc.2", "result": "自动回退0.2.9", "reason": "服务已就绪，但Debian journalctl拒绝ISO时间字符串导致检查器误判", "backup": "/home/wangjiangwen/.local/src/arkagent-backup-before-rc2-BMJXjv" },
+      { "version": "0.2.10-rc.2", "result": "部署成功", "reason": "部署脚本改用已验证的@Unix时间，产品包未再次更改" }
+    ],
+    "authenticationNote": "沙箱内klist无法反映宿主票据；显式GSSAPIAuthentication=yes且不委托票据后成功登录，不是用户未完成登录",
+    "next": "用户直接在原飞书Bot验收，不需init或/new；未发布GitHub/npm"
+  },
+  "limits": [
+    "本轮MA/飞书为模拟，未完成真实飞书业务验收",
+    "客户原PDF超时/稍后早停未确认修复",
+    "手动compact真实成功契约仍待验证",
+    "未启用实验持久队列或承诺全部中断任务自动恢复",
+    "回退必须恢复升级前数据库及配套密钥配置，外部Token轮换不能由文件回退撤销"
+  ]
+}

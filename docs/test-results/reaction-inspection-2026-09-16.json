@@ -1,0 +1,43 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "256a82a",
+  "scope": "Bounded native reaction lookup and checkpoint-based reconciliation",
+  "redPhase": { "lookup": "new module missing", "gatewayAndStoreFailures": 6 },
+  "newTests": 22,
+  "fullRegression": { "tests": 480, "pass": 480, "fail": 0, "skipped": 0, "durationMs": 2539.933875 },
+  "checks": { "syntax": "passed", "build": "passed", "gitDiffCheck": "passed", "typescriptFullTypecheck": "not provided by current check script" },
+  "contractSources": [
+    "lark-cli schema im.reactions.list --format json",
+    "lark-im/references/lark-im-reactions.md",
+    "node_modules/@larksuiteoapi/node-sdk/types/index.d.ts messageReaction.list",
+    "https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1/message-reaction/list"
+  ],
+  "sourceCaveat": "Web reader returned no HTML body and rejected markdown content type; contract checked against CLI schema/reference and installed official SDK, not claimed as successful webpage body reading.",
+  "verifiedMockPaths": [
+    "Full pagination, app ID and emoji ownership, bounded time/page count, cursor loops and conflicting duplicates",
+    "Unknown creation adopted only for a unique matching app reaction within its recorded creation window",
+    "Missing-ID absence remains unresolved because a late creation may still become visible",
+    "Known-ID absence settles without repeated deletion",
+    "Native adapter -> Gateway -> SQLite: creation response lost, delete response lost, next lookup absent; one DELETE only",
+    "Stale checkpoint CAS, coalesced lookup/deletion, unknown queued old-owner preservation"
+  ],
+  "liveReadOnly": {
+    "appId": "cli_aa0ab4fffab85bc6",
+    "messageId": "om_x100b665284a97cb8c2e645e92aa308a",
+    "chatId": "oc_1b3b4ecc37b711f8ea0666284eb30d07",
+    "selection": "Latest matching application audit message from local read-only database",
+    "results": [
+      { "emoji": "Get", "status": "absent", "code": 0, "items": 0, "hasMore": false, "elapsedMs": 594 },
+      { "emoji": "OnIt", "status": "absent", "code": 0, "items": 0, "hasMore": false, "elapsedMs": 415 }
+    ],
+    "operations": "Official SDK tenant authentication and two reaction GETs only; no IM writes, no reaction mutation, no MA calls",
+    "proves": "Real empty-page envelope compatibility only; not live loss/recovery E2E or performance distribution"
+  },
+  "remaining": [
+    "Explicit resolution of missing-ID intents without a unique provable match",
+    "Real non-empty, response-loss and restart recovery E2E",
+    "Reply/card delivery reconciliation, provisioning and OAuth recovery completion",
+    "CLI default integration, file/platform requirements and controlled performance comparison"
+  ],
+  "deployment": "Not published or deployed; durableQueue stays opt-in"
+}

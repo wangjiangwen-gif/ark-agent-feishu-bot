@@ -1,0 +1,23 @@
+{
+  "date": "2026-09-16",
+  "baseCommit": "657df84",
+  "scope": "原子接收、执行检查点与重启恢复日志一致性",
+  "red": { "command": "node --experimental-strip-types --test tests/message-receive.test.ts", "passed": 0, "failed": 12, "reason": "新增事务入口尚未实现" },
+  "targeted": { "command": "node --experimental-strip-types --test tests/message-receive.test.ts tests/message-inbox.test.ts", "passed": 31, "failed": 0, "skipped": 0, "durationMs": 879.031333 },
+  "regression": { "command": "npm test", "passed": 368, "failed": 0, "skipped": 0, "durationMs": 2482.587083, "environment": "允许WebUI绑定本机回环地址；初次沙箱运行仅此监听被EPERM阻止" },
+  "checks": { "syntax": "passed", "build": "passed", "gitDiffCheck": "passed", "typescriptFullTypecheck": "not_run" },
+  "evidence": [
+    "真实子进程在外层事务提交前退出，processed_events和gateway_message_inbox都回滚，重启后可重新接收",
+    "真实子进程在提交后退出，两份日志和原始消息顺序均保留，重投不重复领取",
+    "SQLite触发器模拟Inbox写入失败与事件状态更新失败，验证接收、派发和完成均原子回滚",
+    "重复投递新eventId不替换原内容，身份改变被拒绝，旧入口不可重领持久化任务",
+    "旧版failed、processing、uncertain事件无执行证据，不隐式迁移成可重放任务",
+    "重启时派发未知状态同时写入两份日志；其他记录缺失会回滚此前更新；不同应用互不读取"
+  ],
+  "notProven": [
+    "Gateway.accept与业务调度尚未使用这些入口",
+    "CLI启动恢复、授权业务续跑与输出投递恢复尚未贯通",
+    "真实飞书/MA端到端与用户可感知性能尚未验证"
+  ],
+  "externalChanges": "无生产凭证、云端资源、部署或发布变更"
+}

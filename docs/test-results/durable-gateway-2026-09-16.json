@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-16",
+  "baseCommit": "db8edc7",
+  "scope": "持久化队列接入Gateway的开发选项及授权衔接",
+  "red": [
+    { "command": "node --experimental-strip-types --test tests/durable-gateway.test.ts", "passed": 0, "failed": 8, "reason": "Gateway尚未接入持久化接收和恢复" },
+    { "command": "node --experimental-strip-types --test --test-name-pattern='authorization readiness' tests/durable-gateway.test.ts", "passed": 0, "failed": 3, "reason": "MA空闲状态核查失败未被持久化为未知执行" }
+  ],
+  "regression": { "command": "npm test", "passed": 388, "failed": 0, "skipped": 0, "durationMs": 2912.3055, "environment": "允许WebUI测试绑定本机回环地址" },
+  "checks": { "syntax": "passed", "build": "passed", "gitDiffCheck": "passed", "typescriptFullTypecheck": "not_run" },
+  "evidence": [
+    "普通消息先持久化再领取；输入快照不可变，重复消息ID不再次执行",
+    "共享群FIFO、不同Thread/单聊并行；未@消息不触发任务",
+    "OnIt在Get之前清理，Get正常结束清理；卡片流式收尾完成后才放行后续消息",
+    "真实Gateway子进程排队阶段退出，重启恢复原顺序；重复恢复不重复调度",
+    "真实Gateway子进程MA派发阶段退出，原Session证据保留，不重放原任务或越过它执行同scope后续任务",
+    "真实OAuth Manager与Gateway集成用例同时运行旧队列和持久化队列，授权后原任务优先，复用原Session",
+    "授权取消、过期和显式/new保持控制语义；未知执行不会被无关授权结束通知解锁",
+    "授权续跑前MA状态running、failed或查询失败均持久化未知状态并阻止同scope后续执行",
+    "授权续跑与等待终结的SQLite故障注入均回滚两份日志；原身份和Session不匹配拒绝迁移"
+  ],
+  "integrationBoundary": {
+    "gateway": "real",
+    "sqlite": "real",
+    "oauthManager": "real",
+    "feishuTransport": "mock",
+    "managedAgents": "mock",
+    "cliDefaultEnabled": false
+  },
+  "notProven": [
+    "未知派发与准备阶段的自动核查和解除阻塞尚未实现，保守暂停不等于完整恢复",
+    "授权恢复跨进程衔接、回复和表情投递恢复尚未完整验收",
+    "CLI默认启用与真实飞书/MA端到端尚未完成",
+    "用户可感知延迟和全局并发性能尚未验收"
+  ],
+  "externalChanges": "无生产资源、部署或发布变更"
+}

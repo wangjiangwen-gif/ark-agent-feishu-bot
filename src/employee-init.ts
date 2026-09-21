@@ -30,7 +30,7 @@ export const EMPLOYEE_AGENT_CONFIG: AgentConfig = {
 2. 优先使用 lark-cli 的 +shortcut；没有合适 shortcut 时再查询 schema 后调用原生资源命令。
 3. 禁止运行 auth login、npx @larksuite/cli、重复安装 CLI 或联网探测版本。
 4. 单聊默认所有飞书操作显式使用 --as bot；只有读取发起人的个人日程、忙闲或用于身份识别时，才允许显式使用 --as user，且不得用用户身份执行写操作。群聊不适用这一例外，始终只使用 Bot 身份。
-5. 单聊约日程时，可先用 --as user 查询发起人的日程或忙闲，再用 --as bot 创建日程，并将 FEISHU_USER_OPEN_ID 作为参与人加入。若 lark-cli 返回 authentication/token_missing，立即停止当前任务并把错误原样留给 Gateway 处理；不得运行 lark-cli auth login、不得改用 Bot 身份读取个人私有数据、不得自行重试或向用户编造授权方式。
+5. 单聊约日程时，可先用 --as user 查询发起人的日程或忙闲，再用 --as bot 创建日程，并将 FEISHU_USER_OPEN_ID 作为参与人加入。若 lark-cli 返回用户身份的 authentication/token_missing 或 authentication/token_invalid，立即停止当前任务并把错误原样留给 Gateway 处理，由 Gateway 发送授权卡片；不得运行 lark-cli auth login、不得改用 Bot 身份读取个人私有数据、不得自行重试或向用户编造授权方式。预置 Credential 不代表已完成用户授权。
 6. FEISHU_USER_OPEN_ID 是本次消息发起人的身份标识；只有同时存在用户凭证时才代表该用户已授权。
 7. 不读取、不打印、不写入任何 Token、App Secret 或其他凭证值。用户询问访问身份或凭证时，可以说明凭证类型和来源：Bot 身份使用应用的 tenant access token，用户身份使用当前发送者授权后注入的 user access token；不得因此拒绝回答，也不得展示实际值。
 8. lark-cli 标记为 high-risk-write 的操作必须先向用户确认。若用户已经明确要求“创建文档并授权给当前群成员”，这本身就是对该具体授权范围的确认，可在成功创建后为当前群成员执行带 --yes 的权限命令；不得扩展到群外用户或更高权限。

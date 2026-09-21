@@ -1,0 +1,63 @@
+{
+  "date": "2026-09-16",
+  "baseline": "8813933",
+  "scope": "读取工具/文档返回/后续回复关联观测，明确无读后回复的早停反馈，审计与WebUI；不表示客户PDF问题已修复",
+  "contract": {
+    "url": "https://docs.volcengine.com/docs/82379/2559583?lang=zh",
+    "updated": "2026-09-09 21:19:24",
+    "verified": ["agent.message包含最终回复及工具前后中间文本", "agent.tool_result是内置工具执行完成后的返回", "session.status_idle不证明业务验收通过"]
+  },
+  "tests": {
+    "new": 38,
+    "redEvidence": ["定向31项中的损坏JSON、缺call ID、矛盾元数据3项失败后修复", "控制台缺少失败/缺失/未关联结果说明1项失败后修复", "明确早停最终交付3项失败后修复，并修正测试回复适配器"],
+    "fullSuite": { "command": "npm test", "passed": 686, "failed": 0, "cancelled": 0, "skipped": 0, "durationMs": 7226.4325 },
+    "gates": ["npm run check（语法，不是全量TypeScript类型检查）", "npm run build", "git diff --check"],
+    "coverage": [
+      "SSE每7字节分片与历史轮询一致，旧事件和下一轮隔离，仅提交一次user.message",
+      "读后回复、仅读前回复、无回复、缺结果、冲突重复、乱序、多线程、上限及未知结果",
+      "不读取Document.source，审计不包含文件正文/Base64/原始路径/模型原文",
+      "真实SQLite旧库加列迁移、关闭重开、白名单读写、损坏JSON不回显原文",
+      "直接PDF、未@群历史附件、引用附件有指导提示，普通会话无额外提示，Session SP不覆写",
+      "明确早停在流式/非流式提示失败且不重跑，正常回复与歧义不被关键词规则拦截",
+      "流式交付失败仍保存文件观测，不追加模型执行",
+      "通过可控Promise延迟证明两份下载/上传和Session创建挂载完成后才执行run",
+      "真实本机WebUI HTTP鉴权及实际页面脚本展示，文件返回不等于业务验收"
+    ],
+    "externalServices": "mock",
+    "browserVisualAcceptance": false
+  },
+  "performance": {
+    "externalServices": "mock",
+    "samples": 200,
+    "alternatingOrder": true,
+    "metadataAndAudit": {
+      "script": "scripts/benchmark-file-observation.mjs",
+      "warmup": 10,
+      "documentPayloadBytes": 12582912,
+      "beforePlainP95Ms": 0.320708,
+      "afterPlainP95Ms": 0.26175,
+      "beforeFilesP50Ms": 0.077334,
+      "afterFilesP50Ms": 0.104208,
+      "beforeFilesP95Ms": 0.346417,
+      "afterFilesP95Ms": 0.301125,
+      "scope": "已解析事件归并+真实SQLite审计写入，不包含网络、SSE JSON解析或PDF理解"
+    },
+    "gateway": {
+      "script": "scripts/benchmark-upload-recovery.mjs",
+      "warmup": 5,
+      "beforePlainP95Ms": 0.627459,
+      "afterPlainP95Ms": 0.61725,
+      "beforeFilesP95Ms": 10.019541,
+      "afterFilesP95Ms": 9.830542,
+      "callsEachGroup": { "download": 410, "upload": 410, "mount": 410, "run": 410, "inspect": 0 }
+    },
+    "interpretation": "本地合成数据、存在噪声；未增加正常路径远程请求，不宣称真实飞书/MA性能提升"
+  },
+  "limitations": [
+    "客户读后说稍后分析再idle仍未真实复现；提示约束不是修复证明",
+    "结果缺失、多MA线程或顺序不明只标记待核实，不自动续跑业务",
+    "授权等待分支的文件观测尚未单独写入该审计列",
+    "未进行真实飞书/MA、Memory/TOS/upgrade或回退验收",
+    "没有使用真实凭证、部署、发布或默认启用durableQueue"
+  ]
+}

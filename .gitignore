@@ -3,3 +3,5 @@ dist/
 data/
 .env
 npm-debug.log*
+*.credential-key
+tmp/pdfs/repro/

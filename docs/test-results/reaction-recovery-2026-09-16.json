@@ -1,0 +1,32 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "e3bcaa3",
+  "scope": "Encrypted reaction checkpoints and known-ID cleanup after Gateway restart",
+  "redPhase": { "initialFailures": 5, "additionalFailuresBeforeFix": 4 },
+  "newTests": 14,
+  "fullRegression": { "tests": 458, "pass": 458, "fail": 0, "skipped": 0, "durationMs": 2427.782542 },
+  "checks": { "syntax": "passed", "build": "passed", "gitDiffCheck": "passed", "typescriptFullTypecheck": "not provided by current check script" },
+  "verified": [
+    "Gateway subprocess exits after Get receipt persistence; restart deletes known old Get and OnIt without MA calls",
+    "Reaction checkpoints do not change task revision or terminal state",
+    "Encrypted IDs and original task binding survive database reopen",
+    "Missing runtime lock, altered encrypted metadata, stale CAS and foreign identity are rejected",
+    "Failed cleanup is retained after task completion and explicit recovery retries cleanup only",
+    "Concurrent cleanup is coalesced; unresolved same-task emoji cannot be recreated",
+    "Failed intent insertion prevents external addReaction call",
+    "Native reaction business errors and missing IDs are rejected without leaking upstream error text"
+  ],
+  "externalServices": "MA and Feishu transports mocked; not live external end-to-end",
+  "sdkEvidence": "Installed @larksuite/channel 0.4.1 dist/index.mjs addReaction/removeReaction use rawClient.im.v1.messageReaction; removeReaction ignores the business envelope",
+  "sandbox": "Initial full run: 455 passed, WebUI failed due to loopback EPERM. Full rerun with loopback permission passed; no test skipped.",
+  "remaining": [
+    "Unknown creation without reaction ID requires platform lookup",
+    "Delete acknowledgement loss requires actual-state lookup",
+    "Message/card delivery reconciliation",
+    "Provisioning and OAuth recovery completion",
+    "CLI default integration and explicit resolution UI",
+    "Real Feishu/MA/devbox E2E and controlled performance comparison",
+    "Other requirements in the complete twelve-section plan"
+  ],
+  "deployment": "No publish or deployment; durableQueue remains opt-in"
+}

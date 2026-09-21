@@ -1,0 +1,42 @@
+{
+  "date": "2026-09-16",
+  "baseline": "9bd6ef0",
+  "scope": "MA HTTP/网络错误脱敏、有界错误正文、附件安全诊断落库与控制台展示；不是完整文件业务验收",
+  "contractSource": "https://docs.volcengine.com/docs/82379/1299023?lang=zh",
+  "contractRead": "官方页面最近更新2026.09.14，通过浏览器读取Managed Agent HTTP和SSE错误表；保持已有x-request-id响应头读取，不从原始message猜测ID",
+  "tests": {
+    "initialRed": { "tests": 13, "failed": 9, "cancelled": 4, "reason": "旧无界正文读取导致后续测试取消" },
+    "newTests": 24,
+    "fullSuite": { "command": "npm test", "passed": 648, "failed": 0, "cancelled": 0, "skipped": 0, "durationMs": 4454.821625 },
+    "gates": ["npm run check（语法）", "npm run build", "git diff --check"],
+    "coverage": [
+      "400/401/403/404/409/413/429/500分类、结构化code和request ID，POST仅调用一次",
+      "上游message/网络cause中的模拟密钥、下载链接、文件正文不进入异常",
+      "非法/超长格式和已知API Key回显过滤，非JSON/空正文保留HTTP状态",
+      "64KiB大小上限、停滞正文超时取消、非法UTF-8取消，不从半截响应产生拒绝证明",
+      "ECONNRESET、AbortError、TimeoutError与未知来源错误隔离",
+      "JSON及旧纯文本文件类型固定提示兼容，500不误报格式问题",
+      "Gateway上传/挂载/创建失败的安全诊断在SQLite重开后保留",
+      "真实本地WebUI HTTP和页面脚本展示安全字段，记录不包含原始错误正文"
+    ],
+    "externalServices": "mock"
+  },
+  "performance": {
+    "script": "scripts/benchmark-upload-recovery.mjs",
+    "samplesPerGroup": 200,
+    "warmup": 5,
+    "alternatingOrder": true,
+    "runs": [
+      { "phase": "concurrent_with_full_tests", "beforePlainP95Ms": 0.468708, "afterPlainP95Ms": 0.538875, "beforeFilesP95Ms": 7.360875, "afterFilesP95Ms": 7.866333 },
+      { "phase": "after_tests_and_build_finished", "beforePlainP50Ms": 0.251875, "afterPlainP50Ms": 0.2505, "beforePlainP95Ms": 0.450458, "afterPlainP95Ms": 0.43625, "beforeFilesP50Ms": 6.199417, "afterFilesP50Ms": 6.229458, "beforeFilesP95Ms": 7.978375, "afterFilesP95Ms": 8.39325 }
+    ],
+    "callsPerGroup": { "download": 410, "upload": 410, "mount": 410, "inspect": 0, "run": 410 },
+    "interpretation": "真实SQLite+模拟传输，附件为两份4.5MiB合成数据；不是PDF解析或真实用户P95，未增加正常路径远端调用"
+  },
+  "limitations": [
+    "未完成真实MA/飞书端到端；测试资源授权尚待答复",
+    "飞书下载侧未知错误不猜测为MA结构化错误",
+    "PDF提前idle、完整准备事务、队列默认启用、Memory/TOS/upgrade及回退验收仍未完成",
+    "未部署、未发布、未改变实验持久化队列默认关闭"
+  ]
+}

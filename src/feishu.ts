@@ -1,6 +1,7 @@
 import type { Gateway, IncomingMessage } from "./gateway.ts";
+import { MAX_FILE_BYTES, attachmentSizeError } from "./attachment-limits.ts";
 
-export const MAX_FEISHU_FILE_BYTES = 20 * 1024 * 1024;
+export const MAX_FEISHU_FILE_BYTES = MAX_FILE_BYTES;
 
 type FeishuEvent = {
   event_id?: string;
@@ -152,13 +153,13 @@ export function createFeishuResourceDownloader(client: FeishuResourceClient, max
       path: { message_id: message.messageId, file_key: attachment.id }
     });
     const declaredSize = Number(headerValue(response.headers, "content-length") || 0);
-    if (declaredSize > limit) throw new Error(`文件 ${attachment.name} 超过本轮剩余 ${formatBytes(limit)} 限制`);
+    if (declaredSize > limit) throw attachmentSizeError(declaredSize, maxBytes, remainingBytes);
     const chunks: Uint8Array[] = [];
     let size = 0;
     for await (const chunk of response.getReadableStream()) {
       const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
       size += bytes.byteLength;
-      if (size > limit) throw new Error(`文件 ${attachment.name} 超过本轮剩余 ${formatBytes(limit)} 限制`);
+      if (size > limit) throw attachmentSizeError(size, maxBytes, remainingBytes, true);
       chunks.push(bytes);
     }
     const combined = new Uint8Array(size);
@@ -178,8 +179,4 @@ function inferMimeType(name: string, type: "file" | "image"): string {
   if (type === "image") return "image/jpeg";
   const extension = name.toLowerCase().split(".").pop();
   return ({ pdf: "application/pdf", doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", csv: "text/csv", txt: "text/plain", md: "text/markdown" } as Record<string, string>)[extension || ""] || "application/octet-stream";
-}
-
-function formatBytes(bytes: number): string {
-  return bytes < 1024 * 1024 ? `${Math.floor(bytes / 1024)} KB` : `${Math.floor(bytes / 1024 / 1024)} MB`;
 }

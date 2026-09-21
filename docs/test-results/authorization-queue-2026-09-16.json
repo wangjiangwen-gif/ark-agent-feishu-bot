@@ -1,0 +1,32 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "026d8da",
+  "location": "local macOS workspace",
+  "packageVersion": "0.2.9",
+  "published": false,
+  "suite": { "command": "npm test", "tests": 292, "passed": 292, "failed": 0, "skipped": 0, "durationMs": 2345.7285 },
+  "checks": ["npm run check (syntax only)", "npm run build", "git diff --check"],
+  "newTests": 11,
+  "coverage": [
+    "Paused direct scope preserves follower FIFO while other identities proceed",
+    "Authorized original task resumes before followers, without new Session",
+    "Get removed while waiting for user authorization",
+    "Cancellation, rejection and expiry release restored pause without replaying original task",
+    "Explicit /new cancels waiting authorization before resetting, but ordinary FIFO remains unchanged",
+    "Stale flow completion cannot release a replacement flow pause",
+    "Group scopes cannot be paused by user OAuth state",
+    "500 tasks across 20 scopes preserve per-scope order and never overlap within one scope"
+  ],
+  "redGreen": [
+    "Before implementation, second and third direct messages ran while first awaited OAuth",
+    "Initial priority implementation broke earlier queued /new semantics; scoped recovery priority and reset control fixed it",
+    "Added ordinary FIFO regression test to prevent /new reordering when there is no authorization wait"
+  ],
+  "limitations": [
+    "MA and OAuth endpoints mocked; not real Feishu/MA end-to-end",
+    "Queue stress is scheduling coverage, not user-facing P95 measurement",
+    "Partial-write-safe continuation remains pending",
+    "Ordinary queued message payloads remain in memory; only original OAuth recovery is durable",
+    "No production deployment or publication performed"
+  ]
+}

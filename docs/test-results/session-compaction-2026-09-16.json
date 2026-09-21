@@ -1,0 +1,44 @@
+{
+  "date": "2026-09-16",
+  "location": "local Mac, source development checkout",
+  "baseCommit": "eb233cd",
+  "packageVersion": "0.2.9",
+  "published": false,
+  "officialContract": {
+    "url": "https://docs.volcengine.com/docs/82379/2559583?lang=zh",
+    "pageUpdatedAt": "2026-09-09 21:19:24",
+    "readMethod": "authenticated-not-required browser DOM",
+    "compactionEvent": "agent.thread_context_compacted",
+    "successRule": "本轮有原生压缩事件、正常idle且无session.error；不以子线程压缩证明多线程全局压缩"
+  },
+  "automated": {
+    "tests": 208,
+    "passed": 208,
+    "failed": 0,
+    "coverage": [
+      "旧Session高Token样本只建基线",
+      "同样本防重复、业务增量、冷却、失败暂停",
+      "SQLite重启恢复与未决边界",
+      "未决提交不重发、未确定终态不派发业务",
+      "原生事件确认、旧证明去重、error后idle不误报成功",
+      "同scope手动压缩串行、现有文件挂载记录保留",
+      "平台原生压缩事件更新基线"
+    ],
+    "limitations": "模拟原生成功事件只验证代码行为，不证明MA真实成功、沙箱文件持久性或真实飞书E2E"
+  },
+  "live": {
+    "sessionId": "sesn-20260916030636-vf5pc",
+    "agentId": "agent-20260819140401-nf7xw",
+    "environmentId": "env-20260820154731-qspjg",
+    "liveChannel": false,
+    "productionGatewayChanged": false,
+    "command": "/compact",
+    "attempts": [
+      { "elapsedMs": 29562, "terminal": "failed", "errorEventId": "sevt-20260916034134-4m89v", "errorType": "model_rate_limited_error", "retryStatus": "exhausted" },
+      { "elapsedMs": 29629, "terminal": "failed", "errorEventId": "sevt-20260916034529-gbhlz", "errorType": "model_rate_limited_error", "retryStatus": "exhausted" },
+      { "elapsedMs": 29647, "terminal": "failed", "errorEventId": "sevt-20260916035713-pxby6", "errorType": "model_rate_limited_error", "retryStatus": "exhausted", "inspectionResult": "failed" }
+    ],
+    "result": "真实成功路径未验收；3次失败后停止重试",
+    "nextActions": ["核实测试模型配额或限流解除", "运行smoke-resilience验证原生完成事件及真实文件保留", "完成真实飞书入口回归"]
+  }
+}

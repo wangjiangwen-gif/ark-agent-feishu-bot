@@ -1,0 +1,93 @@
+{
+  "date": "2026-09-17",
+  "baselineCommit": "edff36e",
+  "deploymentChanged": false,
+  "published": false,
+  "durableQueueEnabledByDefault": false,
+  "local": {
+    "suite": "npm test",
+    "passed": 1125,
+    "failed": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "addedSinceBaseline": 178,
+    "elapsedMs": 10524.298916,
+    "syntaxCheck": true,
+    "build": true,
+    "diffCheck": true,
+    "realProcessExit": true,
+    "externalMaAndLarkInterfaces": "mocked",
+    "coverage": [
+      "encrypted creation intent before POST, immutable request and identity bindings",
+      "atomic Session, configuration, compaction baseline and binary mount confirmation",
+      "unknown creation never authorizes another POST; explicit InvalidParameter rejection differs",
+      "safe pending diagnostics survive reopen and successful confirmation",
+      "same-message confirmed isolated creation survives process exit before ready",
+      "independent isolated messages remain concurrent; shared mapping is preserved",
+      "mode/config changes and stale or conflicting proofs cannot bypass pending creation",
+      "default public accept deduplicates repeated messageId with a new eventId",
+      "durable pre-ready recovery confirms resources without dispatching old business input",
+      "bounded complete Session listing, unique tags, exact detail configuration proof",
+      "5-second total deadline, 4-MiB raw-byte budget, cancellation and malformed responses",
+      "TXT/Markdown full-input delivery receipts survive prepared restart",
+      "truncated, failed or authorization-waiting input does not confirm inline delivery",
+      "256-KiB inline restore budget retains unprocessed sources for later turns"
+    ]
+  },
+  "liveMa": {
+    "script": "scripts/probe-session-creation.mjs",
+    "agentId": "agent-20260819140401-nf7xw",
+    "environmentId": "env-20260820154731-qspjg",
+    "vaultIds": [],
+    "resources": [],
+    "liveChannel": false,
+    "cases": [
+      {
+        "requestKind": "environment_id_reference",
+        "sessionId": "sesn-20260916161253-pbh8z",
+        "operationId": "9c6afcf4-cd91-4b5b-80c8-644a67209d54",
+        "status": "confirmed_without_recreation",
+        "realChildExitCode": 77,
+        "childCreates": 1,
+        "parentCreates": 0,
+        "parentGets": 2,
+        "modelMessages": 0,
+        "bindingMatches": true,
+        "parentFlowElapsedMsIncludingChild": 987
+      },
+      {
+        "requestKind": "environment_with_overrides_using_actual_client_builder",
+        "sessionId": "sesn-20260916161546-ttmsz",
+        "operationId": "57507792-fb57-4610-b897-d9653b79d74b",
+        "status": "confirmed_without_recreation",
+        "realChildExitCode": 77,
+        "childCreates": 1,
+        "parentCreates": 0,
+        "parentGets": 2,
+        "modelMessages": 0,
+        "bindingMatches": true,
+        "parentFlowElapsedMsIncludingChild": 1104
+      }
+    ],
+    "observedProtocol": {
+      "terminalListPage": "data array with omitted next_page",
+      "detail": "bare Session with tags, environment, agent, resources and vault_ids"
+    },
+    "limitations": [
+      "resource recovery only: no model dispatch, real Lark message, attachment payload or production Vault",
+      "no automatic replay of an unfinished preparation plan",
+      "complex Memory/TOS/resource combinations and agent overrides not exercised in these live cases",
+      "idle proof is a snapshot, not server-side compare-and-dispatch",
+      "new test Sessions remain available; no platform resources were deleted"
+    ]
+  },
+  "remaining": [
+    "freeze and recover the full pre-ready preparation plan including hooks, history and resources",
+    "explicit administration for unresolved preparation outcomes",
+    "controlled continuation after partially successful writes",
+    "Gateway Session upgrade state machine and restart recovery",
+    "real Memory/TOS, Lark authorization/cards/thread end-to-end and performance validation",
+    "customer original PDF failure reproduction and root cause",
+    "native manual compact and automatic MA compact complete real-world validation"
+  ]
+}

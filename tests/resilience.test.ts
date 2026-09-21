@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { Gateway, toConversationKey, type IncomingMessage } from "../src/gateway.ts";
 import { GatewayStore } from "../src/store.ts";
 import type { ChannelHistoryMessage } from "../src/channel.ts";
+import { ArkHttpError } from "../src/ark.ts";
 
 function message(id: string, overrides: Partial<IncomingMessage> = {}): IncomingMessage {
   return { channelType: "lark", installationId: "cli", tenantId: "tenant", conversationId: "chat", conversationType: "group",
@@ -23,6 +24,8 @@ function harness(overrides: Record<string, any> = {}, store = new GatewayStore("
   const resources: any[] = [];
   let uploads = 0;
   const gateway = new Gateway(store, {
+    getSessionStats: async () => ({ eventCount: 10, latestEventId: "idle", status: "idle" }),
+    inspectCompaction: async () => ({ result: "succeeded", terminal: "idle", reason: "test_adapter_verified_completion" }),
     createSession: async request => { resources.push(...(request.resources || [])); return "session"; },
     uploadFile: async name => ({ id: `file-${++uploads}`, name }),
     addSessionResource: async (_id, resource) => { resources.push(resource); },
@@ -37,6 +40,51 @@ function harness(overrides: Record<string, any> = {}, store = new GatewayStore("
   });
   return { gateway, store, inputs, replies, resources, uploads: () => uploads };
 }
+
+test("every shared-group turn carries its own actor without pinning the first user's environment", async t => {
+  const requests: any[] = [];
+  const h = harness({ ark: { createSession: async request => { requests.push(request); return "session"; } } });
+  t.after(() => h.store.close());
+  h.gateway.accept(message("a", { senderId: "user-a" })); await until(() => h.replies.length === 1);
+  h.gateway.accept(message("b", { senderId: "user-b", createTime: 200 })); await until(() => h.replies.length === 2);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].environment.config.env.FEISHU_USER_OPEN_ID, undefined);
+  assert.equal(requests[0].environment.config.env.FEISHU_TRIGGER_MESSAGE_ID, undefined);
+  assert.match(h.inputs[0], /<current_actor open_id="user-a"/);
+  assert.match(h.inputs[1], /<current_actor open_id="user-b"/);
+});
+
+test("quoted own reply remains visible on the next shared Session turn", async t => {
+  let history: ChannelHistoryMessage[] = [];
+  const h = harness({ options: { loadRecentHistory: async () => history } }); t.after(() => h.store.close());
+  const first = message("first"); h.gateway.accept(first); await until(() => h.replies.length === 1);
+  h.store.recordOutgoing(first, "question");
+  history = [{ messageId: "question", senderId: "bot", senderType: "app", source: "chat", text: "需要创建文档吗", createTime: 150 }];
+  h.gateway.accept(message("second", { parentMessageId: "question", text: "需要", createTime: 200 }));
+  await until(() => h.replies.length === 2);
+  assert.match(h.inputs[1], /<reply_context role="reference">/);
+  assert.match(h.inputs[1], /需要创建文档吗/);
+  assert.match(h.inputs[1], /<current_request>\n需要/);
+});
+
+test("quotation lookup on direct chat is wired even without recent-history loading", async t => {
+  let calls = 0;
+  const h = harness({ options: { loadRecentHistory: undefined, readMessage: async () => {
+    calls++; return { status: "available", message: { messageId: "q", senderId: "bot", senderType: "app", source: "chat", text: "需要摘要吗", createTime: 50 } };
+  } } }); t.after(() => h.store.close());
+  h.gateway.accept(message("direct", { conversationType: "direct", parentMessageId: "q", text: "需要" }));
+  await until(() => h.replies.length === 1);
+  assert.equal(calls, 1); assert.match(h.inputs[0], /需要摘要吗/);
+});
+
+test("quote cache is scoped by application, tenant, chat and thread", t => {
+  const store = new GatewayStore(":memory:"); t.after(() => store.close());
+  const trigger = message("now", { threadId: "current" });
+  const quote: ChannelHistoryMessage = { messageId: "q", senderId: "u", senderType: "user", source: "chat", createTime: 50, text: "private" };
+  for (const override of [{ installationId: "other" }, { tenantId: "other" }, { conversationId: "other" }]) store.cacheHistory({ ...trigger, ...override }, [quote]);
+  store.cacheHistory(trigger, [{ ...quote, source: "thread", threadId: "other" }]);
+  assert.equal(store.cachedMessage(trigger, "q"), undefined);
+});
 
 test("two same-name files are both mounted at different safe paths", async t => {
   const h = harness(); t.after(() => h.store.close());
@@ -85,10 +133,10 @@ test("unmentioned file is cached without execution and survives Gateway reconstr
   assert.match(restarted.inputs[0], /可能缺少离线期间/);
 });
 
-test("failed historical mount reuses uploaded File ID on next mention", async t => {
+test("explicitly rejected historical mount reuses uploaded File ID on next mention", async t => {
   let attempts = 0;
   const history = [{ messageId: "file-message", senderId: "user", senderType: "user", source: "chat", text: "附件", createTime: 10, resources: [{ id: "a", name: "资料.pdf", type: "file" }] }];
-  const h = harness({ ark: { addSessionResource: async () => { if (++attempts === 1) throw new Error("temporary mount error"); } }, options: { loadRecentHistory: async () => history } });
+  const h = harness({ ark: { addSessionResource: async () => { if (++attempts === 1) throw new ArkHttpError("mount rejected", 400, "InvalidParameter"); } }, options: { loadRecentHistory: async () => history } });
   t.after(() => h.store.close());
   h.gateway.accept(message("one")); await until(() => h.replies.length === 1);
   assert.match(h.replies[0], /附件提示/);
@@ -171,13 +219,26 @@ test("attachment download receives the remaining aggregate budget", async t => {
   const limits: number[] = [];
   const h = harness({ options: { downloadAttachment: async (_resource, _message, limit) => {
     limits.push(limit);
-    return { bytes: new Uint8Array(15 * 1024 * 1024), mimeType: "application/pdf" };
+    return { bytes: new Uint8Array(75 * 1024 * 1024), mimeType: "application/pdf" };
   } } }); t.after(() => h.store.close());
   h.gateway.accept(message("files", { resources: ["a", "b", "c"].map(id => ({ id, name: `${id}.pdf`, type: "file" })) }));
   await until(() => h.replies.length === 1);
-  assert.deepEqual(limits, [20, 20, 10].map(mb => mb * 1024 * 1024));
+  assert.deepEqual(limits, [200, 125, 50].map(mb => mb * 1024 * 1024));
   assert.equal(h.uploads(), 2);
-  assert.match(h.replies[0], /40 MB/);
+  assert.match(h.replies[0], /单文件上限 100 MiB，本轮剩余 50 MiB/);
+});
+
+test("two 100 MiB files fit one turn and a third is rejected before downloading", async t => {
+  const limits: number[] = [];
+  const bytes = new Uint8Array(100 * 1024 * 1024);
+  const h = harness({ options: { downloadAttachment: async (_resource, _message, limit) => {
+    limits.push(limit); return { bytes, mimeType: "application/pdf" };
+  } } }); t.after(() => h.store.close());
+  h.gateway.accept(message("files", { resources: ["a", "b", "c"].map(id => ({ id, name: `${id}.pdf`, type: "file" })) }));
+  await until(() => h.replies.length === 1);
+  assert.deepEqual(limits, [200, 100].map(mb => mb * 1024 * 1024));
+  assert.equal(h.uploads(), 2);
+  assert.match(h.replies[0], /单轮附件总量达到 200 MiB/);
 });
 
 test("history, upload receipts and inline originals survive a real SQLite close and reopen", async t => {

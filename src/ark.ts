@@ -1,29 +1,71 @@
+import { createHash } from "node:crypto";
+import { pdfDocumentBlocks, runInputFingerprint, eventInputFingerprint, type PdfInputFile } from "./pdf-input.ts";
+import { ArkHttpError, ArkNetworkError, failureDiagnostic, safeErrorCode, safeRequestId, sessionFailure, type FailureDiagnostic } from "./ark-errors.ts";
+export { ArkHttpError } from "./ark-errors.ts";
+import { RunEvidenceCollector, type RunEvidence } from "./run-evidence.ts";
+import { RunFileObserver, type RunFileObservation } from "./run-file-observation.ts";
+import { inspectMountResources, validMountQuery, type FileMountQuery, type FileMountInspection } from "./mount-inspection.ts";
+import { inspectUploadedFile, validUploadName, type FileUploadQuery, type FileUploadInspection } from "./upload-inspection.ts";
+import { inspectCreatedSession, type SessionCreationQuery, type SessionCreationInspection } from "./session-creation-inspection.ts";
+export type { SessionCreationQuery, SessionCreationInspection } from "./session-creation-inspection.ts";
+import {
+  prepareSessionUpgrade, parseSessionUpgradeSnapshot, validUpgradeSessionId, validateUpgradeWait,
+  type SessionUpgradeRequest, type SessionUpgradeSubmission, type SessionUpgradeObservation, type SessionUpgradeWaitOptions
+} from "./session-upgrade.ts";
+
 export type ArkEvent = Record<string, unknown> & { id?: string; type?: string; processed_at?: string };
 
 export type RunResult = {
   terminal: "idle" | "failed";
   messages: string[];
   authorizationRequired?: UserAuthorizationRequired;
+  evidence?: RunEvidence;
+  fileObservation?: RunFileObservation;
+  failure?: FailureDiagnostic;
 };
+
+export type RunInspection =
+  | { status: "unknown"; reason: "history_unavailable" | "anchor_not_found" | "ambiguous_anchor" | "conflicting_event" | "later_request" | "multiple_threads" | "event_order_unknown" | "activity_after_terminal" | "terminal_not_observed"; anchorEventId?: string }
+  | { status: "running"; anchorEventId: string }
+  | { status: "ended"; anchorEventId: string; terminalEventId: string; result: RunResult };
 
 export type UserAuthorizationRequired = {
   identity: "user";
   errorType: "authentication";
-  subtype: "token_missing";
+  subtype: "token_missing" | "token_invalid";
   domain?: string;
 };
 
 export type SessionStats = {
   eventCount: number;
   latestInputTokens?: number;
+  latestTokenSampleId?: string;
+  latestBusinessEventId?: string;
+  latestEventId?: string;
+  status?: "running" | "idle" | "failed";
+  latestCompaction?: { eventId: string; eventCount: number; tokenSampleId?: string; businessEventId?: string };
+};
+
+export type SessionReadiness = {
+  sessionId: string;
+  status: "idle" | "running" | "upgrading" | "failed" | "unknown";
+  agentId?: string;
+};
+
+export type CompactionObservation = {
+  result: "succeeded" | "failed" | "unknown";
+  terminal?: "idle" | "failed";
+  reason: string;
+  evidenceEventId?: string;
 };
 
 type ArkClientOptions = {
   sseHeadStartMs?: number;
   eventPollIntervalMs?: number;
+  inspectionTimeoutMs?: number;
 };
 
-type RunBoundary = { startedAt: number; input: string; previousIds: Set<string>; anchored: boolean; page?: string };
+type RunBoundary = { startedAt: number; fingerprint: string; previousIds: Set<string>; anchored: boolean; page?: string };
 
 export type AgentConfig = {
   name: string;
@@ -72,6 +114,15 @@ export type SessionCreateDefaults = {
   envOverrides?: Record<string, string>;
 };
 
+export type VaultMetadata = {
+  id: string; displayName: string; type?: "vault"; metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string;
+};
+export type CredentialMetadata = {
+  id: string; displayName: string; authType: string; secretName?: string; type?: "vault_credential";
+  vaultId?: string; metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string;
+  networking?: { type: string; allowed_hosts?: string[] };
+};
+
 const LARK_CLI_VERSION = "1.0.88";
 const LARK_CLI_SETUP_SCRIPT = `set -e
 case "$(uname -m)" in
@@ -92,7 +143,7 @@ export class ArkClient {
 
   private fetcher: typeof fetch;
   private options: Required<ArkClientOptions>;
-  private environmentConfigs = new Map<string, EnvironmentConfig>();
+  private environmentConfigs = new Map<string, { config: EnvironmentConfig; fetchedAt: number }>();
 
   constructor(apiKey: string, baseUrl: string, fetcher: typeof fetch = fetch, options: ArkClientOptions = {}) {
     this.apiKey = apiKey;
@@ -100,12 +151,14 @@ export class ArkClient {
     this.fetcher = fetcher;
     this.options = {
       sseHeadStartMs: options.sseHeadStartMs ?? 100,
-      eventPollIntervalMs: options.eventPollIntervalMs ?? 750
+      eventPollIntervalMs: options.eventPollIntervalMs ?? 750,
+      inspectionTimeoutMs: options.inspectionTimeoutMs ?? 10_000
     };
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
     const method = init.method || "GET";
+    const signal = init.signal || AbortSignal.timeout(30_000);
     let response: Response;
     try {
       response = await this.fetcher(`${this.baseUrl}${path}`, {
@@ -116,15 +169,26 @@ export class ArkClient {
           ...(typeof init.body === "string" ? { "Content-Type": "application/json" } : {}),
           ...init.headers
         },
-        signal: init.signal || AbortSignal.timeout(30_000)
+        signal
       });
     } catch (error) {
-      throw new Error(`方舟网络请求失败（${method} ${path}）：${networkErrorDetail(error)}`, { cause: error });
+      const operation = `${method} ${path.split("?")[0]}`.replaceAll(this.apiKey, "[redacted]");
+      throw new ArkNetworkError(operation, signal.aborted ? signal.reason : error);
     }
     if (!response.ok) {
-      const requestId = response.headers.get("x-request-id");
-      const body = await response.text();
-      throw new Error(`方舟请求失败 ${response.status}${requestId ? ` (${requestId})` : ""}: ${body.slice(0, 300)}`);
+      const redactKnownSecret = (value: string | undefined): string | undefined => value && !value.includes(this.apiKey) ? value : undefined;
+      const requestId = redactKnownSecret(safeRequestId(response.headers.get("x-request-id")));
+      let code: string | undefined;
+      let hint = "";
+      try {
+        const body = await boundedHistoryBody(response, 64 * 1024,
+          AbortSignal.any([signal, AbortSignal.timeout(Math.min(5_000, this.options.inspectionTimeoutMs))]));
+        // 兼容旧版纯文本格式错误，只提取固定提示，绝不复制上下文或据此认定可重试。
+        if (path === "/files" && response.status === 400 && /file type not supported/i.test(body)) hint = ": file type not supported";
+        const parsed = JSON.parse(body);
+        code = redactKnownSecret(safeErrorCode(parsed?.error?.code));
+      } catch { /* 不完整、超限或非JSON响应不提供结构化拒绝证明。 */ }
+      throw new ArkHttpError(`方舟请求失败 ${response.status}${code ? ` ${code}` : ""}${requestId ? ` (${requestId})` : ""}${hint}`, response.status, code, requestId);
     }
     return response;
   }
@@ -134,6 +198,157 @@ export class ArkClient {
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
     return { id: String(data.id || agentId), version: data.version === undefined ? undefined : String(data.version) };
+  }
+
+  // 这是原生协议层，不是普通聊天用户的升级入口。调用方须先校验身份并持久化提交意图。
+  // 官方契约：https://docs.volcengine.com/docs/82379/2673930?lang=zh
+  async upgradeSession(sessionId: string, request: SessionUpgradeRequest, signal?: AbortSignal): Promise<SessionUpgradeSubmission> {
+    if (!validUpgradeSessionId(sessionId)) throw new Error("Session ID 无效");
+    const prepared = prepareSessionUpgrade(request);
+    signal?.throwIfAborted();
+    const requestFingerprint = prepared.fingerprint;
+    const combined = AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]);
+    try {
+      // initial_events也可能产生业务副作用，任何结果未知都不得自动重发。
+      const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/upgrades`, {
+        method: "POST", body: prepared.body, signal: combined
+      });
+      const body = await boundedHistoryBody(response, 4 * 1024 * 1024,
+        AbortSignal.any([combined, AbortSignal.timeout(this.options.inspectionTimeoutMs)]));
+      const snapshot = parseSessionUpgradeSnapshot(JSON.parse(body), sessionId);
+      return snapshot ? { status: "accepted", requestFingerprint, snapshot }
+        : { status: "unknown", reason: "invalid_response", requestFingerprint };
+    } catch (error) {
+      const rejected = error instanceof ArkHttpError && error.status === 400 && error.code === "InvalidParameter";
+      return { status: rejected ? "rejected" : "unknown", reason: "request_failed", requestFingerprint, failure: failureDiagnostic(error) };
+    }
+  }
+
+  async waitForSessionUpgrade(submission: SessionUpgradeSubmission, options: SessionUpgradeWaitOptions = {}): Promise<SessionUpgradeObservation> {
+    const receipt = validateUpgradeWait(submission, options);
+    let last = receipt.snapshot;
+    let observedUpgrading = last.status === "upgrading";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 30_000);
+    const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
+    const observation = (status: SessionUpgradeObservation["status"], reason: SessionUpgradeObservation["reason"]): SessionUpgradeObservation => ({
+      status, reason, snapshot: last, requestFingerprint: receipt.requestFingerprint,
+      configurationVerified: false, businessResult: "not_assessed"
+    });
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const response = await this.request(`/sessions/${encodeURIComponent(last.sessionId)}`, { signal });
+        const body = await boundedHistoryBody(response, 4 * 1024 * 1024, signal);
+        let snapshot;
+        try { snapshot = parseSessionUpgradeSnapshot(JSON.parse(body), last.sessionId); }
+        catch { return observation("unknown", "invalid_response"); }
+        if (!snapshot) return observation("unknown", "invalid_response");
+        if (Date.parse(snapshot.updatedAt) < Date.parse(last.updatedAt)) return observation("unknown", "time_regressed");
+        last = snapshot;
+        if (snapshot.status === "idle") return observation(observedUpgrading ? "settled" : "unknown", observedUpgrading ? "upgrading_to_idle" : "transition_not_observed");
+        if (snapshot.status !== "upgrading") return observation("unknown", "status_not_confirmed");
+        observedUpgrading = true;
+        await waitFor(options.pollIntervalMs ?? 750, signal);
+      }
+    } catch {
+      if (options.signal?.aborted) return observation("unknown", "cancelled");
+      if (controller.signal.aborted) return observation(last.status === "upgrading" ? "pending" : "unknown", "timeout");
+      return observation("unknown", "query_failed");
+    } finally { clearTimeout(timer); controller.abort(); }
+  }
+
+  async getSessionInfo(sessionId: string): Promise<{
+    id: string; status?: string; agentId?: string; agentVersion?: string; environmentId?: string;
+    appId?: string; vaultIds: string[]; systemFingerprint?: string;
+  }> {
+    const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const data = (payload.data || payload) as Record<string, unknown>;
+    const agent = data.agent && typeof data.agent === "object" ? data.agent as Record<string, unknown> : undefined;
+    const environment = data.environment && typeof data.environment === "object" ? data.environment as { id?: string; config?: EnvironmentConfig } : undefined;
+    return {
+      id: String(data.id || sessionId), status: typeof data.status === "string" ? data.status : undefined,
+      agentId: typeof data.agent === "string" ? data.agent : typeof agent?.id === "string" ? agent.id : undefined,
+      agentVersion: agent?.version === undefined ? undefined : String(agent.version),
+      environmentId: typeof data.environment_id === "string" ? data.environment_id : environment?.id,
+      appId: environment?.config?.env?.LARKSUITE_CLI_APP_ID,
+      vaultIds: Array.isArray(data.vault_ids) ? data.vault_ids.filter((id): id is string => typeof id === "string") : [],
+      systemFingerprint: typeof agent?.system === "string" ? createHash("sha256").update(agent.system).digest("hex") : undefined
+    };
+  }
+
+  // 新Session可能尚无历史事件；准备恢复必须直接核查资源状态，不能把缺少事件当作idle。
+  async inspectSessionReadiness(sessionId: string, signal?: AbortSignal): Promise<SessionReadiness> {
+    const unknown: SessionReadiness = { sessionId, status: "unknown" };
+    if (!validUpgradeSessionId(sessionId) || signal?.aborted) return unknown;
+    const controller = new AbortController();
+    const timeoutMs = Number.isSafeInteger(this.options.inspectionTimeoutMs) && this.options.inspectionTimeoutMs > 0
+      ? Math.min(5_000, this.options.inspectionTimeoutMs) : 5_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let abort!: () => void;
+    const interrupted = new Promise<SessionReadiness>(resolve => {
+      abort = () => resolve(unknown);
+      combined.addEventListener("abort", abort, { once: true });
+    });
+    const inspect = async (): Promise<SessionReadiness> => {
+      try {
+        combined.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(sessionId)}`, {
+          method: "GET", headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` },
+          redirect: "error", signal: combined
+        });
+        if (!response.ok || combined.aborted) { void response.body?.cancel().catch(() => {}); return unknown; }
+        const body = await boundedHistoryBody(response, 4 * 1024 * 1024, combined);
+        combined.throwIfAborted();
+        const payload: unknown = JSON.parse(body);
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return unknown;
+        const data = payload as Record<string, unknown>;
+        if (Object.hasOwn(data, "error") || data.id !== sessionId || data.type !== "session"
+          || typeof data.status !== "string" || !["idle", "running", "upgrading", "failed", "unknown"].includes(data.status)) return unknown;
+        const agentId = typeof data.agent === "string" ? data.agent
+          : data.agent && typeof data.agent === "object" && !Array.isArray(data.agent) ? (data.agent as Record<string, unknown>).id : undefined;
+        if (!validUpgradeSessionId(agentId) || (this.apiKey && agentId.includes(this.apiKey))) return unknown;
+        return { sessionId, status: data.status as SessionReadiness["status"], agentId };
+      } catch { return unknown; }
+    };
+    try {
+      // 总时限同时覆盖响应头和正文，也约束忽略AbortSignal的适配器；迟到响应只清理正文。
+      return await Promise.race([inspect(), interrupted]);
+    } finally {
+      clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort();
+    }
+  }
+
+  async inspectSessionCreation(query: SessionCreationQuery, signal?: AbortSignal): Promise<SessionCreationInspection> {
+    if (signal?.aborted) return { status: "unknown", reason: "cancelled" };
+    const controller = new AbortController();
+    const timeoutMs = Number.isSafeInteger(this.options.inspectionTimeoutMs) && this.options.inspectionTimeoutMs > 0
+      ? Math.min(5000, this.options.inspectionTimeoutMs) : 5000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let abort!: () => void, remaining = 4 * 1024 * 1024;
+    const interrupted = new Promise<SessionCreationInspection>(resolve => {
+      abort = () => resolve({ status: "unknown", reason: signal?.aborted ? "cancelled" : "timeout" });
+      combined.addEventListener("abort", abort, { once: true });
+    });
+    const inspect = inspectCreatedSession(query, async path => {
+      combined.throwIfAborted();
+      const response = await this.fetcher(`${this.baseUrl}${path}`, { method: "GET",
+        headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, redirect: "error", signal: combined });
+      if (!response.ok || combined.aborted) { void response.body?.cancel().catch(() => {}); throw new Error("核查不可用"); }
+      const body = await boundedHistoryBody(response, remaining, combined, bytes => { remaining -= bytes; });
+      combined.throwIfAborted();
+      return JSON.parse(body);
+    }).then((result): SessionCreationInspection => result.status === "confirmed" && this.apiKey
+      && [result.sessionId, result.agentId, result.environmentId].some(value => value.includes(this.apiKey))
+      ? { status: "unknown", reason: "invalid_sessions" } : result)
+      .catch((): SessionCreationInspection => ({ status: "unknown", reason: "sessions_unavailable" }));
+    try {
+      // 一个总预算覆盖全部列表页与详情，忽略取消信号的适配器也不能无限阻塞调用方。
+      return await Promise.race([inspect, interrupted]);
+    } finally { clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort(); }
   }
 
   async updateAgent(agentId: string, version: string, config: AgentConfig): Promise<{ id: string; version?: string }> {
@@ -197,42 +412,81 @@ export class ArkClient {
     return { id, name: String(data.name || name) };
   }
 
-  async createVault(displayName: string): Promise<string> {
-    const response = await this.request("/vaults", { method: "POST", body: JSON.stringify({ display_name: displayName }) });
+  async createVault(displayName: string, metadata?: Record<string, unknown>): Promise<string> {
+    const response = await this.request("/vaults", { method: "POST", body: JSON.stringify({ display_name: displayName,
+      ...(metadata === undefined ? {} : { metadata: resourceMetadata(metadata) }) }) });
     return responseId(await response.json(), "Vault");
   }
 
-  async listVaults(): Promise<Array<{ id: string; displayName: string }>> {
-    const response = await this.request("/vaults?limit=100");
-    const payload = await response.json() as Record<string, unknown>;
-    const items = Array.isArray(payload.data) ? payload.data : [];
-    return items.map(item => {
-      const record = item as Record<string, unknown>;
-      return { id: String(record.id || ""), displayName: String(record.display_name || "") };
-    }).filter(item => item.id);
+  async listVaults(signal?: AbortSignal): Promise<VaultMetadata[]> {
+    return this.inspectCredentialResources(read => collectCredentialResources(read, "/vaults", projectVault), signal);
   }
 
-  async listCredentials(vaultId: string): Promise<Array<{ id: string; displayName: string; authType: string; secretName?: string }>> {
-    const response = await this.request(`/vaults/${encodeURIComponent(vaultId)}/credentials?limit=100`);
-    const payload = await response.json() as Record<string, unknown>;
-    const items = Array.isArray(payload.data) ? payload.data : [];
-    return items.map(item => {
-      const record = item as Record<string, unknown>;
-      const auth = (record.auth || {}) as Record<string, unknown>;
-      return { id: String(record.id || ""), displayName: String(record.display_name || ""), authType: String(auth.type || ""), secretName: typeof auth.secret_name === "string" ? auth.secret_name : undefined };
-    }).filter(item => item.id);
+  async listCredentials(vaultId: string, signal?: AbortSignal): Promise<CredentialMetadata[]> {
+    return this.inspectCredentialResources(read => {
+      if (!validUpgradeSessionId(vaultId)) throw new Error();
+      return collectCredentialResources(read, `/vaults/${encodeURIComponent(vaultId)}/credentials`, item => projectCredential(item, vaultId));
+    }, signal);
+  }
+
+  async getVault(vaultId: string, signal?: AbortSignal): Promise<VaultMetadata> {
+    return this.inspectCredentialResources(async read => {
+      if (!validUpgradeSessionId(vaultId)) throw new Error();
+      const vault = projectVault(await read(`/vaults/${encodeURIComponent(vaultId)}`));
+      if (vault.id !== vaultId) throw new Error();
+      return vault;
+    }, signal);
+  }
+
+  async getCredential(vaultId: string, credentialId: string, signal?: AbortSignal): Promise<CredentialMetadata> {
+    return this.inspectCredentialResources(async read => {
+      if (!validUpgradeSessionId(vaultId) || !validUpgradeSessionId(credentialId)) throw new Error();
+      const credential = projectCredential(await read(`/vaults/${encodeURIComponent(vaultId)}/credentials/${encodeURIComponent(credentialId)}`), vaultId);
+      if (credential.id !== credentialId || credential.vaultId !== vaultId) throw new Error();
+      return credential;
+    }, signal);
+  }
+
+  private async inspectCredentialResources<T>(operation: (read: (path: string) => Promise<unknown>) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const controller = new AbortController();
+    const timeoutMs = Number.isSafeInteger(this.options.inspectionTimeoutMs) && this.options.inspectionTimeoutMs > 0
+      ? Math.min(5_000, this.options.inspectionTimeoutMs) : 5_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let abort!: () => void, remaining = 4 * 1024 * 1024;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new Error());
+      combined.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      combined.throwIfAborted();
+      const pending = operation(async path => {
+        combined.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}${path}`, { method: "GET", redirect: "error", signal: combined,
+          headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` } });
+        // 总预算包含所有分页和正文；忽略AbortSignal的适配器迟到后也只清理，不继续读。
+        if (!response.ok || combined.aborted) { void response.body?.cancel().catch(() => {}); throw new Error(); }
+        const body = await boundedHistoryBody(response, remaining, combined, bytes => { remaining -= bytes; });
+        combined.throwIfAborted();
+        return JSON.parse(body);
+      });
+      return await Promise.race([pending, interrupted]);
+    } catch {
+      // 失败绝不是空列表；不能让调用方误判资源不存在而重复创建。禁止转发密钥或上游正文。
+      throw new Error("凭证资源核查失败，未确认资源列表或详情");
+    } finally { clearTimeout(timer); combined.removeEventListener("abort", abort); controller.abort(); }
   }
 
   async createEnvironmentCredential(vaultId: string, displayName: string, secretValue: string): Promise<string> {
     return this.createEnvironmentVariableCredential(vaultId, displayName, "LARKSUITE_CLI_USER_ACCESS_TOKEN", secretValue);
   }
 
-  async createEnvironmentVariableCredential(vaultId: string, displayName: string, secretName: string, secretValue: string): Promise<string> {
+  async createEnvironmentVariableCredential(vaultId: string, displayName: string, secretName: string, secretValue: string, metadata?: Record<string, unknown>): Promise<string> {
     const response = await this.request(`/vaults/${encodeURIComponent(vaultId)}/credentials`, {
       method: "POST", body: JSON.stringify({ display_name: displayName, auth: {
         type: "environment_variable", secret_name: secretName, secret_value: secretValue,
         networking: { type: "unrestricted" }
-      } })
+      }, ...(metadata === undefined ? {} : { metadata: resourceMetadata(metadata) }) })
     });
     return responseId(await response.json(), "Credential");
   }
@@ -243,22 +497,23 @@ export class ArkClient {
     });
   }
 
-  async getEnvironmentConfig(environmentId: string): Promise<EnvironmentConfig> {
+  async getEnvironmentConfig(environmentId: string, options: { fresh?: boolean } = {}): Promise<EnvironmentConfig> {
     const cached = this.environmentConfigs.get(environmentId);
-    if (cached) return cached;
+    if (cached && !options.fresh && Date.now() - cached.fetchedAt < 60_000) return structuredClone(cached.config);
     const response = await this.request(`/environments/${encodeURIComponent(environmentId)}`);
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
     const config = data.config as EnvironmentConfig | undefined;
     if (!config || typeof config !== "object" || typeof config.type !== "string") throw new Error("Environment 响应缺少有效 config");
-    this.environmentConfigs.set(environmentId, config);
-    return config;
+    this.environmentConfigs.set(environmentId, { config: structuredClone(config), fetchedAt: Date.now() });
+    return structuredClone(config);
   }
 
   async buildSessionCreateRequest(defaults: SessionCreateDefaults): Promise<SessionCreateRequest> {
     const vaultIds = defaults.vaultIds || [];
     const envOverrides = defaults.envOverrides || {};
     const environmentConfig = Object.keys(envOverrides).length ? await this.getEnvironmentConfig(defaults.environmentId) : undefined;
+    if (envOverrides.LARKSUITE_CLI_APP_ID && environmentConfig?.env?.LARKSUITE_CLI_APP_ID && environmentConfig.env.LARKSUITE_CLI_APP_ID !== envOverrides.LARKSUITE_CLI_APP_ID) throw new Error("Environment的LARKSUITE_CLI_APP_ID与当前FEISHU_APP_ID冲突，请显式修正绑定");
     return {
       agent: defaults.agentId,
       ...(environmentConfig ? {
@@ -303,10 +558,11 @@ export class ArkClient {
     return id;
   }
 
-  async uploadFile(name: string, mimeType: string, bytes: Uint8Array): Promise<{ id: string; name: string }> {
+  async uploadFile(name: string, mimeType: string, bytes: Uint8Array, options: { uploadName: string } | undefined = undefined): Promise<{ id: string; name: string }> {
+    if (options && !validUploadName(options.uploadName)) throw new Error("上传操作标识无效");
     const form = new FormData();
     form.set("purpose", "user_data");
-    form.set("file", new Blob([new Uint8Array(bytes)], { type: mimeType || "application/octet-stream" }), name);
+    form.set("file", new Blob([new Uint8Array(bytes)], { type: mimeType || "application/octet-stream" }), options?.uploadName || name);
     const response = await this.request("/files", { method: "POST", body: form });
     const payload = await response.json() as Record<string, unknown>;
     const data = (payload.data || payload) as Record<string, unknown>;
@@ -326,27 +582,137 @@ export class ArkClient {
     });
   }
 
-  async sendMessage(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
+  async inspectFileMount(query: FileMountQuery, signal?: AbortSignal): Promise<FileMountInspection> {
+    if (!validMountQuery(query)) return { status: "unknown", reason: "invalid_resources" };
+    const deadline = AbortSignal.timeout(this.options.inspectionTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    try {
+      combined.throwIfAborted();
+      // 此只读接口最多1000条、无分页；独立读取确保错误正文也不会无界读取或泄漏。
+      const response = await this.fetcher(`${this.baseUrl}/sessions/${encodeURIComponent(query.sessionId)}/resources`, {
+        headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, signal: combined
+      });
+      if (!response.ok) { void response.body?.cancel().catch(() => {}); return { status: "unknown", reason: "resources_unavailable" }; }
+      const body = await boundedHistoryBody(response, 4 * 1024 * 1024, combined);
+      combined.throwIfAborted();
+      return inspectMountResources(JSON.parse(body), query);
+    } catch { return { status: "unknown", reason: "resources_unavailable" }; }
+  }
+
+  async inspectFileUpload(query: FileUploadQuery, signal?: AbortSignal): Promise<FileUploadInspection> {
+    const deadline = AbortSignal.timeout(this.options.inspectionTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    let remaining = 4 * 1024 * 1024;
+    try {
+      return await inspectUploadedFile(query, async path => {
+        combined.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}${path}`, {
+          headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, signal: combined
+        });
+        if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error("文件核查接口不可用"); }
+        const body = await boundedHistoryBody(response, remaining, combined);
+        remaining -= Buffer.byteLength(body);
+        combined.throwIfAborted();
+        return JSON.parse(body);
+      });
+    } catch { return { status: "unknown", reason: "files_unavailable" }; }
+  }
+
+  async waitForFileActive(fileId: string, options: { timeoutMs?: number; pollIntervalMs?: number } = {}): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(fileId)) throw new Error("PDF 文件引用无效");
+    const timeout = options.timeoutMs ?? 60_000;
+    const interval = options.pollIntervalMs ?? 500;
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 60_000 || !Number.isSafeInteger(interval) || interval < 1 || interval > 5_000) throw new Error("PDF 就绪等待参数无效");
+    const signal = AbortSignal.timeout(timeout);
+    try {
+      while (true) {
+        signal.throwIfAborted();
+        const response = await this.fetcher(`${this.baseUrl}/files/${encodeURIComponent(fileId)}`, {
+          method: "GET", headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` }, signal, redirect: "error"
+        });
+        if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error(); }
+        const payload = JSON.parse(await boundedHistoryBody(response, 256 * 1024, signal));
+        const file = payload.data || payload;
+        if (file.id !== fileId || file.purpose !== "user_data" || file.mime_type !== "application/pdf" || file.error ||
+          (file.expire_at != null && (!Number.isFinite(file.expire_at) || file.expire_at * 1000 <= Date.now()))) throw new Error();
+        if (file.status === "active") return;
+        if (file.status !== "processing") throw new Error();
+        await waitFor(interval, signal);
+      }
+    } catch { throw new Error("PDF 文件尚未就绪、已失效或不可读取，请稍后重试；未发送模型请求"); }
+  }
+
+  async sendMessage(sessionId: string, text: string, signal?: AbortSignal, pdfFiles: PdfInputFile[] = []): Promise<void> {
     await this.request(`/sessions/${encodeURIComponent(sessionId)}/events`, {
       method: "POST",
       signal,
-      body: JSON.stringify({ events: [{ type: "user.message", content: [{ type: "text", text }] }] })
+      body: JSON.stringify({ events: [{ type: "user.message", content: [{ type: "text", text }, ...pdfDocumentBlocks(pdfFiles)] }] })
     });
   }
 
   async getSessionStats(sessionId: string, signal?: AbortSignal): Promise<SessionStats> {
-    const events = await this.listSessionEvents(sessionId, signal);
-    let latestInputTokens: number | undefined;
+    const history = await this.listSessionEvents(sessionId, signal);
+    const events = [...new Map(history.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
+    const stats: SessionStats = { eventCount: 0 };
+    const threads = new Set(events.flatMap(event => typeof event.session_thread_id === "string" ? [event.session_thread_id] : []));
+    let compactTurn = false;
     for (const event of events) {
+      if (event.id) stats.latestEventId = event.id;
+      if (event.type === "session.status_running") stats.status = "running";
+      if (event.type === "session.status_idle") stats.status = "idle";
+      if (event.type === "session.status_failed" || event.type === "session.error") stats.status = "failed";
+      if (event.type === "user.message") {
+        compactTurn = eventText(event).trim() === "/compact";
+        if (!compactTurn && event.id) stats.latestBusinessEventId = event.id;
+      }
+      if (event.type === "agent.thread_context_compacted" && event.id && threads.size <= 1) {
+        stats.latestCompaction = { eventId: event.id, eventCount: stats.eventCount,
+          ...(stats.latestTokenSampleId ? { tokenSampleId: stats.latestTokenSampleId } : {}),
+          ...(stats.latestBusinessEventId ? { businessEventId: stats.latestBusinessEventId } : {}) };
+        continue;
+      }
+      // 压缩模型调用不是新的业务输入，不得用它再次触发压缩。
+      if (compactTurn) {
+        if (event.type === "session.status_idle" || event.type === "session.status_failed") compactTurn = false;
+        continue;
+      }
+      stats.eventCount++;
       const usage = event.model_usage && typeof event.model_usage === "object"
         ? event.model_usage as Record<string, unknown>
         : undefined;
       const inputTokens = usage?.input_tokens;
-      if (typeof inputTokens === "number" && Number.isFinite(inputTokens)) {
-        latestInputTokens = inputTokens;
+      if (event.is_error !== true && typeof inputTokens === "number" && Number.isFinite(inputTokens) && inputTokens > 0) {
+        stats.latestInputTokens = inputTokens;
+        stats.latestTokenSampleId = event.id;
       }
     }
-    return { eventCount: events.length, latestInputTokens };
+    return stats;
+  }
+
+  async inspectCompaction(sessionId: string, beforeEventId?: string, signal?: AbortSignal): Promise<CompactionObservation> {
+    const history = await this.listSessionEvents(sessionId, signal);
+    const events = [...new Map(history.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
+    const boundary = beforeEventId ? events.findIndex(event => event.id === beforeEventId) : -1;
+    if (beforeEventId && boundary < 0) return { result: "unknown", reason: "boundary_not_found" };
+    const next = events.slice(boundary + 1);
+    const command = next.findIndex(event => event.type === "user.message");
+    if (command < 0 || eventText(next[command]).trim() !== "/compact") return { result: "unknown", reason: "command_not_found" };
+    const current: ArkEvent[] = [];
+    for (const event of next.slice(command + 1)) {
+      if (event.type === "user.message") break;
+      current.push(event);
+      if (event.type === "session.status_idle" || event.type === "session.status_failed") break;
+    }
+    const result = terminalResult(current);
+    if (result?.terminal === "failed") return { result: "failed", terminal: "failed", reason: "session_error" };
+    // 官方事件契约：https://docs.volcengine.com/docs/82379/2559583?lang=zh
+    // 同时要求本轮正常结束和明确压缩事件。多线程结果不能代表整个Session，暂不自动确认。
+    const threads = new Set([...next.slice(0, command), ...current].flatMap(event => typeof event.session_thread_id === "string" ? [event.session_thread_id] : []));
+    const proof = current.find(event => event.type === "agent.thread_context_compacted" && typeof event.id === "string");
+    if (result?.terminal === "idle" && proof && threads.size <= 1) {
+      return { result: "succeeded", terminal: "idle", reason: "thread_context_compacted", evidenceEventId: proof.id };
+    }
+    return { result: "unknown", ...(result ? { terminal: result.terminal } : {}), reason: result ? "missing_completion_evidence" : "run_not_terminal" };
   }
 
   async run(
@@ -354,15 +720,20 @@ export class ArkClient {
     text: string,
     timeoutMs: number,
     onProgress?: (progress: string) => Promise<void>,
-    onDelta?: (snapshot: string) => Promise<void>
+    onDelta?: (snapshot: string) => Promise<void>,
+    assertBeforeSend?: () => void,
+    pdfFiles: PdfInputFile[] = []
   ): Promise<RunResult> {
+    pdfDocumentBlocks(pdfFiles);
+    pdfFiles = pdfFiles.map(file => ({ ...file }));
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Session 运行超时")), timeoutMs);
     let boundary: RunBoundary | undefined;
+    let dispatchGuardFailed = false;
     try {
       const previous = await this.readSessionEvents(sessionId, controller.signal);
-      boundary = { startedAt, input: text, previousIds: new Set(previous.events.flatMap(event => event.id ? [event.id] : [])), anchored: false, page: previous.lastPage };
+      boundary = { startedAt, fingerprint: runInputFingerprint(text, pdfFiles), previousIds: new Set(previous.events.flatMap(event => event.id ? [event.id] : [])), anchored: false, page: previous.lastPage };
       // 先发起 SSE 请求，但不等待服务端返回响应头。部分环境建立事件流约需
       // 15 秒；若在这里 await，会让 user.message 也被无谓阻塞。
       const eventStream = this.openEventStream(sessionId, controller.signal, Boolean(onDelta));
@@ -370,17 +741,46 @@ export class ArkClient {
         eventStream.then(() => undefined, () => undefined),
         waitFor(this.options.sseHeadStartMs, controller.signal)
       ]);
-      await this.sendMessage(sessionId, text, controller.signal);
-      const result = await Promise.any([
+      // 必须在全部准备等待之后同步校验；这里到实际 POST 之间不得增加 await。
+      if (assertBeforeSend) {
+        try {
+          const result: unknown = assertBeforeSend();
+          if (result !== null && (typeof result === "object" || typeof result === "function") &&
+            typeof (result as { then?: unknown }).then === "function") {
+            // 错误配置的异步门禁不能放行，也不能产生未处理的 Promise rejection。
+            void Promise.resolve(result).catch(() => {});
+            throw new Error();
+          }
+        } catch {
+          dispatchGuardFailed = true;
+          // 不转发回调错误，避免授权、配置或凭证详情进入消息和日志。
+          throw new Error("发送前校验未通过，已停止发送消息");
+        }
+      }
+      await this.sendMessage(sessionId, text, controller.signal, pdfFiles);
+      let result = await Promise.any([
         this.consumeEventStream(eventStream, boundary, onProgress, onDelta),
         this.pollRunResult(sessionId, boundary, controller.signal)
       ]);
+      if (result.authorizationRequired) {
+        // SSE可能漏掉前面的写入或用户锚点。授权续跑只能依赖本轮完整历史，不把流式片段当证明。
+        try {
+          const history = await this.readSessionEvents(sessionId, AbortSignal.any([controller.signal, AbortSignal.timeout(2_000)]), boundary.page);
+          const verified = resultForBoundary(history.events, { ...boundary, anchored: false });
+          result = { ...result, evidence: verified?.authorizationRequired ? verified.evidence : undefined };
+        } catch {
+          console.warn("授权任务历史核验失败，保留授权需求但禁止依据不完整证据自动续跑");
+          result = { ...result, evidence: undefined };
+        }
+      }
+      // 即使上游错误把已知密钥放进格式正确的Request ID，也不能回传。
+      this.redactRunFailure(result);
       controller.abort();
       return result;
     } catch (error) {
-      if (!controller.signal.aborted) throw error;
+      if (dispatchGuardFailed || !controller.signal.aborted) throw error;
       const recovered = boundary ? await this.recoverTimedOutRun(sessionId, boundary) : undefined;
-      if (recovered) return recovered;
+      if (recovered) return this.redactRunFailure(recovered);
       throw new Error("Session 运行超时");
     } finally {
       controller.abort();
@@ -410,6 +810,7 @@ export class ArkClient {
     onDelta?: (snapshot: string) => Promise<void>
   ): Promise<RunResult> {
     const messages: string[] = [];
+    const files = new RunFileObserver();
     const seen = new Set<string>();
     const previews = new Map<string, Map<number, string>>();
     const toolDomains = new Map<string, string>();
@@ -417,6 +818,7 @@ export class ArkClient {
     let lastSnapshot = "";
     for await (const event of await streamPromise) {
       if (!belongsToRun(event, boundary)) continue;
+      files.observe(event);
       if (event.id && seen.has(event.id)) continue;
       if (event.id) seen.add(event.id);
       rememberLarkCliToolDomain(event, toolDomains);
@@ -452,8 +854,12 @@ export class ArkClient {
       }
       const progress = eventProgress(event);
       if (progress) await onProgress?.(progress);
-      if (event.type === "session.error" || event.type === "session.status_failed") return { terminal: "failed", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
-      if (event.type === "session.status_idle") return { terminal: "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+      if (["session.error", "session.status_failed", "session.status_idle"].includes(String(event.type))) {
+        const fileObservation = files.snapshot();
+        return { terminal: event.type === "session.status_idle" ? "idle" : "failed", messages,
+          ...(event.type !== "session.status_idle" ? { failure: sessionFailure(event) } : {}),
+          ...(fileObservation ? { fileObservation } : {}), ...(authorizationRequired ? { authorizationRequired } : {}) };
+      }
     }
     throw new Error("事件流结束，但未观察到 Session 终态");
   }
@@ -472,15 +878,47 @@ export class ArkClient {
     return (await this.readSessionEvents(sessionId, signal)).events;
   }
 
-  private async readSessionEvents(sessionId: string, signal?: AbortSignal, startPage?: string): Promise<{ events: ArkEvent[]; lastPage?: string }> {
+  // 只核查已提交的原运行，不发送消息、不执行工具，也不将idle等同于业务成功。
+  async inspectRun(sessionId: string, requestFingerprint: string, signal?: AbortSignal): Promise<RunInspection> {
+    if (!/^[a-f0-9]{64}$/.test(requestFingerprint)) throw new Error("运行请求指纹必须是SHA256");
+    const deadline = AbortSignal.timeout(this.options.inspectionTimeoutMs);
+    const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    try {
+      combined.throwIfAborted();
+      const { events } = await this.readSessionEvents(sessionId, combined, undefined, true);
+      combined.throwIfAborted();
+      const inspection = inspectRunHistory(events, requestFingerprint);
+      if (inspection.status === "ended") this.redactRunFailure(inspection.result);
+      return inspection;
+    } catch {
+      // 上游错误可能包含凭证或文档片段；核查状态只返回稳定原因，不转发原始错误。
+      return { status: "unknown", reason: "history_unavailable" };
+    }
+  }
+
+  private redactRunFailure(result: RunResult): RunResult {
+    if (result.failure?.requestId?.includes(this.apiKey)) delete result.failure.requestId;
+    return result;
+  }
+
+  private async readSessionEvents(sessionId: string, signal?: AbortSignal, startPage?: string, strict = false): Promise<{ events: ArkEvent[]; lastPage?: string }> {
     const events: ArkEvent[] = [];
     let page = startPage;
     const pages = new Set<string>();
+    let bytes = 0;
     for (let count = 0; count < 100; count++) {
+      signal?.throwIfAborted();
       const response = await this.request(`/sessions/${encodeURIComponent(sessionId)}/events?limit=200${page ? `&page=${encodeURIComponent(page)}` : ""}`, { signal });
-      const payload = await response.json() as Record<string, unknown>;
+      const body = strict ? await boundedHistoryBody(response, 64 * 1024 * 1024 - bytes, signal) : undefined;
+      if (body !== undefined) {
+        bytes += Buffer.byteLength(body);
+        if (bytes > 64 * 1024 * 1024) throw new Error("事件历史超过核查大小上限");
+      }
+      const payload = (body === undefined ? await response.json() : JSON.parse(body)) as Record<string, unknown>;
+      if (strict) validateInspectionPage(payload);
       const data = payload.data as { items?: ArkEvent[]; next_page?: string } | undefined;
       events.push(...(Array.isArray(payload.data) ? payload.data as ArkEvent[] : data?.items || []));
+      if (strict && events.length > 20_000) throw new Error("事件历史超过核查数量上限");
       const nextPage = payload.next_page || data?.next_page;
       if (typeof nextPage !== "string" || !nextPage) return { events, lastPage: page };
       if (pages.has(nextPage)) throw new Error("Session 事件分页游标重复，不能确认完整运行结果");
@@ -500,6 +938,188 @@ export class ArkClient {
   }
 }
 
+function resourceObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+}
+
+function resourceMetadata(value: unknown): Record<string, unknown> {
+  let nodes = 0, bytes = 0;
+  const seen = new Set<object>();
+  const copy = (item: unknown, depth: number): unknown => {
+    if (++nodes > 65_536 || depth > 32) throw new Error("凭证资源元信息无效");
+    if (item === null || typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))) return item;
+    if (typeof item === "string") { bytes += Buffer.byteLength(item); if (bytes > 4 * 1024 * 1024) throw new Error("凭证资源元信息无效"); return item; }
+    if ((!resourceObject(item) && !Array.isArray(item)) || seen.has(item as object) || Object.getOwnPropertySymbols(item as object).length) throw new Error("凭证资源元信息无效");
+    const descriptors = Object.getOwnPropertyDescriptors(item);
+    if (Object.values(descriptors).some(value => value.get || value.set)) throw new Error("凭证资源元信息无效");
+    seen.add(item as object);
+    let result: unknown;
+    if (Array.isArray(item)) {
+      if (Object.keys(item).length !== item.length || Object.keys(item).some(key => !/^\d+$/.test(key))) throw new Error("凭证资源元信息无效");
+      result = item.map(value => copy(value, depth + 1));
+    } else result = Object.fromEntries(Object.keys(item as object).map(key => [copy(key, depth + 1), copy(descriptors[key].value, depth + 1)]));
+    seen.delete(item as object);
+    return result;
+  };
+  if (!resourceObject(value)) throw new Error("凭证资源元信息无效");
+  return copy(value, 0) as Record<string, unknown>;
+}
+
+function projectResource(value: unknown, type: string): { record: Record<string, unknown>; fields: { id: string; displayName: string;
+  metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string } } {
+  if (!resourceObject(value) || Object.hasOwn(value, "error") || !validUpgradeSessionId(value.id)
+    || (value.display_name === undefined ? type !== "vault_credential" : typeof value.display_name !== "string")
+    || (value.type !== undefined && value.type !== type)) throw new Error();
+  const fields: { id: string; displayName: string; metadata?: Record<string, unknown>; createdAt?: string; updatedAt?: string } = {
+    // Credential名称可省略；空字符串仅维持旧投影，不可作为预置资源归属的证明。
+    id: value.id, displayName: typeof value.display_name === "string" ? value.display_name : ""
+  };
+  // MA 对未设置的元信息可能返回 null；按缺省处理，不能据此推定资源归属。
+  if (value.metadata !== undefined && value.metadata !== null) fields.metadata = resourceMetadata(value.metadata);
+  for (const [raw, normalized] of [["created_at", "createdAt"], ["updated_at", "updatedAt"]] as const) {
+    if (value[raw] === undefined) continue;
+    const stamp = value[raw];
+    if (typeof stamp !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(stamp) || !Number.isFinite(Date.parse(stamp))) throw new Error();
+    fields[normalized] = stamp;
+  }
+  return { record: value, fields };
+}
+
+function projectVault(value: unknown): VaultMetadata {
+  const { record, fields } = projectResource(value, "vault");
+  return { ...fields, ...(record.type === undefined ? {} : { type: "vault" }) };
+}
+
+function projectCredential(value: unknown, vaultId: string): CredentialMetadata {
+  const { record, fields } = projectResource(value, "vault_credential"), auth = record.auth;
+  if (!resourceObject(auth) || typeof auth.type !== "string" || !auth.type
+    || (auth.secret_name !== undefined && typeof auth.secret_name !== "string")
+    || (record.vault_id !== undefined && record.vault_id !== vaultId)) throw new Error();
+  let networking: CredentialMetadata["networking"];
+  if (auth.networking !== undefined) {
+    const source = auth.networking;
+    if (!resourceObject(source) || typeof source.type !== "string" || !source.type
+      || (source.allowed_hosts !== undefined && (!Array.isArray(source.allowed_hosts) || source.allowed_hosts.some(host => typeof host !== "string")))) throw new Error();
+    networking = { type: source.type, ...(source.allowed_hosts === undefined ? {} : { allowed_hosts: [...source.allowed_hosts as string[]] }) };
+  }
+  // 只读取明确的元信息字段；auth中的secret_value/token及其他凭证正文绝不进入返回值。
+  return { ...fields, authType: auth.type, ...(auth.secret_name === undefined ? {} : { secretName: auth.secret_name as string }),
+    ...(record.type === undefined ? {} : { type: "vault_credential" }), ...(record.vault_id === undefined ? {} : { vaultId }),
+    ...(networking === undefined ? {} : { networking }) };
+}
+
+async function collectCredentialResources<T extends { id: string }>(read: (path: string) => Promise<unknown>, path: string,
+  project: (item: unknown) => T): Promise<T[]> {
+  const result: T[] = [], cursors = new Set<string>(), ids = new Set<string>();
+  let page: string | undefined, total: number | undefined;
+  for (let count = 0; count < 10; count++) {
+    const payload = await read(`${path}?limit=100${page ? `&page=${encodeURIComponent(page)}` : ""}`);
+    if (!resourceObject(payload) || Object.hasOwn(payload, "error") || !Array.isArray(payload.data)) throw new Error();
+    if (payload.total !== undefined) {
+      if (!Number.isSafeInteger(payload.total) || (payload.total as number) < 0 || (payload.total as number) > 1000
+        || (total !== undefined && total !== payload.total)) throw new Error();
+      total = payload.total as number;
+    }
+    if (result.length + payload.data.length > 1000) throw new Error();
+    for (const item of payload.data) {
+      const projected = project(item);
+      if (ids.has(projected.id)) throw new Error();
+      ids.add(projected.id); result.push(projected);
+    }
+    const next = payload.next_page;
+    if (next !== undefined && next !== null && (typeof next !== "string" || Buffer.byteLength(next) > 2048 || /[\x00-\x20\x7f]/.test(next))) throw new Error();
+    if (typeof next === "string" && next) {
+      if (cursors.has(next)) throw new Error();
+      cursors.add(next); page = next; continue;
+    }
+    if ((total !== undefined && total !== result.length) || (total === undefined && next == null && payload.data.length >= 100)) throw new Error();
+    return result;
+  }
+  throw new Error();
+}
+
+async function boundedHistoryBody(response: Response, maxBytes: number, signal?: AbortSignal, bytesRead?: (bytes: number) => void): Promise<string> {
+  if (!response.body) throw new Error("事件历史响应为空");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const parts: string[] = [];
+  let bytes = 0;
+  const abort = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        void reader.cancel().catch(() => {});
+        throw new Error("事件历史超过核查大小上限");
+      }
+      parts.push(decoder.decode(value, { stream: true }));
+    }
+    parts.push(decoder.decode());
+    // 多页共享预算使用网络字节数，不能因UTF-8解码移除BOM而少计大小。
+    bytesRead?.(bytes);
+    return parts.join("");
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    reader.releaseLock();
+  }
+}
+
+function validateInspectionPage(payload: unknown): void {
+  const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!object(payload)) throw new Error("无效事件历史结构");
+  const data = payload.data;
+  const items = Array.isArray(data) ? data : object(data) ? data.items : undefined;
+  if (!Array.isArray(items) || items.some(event => !object(event) || typeof event.id !== "string" || !event.id || typeof event.type !== "string" || !event.type)) throw new Error("事件历史不完整");
+  const cursors = [payload.next_page, object(data) ? data.next_page : undefined];
+  if (cursors.some(cursor => cursor != null && typeof cursor !== "string")) throw new Error("无效事件分页游标");
+  if (cursors.every(cursor => typeof cursor === "string") && cursors[0] !== cursors[1]) throw new Error("事件分页游标冲突");
+}
+
+function inspectRunHistory(events: ArkEvent[], requestFingerprint: string): RunInspection {
+  const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)])) : value;
+  const seen = new Map<string, string>();
+  const unique: ArkEvent[] = [];
+  for (const event of events) {
+    const id = event.id!;
+    const hash = createHash("sha256").update(JSON.stringify(canonical(event))).digest("hex");
+    const previous = seen.get(id);
+    if (previous && previous !== hash) return { status: "unknown", reason: "conflicting_event" };
+    if (!previous) { seen.set(id, hash); unique.push(event); }
+  }
+  const anchors = unique.filter(event => event.type === "user.message" && eventInputFingerprint(event.content) === requestFingerprint);
+  if (anchors.length !== 1) return { status: "unknown", reason: anchors.length ? "ambiguous_anchor" : "anchor_not_found" };
+  const anchorEventId = anchors[0].id!;
+  const unknown = (reason: Extract<RunInspection, { status: "unknown" }>["reason"]): RunInspection => ({ status: "unknown", reason, anchorEventId });
+  const current = unique.slice(unique.indexOf(anchors[0]));
+  if (current.slice(1).some(event => event.type === "user.message")) return unknown("later_request");
+  const threads = new Set(current.map(event => event.session_thread_id).filter(value => typeof value === "string" && value));
+  if (threads.size > 1) return unknown("multiple_threads");
+  let stamp = -Infinity;
+  for (const event of current) {
+    if (event.processed_at === undefined) continue;
+    const next = Date.parse(event.processed_at);
+    if (!Number.isFinite(next) || next < stamp) return unknown("event_order_unknown");
+    stamp = next;
+  }
+  const terminalIndex = current.findIndex(event => event.type === "session.status_idle" || event.type === "session.status_failed");
+  if (terminalIndex < 0) return current.some(event => event.type === "session.status_running")
+    ? { status: "running", anchorEventId } : unknown("terminal_not_observed");
+  const tail = current.slice(terminalIndex + 1);
+  if (tail.some(event => event.type?.startsWith("agent.") || ["session.status_running", "session.status_failed", "session.error"].includes(event.type!))) return unknown("activity_after_terminal");
+  const result = terminalResult(current.slice(0, terminalIndex + 1))!;
+  return { status: "ended", anchorEventId, terminalEventId: current[terminalIndex].id!, result };
+}
+
 function validateSessionCreateRequest(request: SessionCreateRequest): void {
   if (!request || !request.agent || (typeof request.agent !== "string" && typeof request.agent !== "object")) {
     throw new Error("创建 Session 必须提供 agent");
@@ -509,12 +1129,6 @@ function validateSessionCreateRequest(request: SessionCreateRequest): void {
   if (hasEnvironment === hasEnvironmentId) {
     throw new Error("environment 与 environment_id 必须且只能传一个");
   }
-}
-
-function networkErrorDetail(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  const cause = error.cause instanceof Error ? error.cause.message : typeof error.cause === "string" ? error.cause : "";
-  return [error.message, cause].filter(Boolean).join("；").slice(0, 180);
 }
 
 function waitFor(ms: number, signal: AbortSignal): Promise<void> {
@@ -595,7 +1209,7 @@ function belongsToRun(event: ArkEvent, boundary: RunBoundary): boolean {
   const preview = event.type === "event_start" ? event.event as ArkEvent | undefined : undefined;
   const id = preview?.id || (typeof event.event_id === "string" ? event.event_id : undefined) || event.id;
   if (id && boundary.previousIds.has(id)) return false;
-  if (event.type === "user.message" && eventText(event) === boundary.input) boundary.anchored = true;
+  if (event.type === "user.message" && eventInputFingerprint(event.content) === boundary.fingerprint) boundary.anchored = true;
   const stamp = Date.parse(String(event.processed_at || preview?.processed_at || ""));
   // 用户事件建立本轮边界后不再依赖本机时钟；无边界的旧事件不能触发终态。
   return boundary.anchored || (Number.isFinite(stamp) ? stamp >= boundary.startedAt : boundary.previousIds.size === 0);
@@ -607,6 +1221,7 @@ function resultForBoundary(events: ArkEvent[], boundary: RunBoundary): RunResult
 }
 
 function terminalResult(current: ArkEvent[]): RunResult | undefined {
+  const raw = current;
   current = [...new Map(current.map((event, index) => [event.id || `anonymous:${index}`, event])).values()];
   const failed = current.some(event => event.type === "session.error" || event.type === "session.status_failed");
   const idle = current.some(event => event.type === "session.status_idle");
@@ -615,7 +1230,18 @@ function terminalResult(current: ArkEvent[]): RunResult | undefined {
   const toolDomains = new Map<string, string>();
   for (const event of current) rememberLarkCliToolDomain(event, toolDomains);
   const authorizationRequired = current.map(event => eventUserAuthorizationRequired(event, toolDomains)).find(Boolean);
-  return { terminal: failed ? "failed" : "idle", messages, ...(authorizationRequired ? { authorizationRequired } : {}) };
+  const terminal = failed ? "failed" : "idle";
+  const files = new RunFileObserver();
+  for (const event of raw) files.observe(event);
+  const fileObservation = files.snapshot();
+  const observed = { ...(fileObservation ? { fileObservation } : {}),
+    ...(failed ? { failure: sessionFailure(current.find(event => event.type === "session.error") || {}) } : {}) };
+  if (authorizationRequired) {
+    const collector = new RunEvidenceCollector();
+    for (const event of raw) collector.observe(event, Boolean(eventUserAuthorizationRequired(event, toolDomains)));
+    return { terminal, messages, ...observed, authorizationRequired, evidence: collector.snapshot(terminal) };
+  }
+  return { terminal, messages, ...observed };
 }
 
 function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, string>): void {
@@ -623,7 +1249,10 @@ function rememberLarkCliToolDomain(event: ArkEvent, toolDomains: Map<string, str
   const input = event.input && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
   if (typeof input?.command !== "string") return;
   const match = input.command.match(/(?:^|[;&|]\s*|\s)lark-cli\s+([a-z][\w-]*)\b/i);
-  if (match) toolDomains.set(event.id, match[1].toLowerCase());
+  if (match) {
+    toolDomains.set(event.id, match[1].toLowerCase());
+    if (typeof event.tool_use_id === "string") toolDomains.set(event.tool_use_id, match[1].toLowerCase());
+  }
 }
 
 export function eventUserAuthorizationRequired(
@@ -643,10 +1272,13 @@ export function eventUserAuthorizationRequired(
   try { payload = JSON.parse(normalized.slice(jsonStart, jsonEnd + 1)) as Record<string, unknown>; }
   catch { return undefined; }
   const error = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : undefined;
-  if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication" || error.subtype !== "token_missing") return undefined;
+  if (payload.ok !== false || payload.identity !== "user" || error?.type !== "authentication") return undefined;
+  // 已预置但未授权的Credential或被撤销的UAT可能存在值，CLI会返回token_invalid而非token_missing。
+  // 只接入已确认的用户凭证错误，Bot、应用权限不足和未知错误不能借此申请个人授权。
+  if (error.subtype !== "token_missing" && error.subtype !== "token_invalid") return undefined;
   const toolUseId = typeof event.tool_use_id === "string" ? event.tool_use_id : "";
   const domain = toolDomains.get(toolUseId);
-  return { identity: "user", errorType: "authentication", subtype: "token_missing", ...(domain ? { domain } : {}) };
+  return { identity: "user", errorType: "authentication", subtype: error.subtype, ...(domain ? { domain } : {}) };
 }
 
 function parseEventBlock(block: string): ArkEvent[] {

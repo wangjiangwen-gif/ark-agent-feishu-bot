@@ -1,0 +1,54 @@
+{
+  "date": "2026-09-16",
+  "baseline_commit": "7950cfd",
+  "scope": "原生单卡片远程投递核查，实验持久化队列仍非CLI默认",
+  "red": ["新增查询测试因缺少模块失败", "新增恢复测试因缺少replyInspectionQuery导出失败"],
+  "verification": {
+    "new_tests": 29,
+    "total_tests": 525,
+    "passed": 525,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 3286.53875,
+    "syntax_check": "passed",
+    "full_typescript_typecheck": "not_run_project_check_is_syntax_only",
+    "build": "passed",
+    "diff_check": "passed",
+    "sandbox_first_run": "523/524 passed; WebUI localhost listen failed with EPERM; reran complete suite with local listener permitted"
+  },
+  "fault_injection": {
+    "real_components": ["Gateway", "LarkChannelAdapter", "MessageInbox", "SQLite", "Node child process exit and restart"],
+    "simulated_components": ["MA", "Feishu CardKit writes", "Feishu message GET"],
+    "child_exit_code": 78,
+    "crash_point": "settings applied remotely, before response; local delivery phase finalizing",
+    "recovery_message_gets": 1,
+    "recovery_ma_replays": 0,
+    "recovery_feishu_writes": 0,
+    "other_cases": ["content acknowledgement lost", "settings acknowledgement lost", "concurrent inspection coalesced", "retry after unavailable observation", "revision changed during query", "Session changed during query", "wrong identity/chat/thread", "placeholder or streaming card", "stale or pre-run proof", "duplicate items or elements", "malformed and oversized JSON", "abort and late response", "encrypted proof survives reopen"]
+  },
+  "real_read_only_probe": {
+    "message_id": "om_x100b6597ad6af480b1dadf77b259723",
+    "chat_id": "oc_1b3b4ecc37b711f8ea0666284eb30d07",
+    "app_id": "cli_aa0ab4fffab85bc6",
+    "schema": "2.0",
+    "updated": true,
+    "streaming_mode": false,
+    "element_id": "arkagent_stream_md",
+    "body_characters": 683,
+    "body_sha256": "3f5388a052aa2f3d27f755abfa59a42fcfabd5a199e7f5b4f4cc7f4ee2aea7d7",
+    "list_ms": 934.511666,
+    "get_ms": 616.2936669999999,
+    "implementation_probe_ms": 695.397333,
+    "implementation_result": "confirmed",
+    "observed_at": 1789548307777,
+    "external_resource_writes": 0,
+    "limitation": "仅查询已有卡片，不是从用户发消息到故障恢复的真实端到端，不是性能P95"
+  },
+  "official_contracts": [
+    "https://open.feishu.cn/document/server-docs/im-v1/message/get.md",
+    "https://open.feishu.cn/document/server-docs/im-v1/message/list.md"
+  ],
+  "remaining": ["无消息ID投递结果", "普通文本和分片消息", "SDK流式回退", "未关闭流式卡片受控收尾", "准备阶段副作用", "人工处理入口", "默认开启持久化队列", "真实故障端到端", "真实性能对照", "完整方案其他阶段"],
+  "published": false,
+  "deployed": false
+}

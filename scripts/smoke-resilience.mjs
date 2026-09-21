@@ -57,9 +57,12 @@ try {
   const write = await reconnect.run(sessionId, `请仅使用 bash 将 ${marker} 写入 /mnt/session/resilience-state.txt，再读取并返回内容。`, 180_000);
   assert.ok(write.messages.at(-1)?.includes(marker));
   const compactStarted = Date.now();
+  const beforeCompact = await reconnect.getSessionStats(sessionId);
   const compact = await reconnect.run(sessionId, "/compact", 180_000);
   assert.equal(compact.terminal, "idle");
-  console.log(JSON.stringify({ check: "compact", durationMs: Date.now() - compactStarted, oldReplyReturned: compact.messages.includes(write.messages.at(-1)) }));
+  const proof = await reconnect.inspectCompaction(sessionId, beforeCompact.latestEventId);
+  console.log(JSON.stringify({ check: "compact", durationMs: Date.now() - compactStarted, result: proof.result, reason: proof.reason, evidenceEventId: proof.evidenceEventId }));
+  assert.equal(proof.result, "succeeded", "必须有本轮原生压缩完成事件，不能只凭idle通过");
   const read = await reconnect.run(sessionId, "请仅使用 bash 读取 /mnt/session/resilience-state.txt，并对 /mnt/session/uploads/mnt/data 中的所有 PDF 计算 sha256sum，返回原文和哈希。", 180_000);
   const final = read.messages.at(-1) || "";
   assert.ok(final.includes(marker), "原地压缩后生成文件丢失");

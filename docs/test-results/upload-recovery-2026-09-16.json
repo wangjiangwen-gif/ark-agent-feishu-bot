@@ -1,0 +1,56 @@
+{
+  "date": "2026-09-16",
+  "baseline": "fb53f29",
+  "scope": "带随机操作标识的新上传响应丢失恢复；不是完整业务恢复或外部E2E验收",
+  "contractSources": [
+    "https://docs.volcengine.com/docs/82379/1870405?lang=zh",
+    "https://docs.volcengine.com/docs/82379/1870407?lang=zh",
+    "https://docs.volcengine.com/docs/82379/1870406?lang=zh"
+  ],
+  "contract": {
+    "verifiedBy": "官方公共网页正文与示例，通过浏览器读取",
+    "upload": "POST /files，multipart file的文件名承载客户端生成的UUID操作名，purpose=user_data",
+    "list": "GET /files?purpose=user_data&limit=100&order=desc&after=<last_id>，data/first_id/last_id/has_more",
+    "detail": "GET /files/{file_id}，文件对象本体，active且expire_at未过期",
+    "recoveryEvidence": "唯一随机操作名+大小+用途+创建时间；详情再次确认",
+    "notEvidence": "本地sha256不等于服务端内容Hash；随机操作名不是官方幂等键",
+    "limits": { "pages": 20, "files": 2000, "totalBytes": 4194304, "defaultTimeoutMs": 10000, "clockSkewBeforeSeconds": 30, "creationWindowAfterSeconds": 120 }
+  },
+  "tests": {
+    "initialRed": { "tests": 12, "failures": 12 },
+    "newTests": 30,
+    "fullSuite": { "command": "npm test", "passed": 624, "failed": 0, "skipped": 0, "durationMs": 4335.692625 },
+    "gates": ["npm run check（语法）", "npm run build", "git diff --check"],
+    "realProcess": "模拟远端接收上传后真实Node进程exit(79)，Gateway/SQLite重开，两次GET找回File ID，不重传；使用原Session，挂载原中文文件名",
+    "coverage": [
+      "无标识旧记录不扫描、不猜测认领、不重传",
+      "错文件名/大小/用途/时间，processing/过期文件，重复标识及详情变化",
+      "分页缺字段/重复游标/空页/超页/过量数据/后页失败，响应体超时取消及总字节上限",
+      "同源文件跨Thread共享上传意图，跨应用/租户/群/源消息隔离",
+      "事务领取与CAS、过期/未来证明、SQL失败回滚、缓存保存失败后复用确认结果",
+      "明确400 InvalidParameter与泛化400区别，迟到证明不能替换成功响应File ID",
+      "默认ArkClient上传命名兼容，Gateway使用内部名但保留用户可见文件名"
+    ],
+    "externalServices": "mock"
+  },
+  "performance": {
+    "script": "scripts/benchmark-upload-recovery.mjs",
+    "baselineSource": "git archive fb53f29 src 导出到临时目录，同进程动态导入对照",
+    "warmup": 5,
+    "alternatingOrder": true,
+    "runs": [
+      { "samples": 30, "phase": "initial", "beforePlainP95Ms": 0.531875, "afterPlainP95Ms": 0.729917, "beforeFilesP95Ms": 7.668166, "afterFilesP95Ms": 7.700916 },
+      { "samples": 200, "phase": "review_required", "beforePlainP95Ms": 0.471667, "afterPlainP95Ms": 0.467583, "beforeFilesP95Ms": 7.309792, "afterFilesP95Ms": 8.937417 },
+      { "samples": 200, "phase": "after_removing_redundant_reads", "beforePlainP95Ms": 0.342375, "afterPlainP95Ms": 0.355875, "beforeFilesP50Ms": 5.995083, "afterFilesP50Ms": 6.286042, "beforeFilesP95Ms": 7.379625, "afterFilesP95Ms": 7.477958 }
+    ],
+    "finalCallsPerGroup": { "download": 410, "upload": 410, "mount": 410, "inspect": 0, "run": 410 },
+    "interpretation": "本地SQLite+模拟传输对照；不代表真实用户P95或平台性能验收"
+  },
+  "limitations": [
+    "真实825测试资源授权问题已发出，尚未收到答复；未操作真实MA/飞书或私有Session",
+    "无标识旧记录、扫描超限或未发请求即退出等仍需人工处置，尚无完整强制重传流程",
+    "列表不是快照，随机命名也不是官方幂等键；须真实验证平台命名保留及分页行为",
+    "PDF提前idle、无Session ID的创建结果、完整准备事务与队列默认启用仍未完成",
+    "未部署开发机，未发布GitHub/npm"
+  ]
+}

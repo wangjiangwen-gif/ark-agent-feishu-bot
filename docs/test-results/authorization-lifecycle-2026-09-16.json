@@ -1,0 +1,46 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "adbd333",
+  "packageVersion": "0.2.9",
+  "location": "local macOS source worktree",
+  "scope": "OAuth cancellation, expiry, stale completion and durable terminal recovery checkpoints",
+  "externalServices": "Mocked; no production credentials or real Feishu messages were changed",
+  "commands": [
+    { "command": "npm test", "passed": 259, "failed": 0, "skipped": 0, "durationMs": 2201.950416, "note": "Local loopback permission required by existing WebUI test" },
+    { "command": "npm run check", "exitCode": 0, "note": "Syntax checks, not full TypeScript type checking" },
+    { "command": "npm run build", "exitCode": 0 },
+    { "command": "git diff --check", "exitCode": 0 }
+  ],
+  "redPhase": [
+    "Pre-cancelled poll test failed because the baseline ignored AbortSignal and attempted a request",
+    "Manager cancellation test failed because the baseline had no cancel method"
+  ],
+  "newTests": {
+    "tests/oauth.test.ts": [
+      "Pre-cancelled polling sends no HTTP request",
+      "Cancellation interrupts authorization_pending backoff without another exchange",
+      "In-flight request is aborted; server outcome remains unknown",
+      "Absolute device expiry aborts a hung token response"
+    ],
+    "tests/authorization-lifecycle.test.ts": [
+      "Cancel during begin suppresses late card and poll",
+      "Different user and group cannot cancel another user flow; late tokens ignored",
+      "Cancel during MA write suppresses resume without claiming revocation",
+      "Expiry reports once and discards late completion",
+      "Denied authorization finishes all joined recovery requests and notifies user",
+      "Old flow cleanup cannot remove replacement flow",
+      "Close aborts outstanding work",
+      "Late MA completion after database close does not resume or access database",
+      "Cancel control command bypasses busy scope queue and deduplicates",
+      "Cancelled and expired states survive DB reopen and reject callbacks",
+      "Gateway, real OAuth client, Manager and SQLite mocked integration: one Session, one run, one exchange, zero token updates, Get removed"
+    ]
+  },
+  "unverified": [
+    "Durable active OAuth flow recovery after process restart",
+    "Pausing the direct business queue while waiting for authorization",
+    "Safe step-level continuation after partially successful write operations",
+    "Real MA and Feishu end-to-end acceptance",
+    "Production performance comparison and deployment migration"
+  ]
+}

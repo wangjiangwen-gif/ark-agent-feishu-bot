@@ -1,6 +1,13 @@
 import { createLarkChannel, type LarkChannel, type NormalizedMessage, type SendInput } from "@larksuite/channel";
-import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelOutbound, ChannelResource } from "./channel.ts";
+import type { ChannelAdapter, ChannelHistoryMessage, ChannelMessage, ChannelMessageLookup, ChannelOutbound, ChannelResource, ReplyDeliveryObserver } from "./channel.ts";
+import { replyContentFingerprint, validReplyMessageIds } from "./reply-delivery.ts";
+import { streamFailureText } from "./ark-errors.ts";
+import { withDeliveredFailureNotice } from "./failure-notice.ts";
 import { createFeishuResourceDownloader, MAX_FEISHU_FILE_BYTES, type FeishuResourceClient } from "./feishu.ts";
+import { attachmentSizeError } from "./attachment-limits.ts";
+import { inspectLarkReaction, type ReactionListClient } from "./lark-reactions.ts";
+import { inspectLarkReply } from "./lark-reply-inspection.ts";
+import type { ReactionQuery, ReactionObservation, ReplyInspectionQuery, ReplyObservation } from "./channel.ts";
 
 type RawLarkMessage = {
   event_id?: string;
@@ -14,6 +21,7 @@ export type LarkChannelPort = Pick<LarkChannel,
 
 type LarkHistoryItem = {
   message_id?: string;
+  chat_id?: string;
   msg_type?: string;
   create_time?: string;
   update_time?: string;
@@ -32,8 +40,10 @@ type LarkMessageListResponse = {
 
 type LarkMessageList = (payload: unknown) => Promise<LarkMessageListResponse>;
 
-type FeishuCardStreamClient = FeishuResourceClient & {
-  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList } };
+type FeishuCardStreamClient = FeishuResourceClient & ReactionListClient & {
+  im: FeishuResourceClient["im"] & { message?: { list: LarkMessageList; get?: LarkMessageList };
+    v1?: { messageReaction?: { create(payload: unknown): Promise<{ code?: number; data?: { reaction_id?: string } }>;
+      delete(payload: unknown): Promise<{ code?: number }> } } };
   cardkit?: { v1?: {
     cardElement?: { content(payload: unknown): Promise<unknown> };
     card?: { settings(payload: unknown): Promise<unknown> };
@@ -97,7 +107,7 @@ export class LarkChannelAdapter implements ChannelAdapter {
       safety: { chatQueue: { enabled: false }, staleMessageWindowMs: 5 * 60_000 }
     });
     // Channel SDK 的 downloadResource 返回完整 Buffer。真实 SDK 同时公开 rawClient，
-    // 用它流式读取可在下载过程中执行 20 MB 上限，避免超大附件先占满内存。
+    // 用它流式读取可在下载过程中执行大小上限，避免超大附件先占满内存。
     if (this.channel.rawClient) this.streamingDownloader = createFeishuResourceDownloader(this.channel.rawClient, this.maxFileBytes);
   }
 
@@ -113,9 +123,18 @@ export class LarkChannelAdapter implements ChannelAdapter {
     return this.channel.disconnect();
   }
 
-  async reply(message: ChannelMessage, outbound: ChannelOutbound): Promise<void> {
+  async reply(message: ChannelMessage, outbound: ChannelOutbound, observer?: ReplyDeliveryObserver): Promise<void> {
     const input = toLarkSendInput(outbound);
+    // 发送前固定正文指纹，复用至最终确认；不受调用方在异步发送期间改写文本影响。
+    const contentFingerprint = observer && outbound.type !== "card"
+      ? replyContentFingerprint(outbound.type === "text" ? outbound.text : outbound.markdown) : undefined;
+    await observer?.({ type: "begin", mode: "message",
+      ...(outbound.type === "text" ? { textFingerprint: contentFingerprint } : {}) });
+    await observer?.({ type: "sending" });
     const sent = await this.channel.send(message.conversationId, input, replyOptions(message));
+    await observer?.({ type: "sent", messageIds: [sent.messageId, ...(sent.chunkIds || [])].filter(Boolean) });
+    await observer?.({ type: "completed", contentFingerprint: contentFingerprint ?? replyContentFingerprint(
+      outbound.type === "card" ? JSON.stringify(outbound.card) : outbound.type === "text" ? outbound.text : outbound.markdown) });
     for (const id of [sent.messageId, ...(sent.chunkIds || [])]) if (id) this.onSent?.(message, id);
   }
 
@@ -125,41 +144,68 @@ export class LarkChannelAdapter implements ChannelAdapter {
 
   async streamReply(
     message: ChannelMessage,
-    producer: (update: (snapshot: string) => Promise<void>) => Promise<void>
+    producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
+    observer?: ReplyDeliveryObserver
   ): Promise<void> {
     const cardkit = this.channel.rawClient?.cardkit?.v1;
     if (cardkit?.cardElement?.content && cardkit.card?.settings && typeof this.channel.createCard === "function") {
-      await this.streamNativeCardKit(message, producer, cardkit as Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>);
+      await this.streamNativeCardKit(message, producer, cardkit as Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>, observer);
       return;
     }
+    await observer?.({ type: "begin", mode: "sdk_stream" });
+    await observer?.({ type: "sending" });
+    let streamError: unknown;
+    let streamFailed = false;
     const sent = await this.channel.stream(message.conversationId, {
-      markdown: async controller => progressivelyWriteMarkdown({
-        append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
-        setContent: controller.setContent.bind(controller)
-      }, producer, this.streaming)
+      markdown: async controller => {
+        try {
+          await progressivelyWriteMarkdown({
+            append: typeof controller.append === "function" ? controller.append.bind(controller) : undefined,
+            setContent: controller.setContent.bind(controller)
+          }, producer, this.streaming);
+        } catch (error) { streamFailed = true; streamError = error; throw error; }
+      }
     }, replyOptions(message));
+    await observer?.({ type: "sent", messageIds: sent.messageId ? [sent.messageId] : [] });
+    // SDK 0.4.1会吞掉部分流式更新/收尾错误，只返回首条messageId；此回退不能提供最终送达证明。
+    // 实验持久队列保留未核实投递；回调中已观察到的失败不得被SDK resolve抹掉。
     if (sent.messageId) this.onSent?.(message, sent.messageId);
+    if (streamFailed) throw streamError;
   }
 
   private async streamNativeCardKit(
     message: ChannelMessage,
     producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
-    cardkit: Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>
+    cardkit: Required<NonNullable<FeishuCardStreamClient["cardkit"]>["v1"]>,
+    observer?: ReplyDeliveryObserver
   ): Promise<void> {
     const elementId = "arkagent_stream_md";
+    await observer?.({ type: "begin", mode: "native_card" });
     const { cardId } = await this.channel.createCard(buildNativeStreamingCard(elementId, this.streaming));
+    await observer?.({ type: "card_created", cardId, elementId });
+    await observer?.({ type: "sending" });
     const sent = await this.channel.send(message.conversationId, { cardId }, replyOptions(message));
+    await observer?.({ type: "sent", messageIds: sent.messageId ? [sent.messageId] : [] });
     if (sent.messageId) this.onSent?.(message, sent.messageId);
     let sequence = 0;
     let content = "";
     let lastChunkChars = 0;
     const push = async (): Promise<void> => {
-      await cardkit.cardElement.content({
+      const contentFingerprint = replyContentFingerprint(content || STREAMING_PLACEHOLDER);
+      sequence++;
+      await observer?.({ type: "content_pending", sequence, contentFingerprint });
+      const response = await cardkit.cardElement.content({
         path: { card_id: cardId, element_id: elementId },
-        data: { content: content || STREAMING_PLACEHOLDER, sequence: ++sequence, uuid: `c_${cardId}_${sequence}` }
+        data: { content: content || STREAMING_PLACEHOLDER, sequence, uuid: `c_${cardId}_${sequence}` }
       });
+      assertCardKitSuccess(response, "content");
+      await observer?.({ type: "content_confirmed", sequence, contentFingerprint });
     };
 
+    let streamError: unknown;
+    let streamFailed = false;
+    let failureNoticeWritten = false;
+    let finalized = false;
     try {
       await progressivelyWriteMarkdown({
         append: async chunk => {
@@ -172,32 +218,62 @@ export class LarkChannelAdapter implements ChannelAdapter {
           lastChunkChars = Array.from(value).length;
           await push();
         }
-      }, producer, this.streaming);
-    } finally {
+      }, producer, this.streaming, () => { failureNoticeWritten = true; });
+    } catch (error) { streamFailed = true; streamError = error; }
+    try {
       if (lastChunkChars) {
         const settleMs = Math.ceil(lastChunkChars / this.streaming.printStep) * this.streaming.printFrequencyMs
           + this.streaming.settlePaddingMs;
         await wait(settleMs);
       }
-      await cardkit.card.settings({
+      sequence++;
+      await observer?.({ type: "finalizing", sequence });
+      const response = await cardkit.card.settings({
         path: { card_id: cardId },
         data: {
           settings: JSON.stringify({ config: {
             streaming_mode: false,
             summary: { content: summarizeCard(content) }
           } }),
-          sequence: ++sequence,
+          sequence,
           uuid: `s_${cardId}_${sequence}`
         }
       });
+      assertCardKitSuccess(response, "settings");
+      await observer?.({ type: "finalized", sequence });
+      finalized = true;
+    } catch (error) {
+      if (!streamFailed) throw error;
+      console.warn("流式卡片关闭未确认，保留原始执行失败");
     }
+    if (streamFailed) {
+      // 只有已知消息、失败正文及关闭回执均确认后，才允许上层省略重复失败文本。
+      // 这不是业务成功回执；SDK回退只更新本地缓冲，不能使用同一证明。
+      throw failureNoticeWritten && finalized && validReplyMessageIds([sent.messageId])
+        ? withDeliveredFailureNotice(streamError) : streamError;
+    }
+    // producer、正文更新或关闭流式任一失败，均不能到达最终送达确认。
+    await observer?.({ type: "completed", contentFingerprint: replyContentFingerprint(content || STREAMING_PLACEHOLDER) });
   }
 
-  addReaction(message: ChannelMessage, emojiType: string): Promise<string> {
+  async addReaction(message: ChannelMessage, emojiType: string): Promise<string> {
+    const api = this.channel.rawClient?.im.v1?.messageReaction;
+    if (api?.create) {
+      const response = await api.create({ path: { message_id: message.messageId }, data: { reaction_type: { emoji_type: emojiType } } });
+      assertReactionSuccess(response);
+      const id = response.data?.reaction_id;
+      if (typeof id !== "string" || !id.trim() || id.length > 1024) throw new Error("飞书表情响应缺少有效ID");
+      return id;
+    }
     return this.channel.addReaction(message.messageId, emojiType);
   }
 
-  removeReaction(message: ChannelMessage, reactionId: string): Promise<void> {
+  async removeReaction(message: ChannelMessage, reactionId: string): Promise<void> {
+    const api = this.channel.rawClient?.im.v1?.messageReaction;
+    if (api?.delete) {
+      assertReactionSuccess(await api.delete({ path: { message_id: message.messageId, reaction_id: reactionId } }));
+      return;
+    }
     return this.channel.removeReaction(message.messageId, reactionId);
   }
 
@@ -207,13 +283,40 @@ export class LarkChannelAdapter implements ChannelAdapter {
     return loadLarkRecentHistory(client, message);
   }
 
+  async readMessage(message: ChannelMessage, messageId: string, signal: AbortSignal): Promise<ChannelMessageLookup> {
+    const client = this.channel.rawClient;
+    if (!client) return { status: "unavailable" };
+    return readLarkMessage(client, message, messageId, signal);
+  }
+
+  async inspectReaction(message: ChannelMessage, query: ReactionQuery, signal: AbortSignal): Promise<ReactionObservation> {
+    if (!this.channel.rawClient) return { status: "unknown" };
+    return inspectLarkReaction(this.channel.rawClient, this.installationId, message, query, signal);
+  }
+
+  async inspectReply(message: ChannelMessage, query: ReplyInspectionQuery, signal: AbortSignal): Promise<ReplyObservation> {
+    if (!this.channel.rawClient) return { status: "unknown", reason: "unsupported" };
+    return inspectLarkReply(this.channel.rawClient, this.installationId, message, query, signal);
+  }
+
   async download(resource: ChannelResource, message: ChannelMessage, remainingBytes = this.maxFileBytes): Promise<{ bytes: Uint8Array; mimeType: string }> {
     if (this.streamingDownloader) return this.streamingDownloader(resource, message, remainingBytes);
     const bytes = await this.channel.downloadResource(message.messageId, resource.id, resource.type);
     const limit = Math.min(this.maxFileBytes, remainingBytes);
-    if (bytes.byteLength > limit) throw new Error(`文件 ${resource.name} 超过 ${formatBytes(limit)} 限制`);
+    if (bytes.byteLength > limit) throw attachmentSizeError(bytes.byteLength, this.maxFileBytes, remainingBytes);
     return { bytes: new Uint8Array(bytes), mimeType: resource.mimeType || inferMimeType(resource.name, resource.type) };
   }
+}
+
+function assertReactionSuccess(response: { code?: number } | undefined): void {
+  // Channel SDK的删除封装返回void且不检查业务码，不能直接作为恢复清理的确认。
+  if (response?.code !== 0) throw new Error(`飞书表情操作未确认成功（${typeof response?.code === "number" ? response.code : "invalid_response"}）`);
+}
+
+function assertCardKitSuccess(response: unknown, operation: "content" | "settings"): void {
+  const code = response && typeof response === "object" ? (response as { code?: unknown }).code : undefined;
+  // 原生SDK返回业务信封，HTTP 200并不保证更新成功；错误正文可能含敏感内容。
+  if (code !== 0) throw new Error(`飞书CardKit ${operation} 未确认成功（${typeof code === "number" && Number.isFinite(code) ? code : "invalid_response"}）`);
 }
 
 function buildNativeStreamingCard(elementId: string, options: Required<StreamingOptions>): object {
@@ -239,13 +342,15 @@ function summarizeCard(content: string): string {
 async function progressivelyWriteMarkdown(
   writer: { append?: (value: string) => Promise<void>; setContent: (value: string) => Promise<void> },
   producer: (update: (snapshot: string) => Promise<void>) => Promise<void>,
-  options: Required<StreamingOptions>
+  options: Required<StreamingOptions>,
+  onFailureNoticeWritten?: () => void
 ): Promise<void> {
   let target = "";
   let rendered = "";
   let producerFinished = false;
 
   let writerError: unknown;
+  let writerFailed = false;
   const writerTask = (async () => {
     while (!producerFinished || rendered !== target) {
       if (rendered === target) {
@@ -259,22 +364,33 @@ async function progressivelyWriteMarkdown(
       rendered = next;
       if (rendered !== target) await wait(options.intervalMs);
     }
-  })().catch(error => { writerError = error; });
+  })().catch(error => { writerFailed = true; writerError = error; });
 
   let producerError: unknown;
+  let producerFailed = false;
   try {
     await producer(async snapshot => {
       if (snapshot && snapshot !== target) target = snapshot;
     });
   } catch (error) {
+    producerFailed = true;
     producerError = error;
   } finally {
     producerFinished = true;
   }
 
   await writerTask;
-  if (writerError) throw writerError;
-  if (producerError) throw producerError;
+  if (producerFailed) {
+    // 使用同一卡片替换占位/过程正文；更新失败不重发新卡片，也不吞掉原始失败。
+    try {
+      await writer.setContent(streamFailureText(producerError));
+      onFailureNoticeWritten?.();
+    }
+    catch { console.warn("流式失败状态更新未确认，保留原始失败供网关处理"); }
+    throw producerError;
+  }
+  // 仅投递失败时保留原正文和指纹，供只读核验；不能覆盖可能已成功送达的结果。
+  if (writerFailed) throw writerError;
 }
 
 function nextProgressiveSnapshot(current: string, target: string, options: Required<StreamingOptions>): string {
@@ -330,6 +446,32 @@ export function normalizeLarkChannelMessage(message: NormalizedMessage, installa
       })),
     mentionedBot: message.mentionedBot
   };
+}
+
+export async function readLarkMessage(
+  client: Pick<FeishuCardStreamClient, "im">,
+  message: ChannelMessage,
+  messageId: string,
+  signal: AbortSignal
+): Promise<ChannelMessageLookup> {
+  const get = client.im.message?.get;
+  if (!get) return { status: "unavailable" };
+  if (signal.aborted) return { status: "timeout" };
+  try {
+    // node-sdk 的单次调用不暴露 AbortSignal；Gateway 限制等待时间，底层受 HTTP 超时约束。
+    const response = await get.call(client.im.message, { path: { message_id: messageId }, params: { user_id_type: "open_id", with_sender_name: true } });
+    if (signal.aborted) return { status: "timeout" };
+    if (response.code !== 0) return { status: "unavailable" };
+    const item = response.data?.items?.find(item => item.message_id === messageId);
+    if (!item) return { status: "not_found" };
+    if (item.chat_id !== message.conversationId || (item.thread_id && item.thread_id !== message.threadId)) return { status: "unavailable" };
+    if (!isEligibleHistoryItem(item, message)) return { status: "unavailable" };
+    if (item.deleted) return { status: "deleted" };
+    const normalized = normalizeHistoryItem(item, item.thread_id ? "thread" : "chat");
+    return normalized ? { status: "available", message: normalized } : { status: "unavailable" };
+  } catch {
+    return { status: signal.aborted ? "timeout" : "failed" };
+  }
 }
 
 export async function loadLarkRecentHistory(
@@ -501,8 +643,4 @@ function inferMimeType(name: string, type: "file" | "image"): string {
   if (/\.(?:md|markdown)$/i.test(name)) return "text/markdown";
   if (/\.txt$/i.test(name)) return "text/plain";
   return "application/octet-stream";
-}
-
-function formatBytes(value: number): string {
-  return value >= 1024 * 1024 ? `${Math.round(value / 1024 / 1024)} MB` : `${Math.round(value / 1024)} KB`;
 }

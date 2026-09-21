@@ -1,0 +1,941 @@
+{
+  "date": "2026-09-17",
+  "baselineCommit": "cba2654",
+  "packageVersion": "0.2.9",
+  "status": "local_increment_complete",
+  "scope": "实验durableQueue的准备计划冻结及原任务恢复；默认CLI仍关闭，不部署开发机，不发布",
+  "officialContract": {
+    "url": "https://docs.volcengine.com/docs/82379/2555932?lang=zh",
+    "updated": "2026-09-11",
+    "verified": "创建Session可包含Environment覆写、Vault、初始资源；创建本身不是业务完成。新恢复不引入新API或假设POST可幂等重试。"
+  },
+  "local": {
+    "checks": [
+      "npm test: 1220/1220, 0 failed/cancelled/skipped",
+      "npm run check（仅语法检查）",
+      "npm run build",
+      "git diff --check"
+    ],
+    "suite": {
+      "tests": 1220,
+      "passed": 1220,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "durationMs": 10947.635083,
+      "addedSinceBaseline": 95
+    },
+    "processCases": [
+      "context完成后真实exit77，恢复旧历史和引用",
+      "upload远端成功但回执前退出，GET文件列表+详情后复用原File ID",
+      "download中断、download有Hash但尚无upload意图，均暂停不重取",
+      "9个历史文件挂完2个后退出，恢复保持原入选8个和40MiB预算",
+      "180KB当前TXT及120KB待恢复原文，后者仍pending",
+      "已创建Session的mapping删除或替换，在上传/挂载前拒绝",
+      "领取后新授权暂停，在模型POST前拒绝",
+      "已完成hook输出复用；pending、无revision的未执行hook、callbacks变化均暂停",
+      "创建确认与计划完成之间退出，仍复用原Session与当前PDF"
+    ],
+    "externalTransport": "Mock；真实Node子进程退出、SQLite重开和ArkClient HTTP行为，不冒充真实飞书"
+  },
+  "performance": {
+    "defaultConcurrent": {
+      "externalServices": "mock",
+      "warmup": 5,
+      "samples": 200,
+      "alternatingOrder": true,
+      "scenarios": {
+        "plain": "普通文本",
+        "files": "已有Session追加两份4.5MiB数据，不是PDF解析验收"
+      },
+      "groups": [
+        {
+          "label": "before",
+          "calls": {
+            "download": 410,
+            "upload": 410,
+            "mount": 410,
+            "inspect": 0,
+            "run": 410
+          },
+          "samples": {
+            "plain": {
+              "p50Ms": 0.2534999999999741,
+              "p95Ms": 0.47808299999999804
+            },
+            "files": {
+              "p50Ms": 6.002875000000131,
+              "p95Ms": 7.369000000000142
+            }
+          }
+        },
+        {
+          "label": "after",
+          "calls": {
+            "download": 410,
+            "upload": 410,
+            "mount": 410,
+            "inspect": 0,
+            "run": 410
+          },
+          "samples": {
+            "plain": {
+              "p50Ms": 0.25062500000001364,
+              "p95Ms": 0.44516699999999787
+            },
+            "files": {
+              "p50Ms": 6.000625000000127,
+              "p95Ms": 7.023415999999997
+            }
+          }
+        }
+      ]
+    },
+    "defaultIsolated": {
+      "externalServices": "mock",
+      "warmup": 5,
+      "samples": 200,
+      "alternatingOrder": true,
+      "scenarios": {
+        "plain": "普通文本",
+        "files": "已有Session追加两份4.5MiB数据，不是PDF解析验收"
+      },
+      "groups": [
+        {
+          "label": "before",
+          "calls": {
+            "download": 410,
+            "upload": 410,
+            "mount": 410,
+            "inspect": 0,
+            "run": 410
+          },
+          "samples": {
+            "plain": {
+              "p50Ms": 0.24729200000001583,
+              "p95Ms": 0.4286669999999617
+            },
+            "files": {
+              "p50Ms": 6.2387079999998605,
+              "p95Ms": 7.675375000000031
+            }
+          }
+        },
+        {
+          "label": "after",
+          "calls": {
+            "download": 410,
+            "upload": 410,
+            "mount": 410,
+            "inspect": 0,
+            "run": 410
+          },
+          "samples": {
+            "plain": {
+              "p50Ms": 0.24916699999999992,
+              "p95Ms": 0.4372499999999775
+            },
+            "files": {
+              "p50Ms": 6.246999999999844,
+              "p95Ms": 8.797374999999874
+            }
+          }
+        }
+      ]
+    },
+    "profile": {
+      "samples": 128,
+      "warmup": 16,
+      "balancedOrder": true,
+      "notes": [
+        "均衡每个变体在每个执行位置的样本数",
+        "终点为成功终态落盘，不以reply回调代替完成",
+        "Store嵌套调用不重复计时，适配层耗时扣除Store时间",
+        "同步Store计时含其方法内的加密/序列化，不等于纯磁盘耗时",
+        "统计受计时插桩开销影响，不是用户端时延"
+      ],
+      "comparisons": [
+        {
+          "durableQueue": false,
+          "scenario": "short",
+          "pairedDelta": {
+            "toTerminalMs": {
+              "count": 128,
+              "minMs": -0.7227919999999131,
+              "p50Ms": -0.014541000000235726,
+              "p95Ms": 0.3059170000001359,
+              "maxMs": 0.5822920000000522,
+              "meanMs": -0.025431359374995743
+            },
+            "storeMs": {
+              "count": 128,
+              "minMs": -0.77737500000012,
+              "p50Ms": -0.007167000000208645,
+              "p95Ms": 0.30662100000017745,
+              "maxMs": 0.5722059999999374,
+              "meanMs": -0.023705343750027197
+            },
+            "replyExclusiveMs": {
+              "count": 128,
+              "minMs": -0.004042000000026746,
+              "p50Ms": -0.00024999999982355803,
+              "p95Ms": 0.0013760000001639128,
+              "maxMs": 0.0030419999999367064,
+              "meanMs": -0.000234289062500892
+            },
+            "otherBeforeTerminalMs": {
+              "count": 128,
+              "minMs": -0.08078999999986536,
+              "p50Ms": -0.00466799999981049,
+              "p95Ms": 0.030878999999572443,
+              "maxMs": 0.05583399999989069,
+              "meanMs": -0.0014917265624676546
+            },
+            "afterTerminalMs": {
+              "count": 128,
+              "minMs": -0.2593749999998636,
+              "p50Ms": -9.999996564147295e-7,
+              "p95Ms": 0.009876000000076601,
+              "maxMs": 0.05558300000006966,
+              "meanMs": -0.0022434531250059564
+            },
+            "totalMs": {
+              "count": 128,
+              "minMs": -0.7093340000000126,
+              "p50Ms": -0.0107500000001437,
+              "p95Ms": 0.30733299999997143,
+              "maxMs": 0.5762089999999489,
+              "meanMs": -0.0276748125000017
+            }
+          }
+        },
+        {
+          "durableQueue": false,
+          "scenario": "long",
+          "pairedDelta": {
+            "toTerminalMs": {
+              "count": 128,
+              "minMs": -0.42041699999981574,
+              "p50Ms": -0.0045419999996738625,
+              "p95Ms": 0.18458400000008623,
+              "maxMs": 2.754208999999719,
+              "meanMs": 0.035747765624995154
+            },
+            "storeMs": {
+              "count": 128,
+              "minMs": -0.3998739999992722,
+              "p50Ms": 0.0003739999997378618,
+              "p95Ms": 0.10171099999888611,
+              "maxMs": 2.5834190000005037,
+              "meanMs": 0.036446546874989494
+            },
+            "replyExclusiveMs": {
+              "count": 128,
+              "minMs": -0.0031260000000656873,
+              "p50Ms": -0.00016700000014679972,
+              "p95Ms": 0.0011660000000119908,
+              "maxMs": 0.023791999999957625,
+              "meanMs": -0.00006926562499742772
+            },
+            "otherBeforeTerminalMs": {
+              "count": 128,
+              "minMs": -0.2555039999992914,
+              "p50Ms": -0.002417000001969427,
+              "p95Ms": 0.056837999999970634,
+              "maxMs": 0.16999799999894094,
+              "meanMs": -0.0006295156249969125
+            },
+            "afterTerminalMs": {
+              "count": 128,
+              "minMs": -0.028334000000086235,
+              "p50Ms": 0.00004100000001017179,
+              "p95Ms": 1.53841599999987,
+              "maxMs": 1.8516660000004777,
+              "meanMs": 0.19642449218750535
+            },
+            "totalMs": {
+              "count": 128,
+              "minMs": -0.42337499999985084,
+              "p50Ms": -0.0024589999998170242,
+              "p95Ms": 1.6134170000000267,
+              "maxMs": 2.7595839999999043,
+              "meanMs": 0.2321722578125005
+            }
+          }
+        },
+        {
+          "durableQueue": true,
+          "scenario": "short",
+          "pairedDelta": {
+            "toTerminalMs": {
+              "count": 128,
+              "minMs": -0.9953749999999673,
+              "p50Ms": 1.334999999999809,
+              "p95Ms": 1.6712920000002214,
+              "maxMs": 2.2213330000000724,
+              "meanMs": 1.2696949218750095
+            },
+            "storeMs": {
+              "count": 128,
+              "minMs": -1.0111289999999826,
+              "p50Ms": 1.2900839999995242,
+              "p95Ms": 1.602998999999727,
+              "maxMs": 2.1392929999998387,
+              "meanMs": 1.2236342734375247
+            },
+            "replyExclusiveMs": {
+              "count": 128,
+              "minMs": -0.025416000000063832,
+              "p50Ms": -0.00003999999989900971,
+              "p95Ms": 0.003458999999907064,
+              "maxMs": 0.01849800000002233,
+              "meanMs": -0.000021273437508462223
+            },
+            "otherBeforeTerminalMs": {
+              "count": 128,
+              "minMs": -0.00783000000001266,
+              "p50Ms": 0.04412600000011935,
+              "p95Ms": 0.08032999999943513,
+              "maxMs": 0.1322069999996529,
+              "meanMs": 0.04608192187499327
+            },
+            "afterTerminalMs": {
+              "count": 128,
+              "minMs": -4.817709000000036,
+              "p50Ms": 0.0023759999999128922,
+              "p95Ms": 0.052458000000115135,
+              "maxMs": 4.7817499999998745,
+              "meanMs": -0.004480046875008803
+            },
+            "totalMs": {
+              "count": 128,
+              "minMs": -3.2306659999999283,
+              "p50Ms": 1.334666999999854,
+              "p95Ms": 1.9844590000000153,
+              "maxMs": 6.344458999999915,
+              "meanMs": 1.2652148750000007
+            }
+          }
+        },
+        {
+          "durableQueue": true,
+          "scenario": "long",
+          "pairedDelta": {
+            "toTerminalMs": {
+              "count": 128,
+              "minMs": -5.219125000000531,
+              "p50Ms": 1.2949169999997139,
+              "p95Ms": 1.8015000000000327,
+              "maxMs": 5.011833000000024,
+              "meanMs": 1.3102553828125014
+            },
+            "storeMs": {
+              "count": 128,
+              "minMs": -5.057042999997975,
+              "p50Ms": 1.2439229999995405,
+              "p95Ms": 1.740876999998818,
+              "maxMs": 5.093249000000014,
+              "meanMs": 1.2723444843749352
+            },
+            "replyExclusiveMs": {
+              "count": 128,
+              "minMs": -0.21454099999982645,
+              "p50Ms": -0.0001680000002579618,
+              "p95Ms": 0.00762599999984559,
+              "maxMs": 0.3219180000005508,
+              "meanMs": -0.007460921874969273
+            },
+            "otherBeforeTerminalMs": {
+              "count": 128,
+              "minMs": -0.04262500000072578,
+              "p50Ms": 0.04320899999947869,
+              "p95Ms": 0.08412900000121226,
+              "maxMs": 0.17675300000018979,
+              "meanMs": 0.045371820312535505
+            },
+            "afterTerminalMs": {
+              "count": 128,
+              "minMs": -0.05233300000008967,
+              "p50Ms": 0.00474999999960346,
+              "p95Ms": 1.759375000000091,
+              "maxMs": 2.4661670000000413,
+              "meanMs": 0.22873478124996183
+            },
+            "totalMs": {
+              "count": 128,
+              "minMs": -5.233583000000181,
+              "p50Ms": 1.3412500000004002,
+              "p95Ms": 3.133208000000195,
+              "maxMs": 6.132333999999901,
+              "meanMs": 1.5389901640624633
+            }
+          }
+        }
+      ],
+      "groups": [
+        {
+          "label": "before",
+          "durableQueue": false,
+          "calls": {
+            "create": 1,
+            "run": 288,
+            "send": 288,
+            "inspect": 0,
+            "observer": 0
+          },
+          "scenarios": {
+            "short": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.42116699999996854,
+                  "p50Ms": 0.7529170000000249,
+                  "p95Ms": 1.2479999999999336,
+                  "maxMs": 2.0197919999999385,
+                  "meanMs": 0.7688219843749993
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 0.3550829999999223,
+                  "p50Ms": 0.6798750000007203,
+                  "p95Ms": 1.155336000000034,
+                  "maxMs": 1.9122090000000753,
+                  "meanMs": 0.6815641718749728
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.0017920000000231084,
+                  "p50Ms": 0.0033330000001114968,
+                  "p95Ms": 0.005249999999932697,
+                  "maxMs": 0.006957999999940512,
+                  "meanMs": 0.003404250000002662
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.05370700000037232,
+                  "p50Ms": 0.08071100000006481,
+                  "p95Ms": 0.11054199999989578,
+                  "maxMs": 0.16383200000007037,
+                  "meanMs": 0.08385356250002385
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.019832999999948697,
+                  "p50Ms": 0.025374999999939973,
+                  "p95Ms": 0.0371660000000702,
+                  "maxMs": 0.2946669999998903,
+                  "meanMs": 0.029038414062491746
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 0.44183399999997164,
+                  "p50Ms": 0.7799579999999651,
+                  "p95Ms": 1.2748329999999441,
+                  "maxMs": 2.0445419999999785,
+                  "meanMs": 0.797860398437491
+                }
+              }
+            },
+            "long": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.6143750000001091,
+                  "p50Ms": 0.7250410000001466,
+                  "p95Ms": 0.9477500000002692,
+                  "maxMs": 4.578458999999839,
+                  "meanMs": 0.7866666249999987
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 0.3715440000005401,
+                  "p50Ms": 0.4379149999999754,
+                  "p95Ms": 0.5895439999994778,
+                  "maxMs": 4.257458000000042,
+                  "meanMs": 0.4975095390625057
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.00179100000013932,
+                  "p50Ms": 0.003624999999829015,
+                  "p95Ms": 0.005707999999685853,
+                  "maxMs": 0.006667000000106782,
+                  "meanMs": 0.003696234375009766
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.24087299999951028,
+                  "p50Ms": 0.28079000000070664,
+                  "p95Ms": 0.3236669999996593,
+                  "maxMs": 0.5398350000000391,
+                  "meanMs": 0.28546085156248324
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.020500000000083674,
+                  "p50Ms": 0.026917000000139524,
+                  "p95Ms": 0.03654099999994287,
+                  "maxMs": 0.0625,
+                  "meanMs": 0.028309554687510285
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 0.6373340000000098,
+                  "p50Ms": 0.7519999999999527,
+                  "p95Ms": 0.9848329999999805,
+                  "maxMs": 4.63858399999981,
+                  "meanMs": 0.814976179687509
+                }
+              }
+            }
+          }
+        },
+        {
+          "label": "before",
+          "durableQueue": true,
+          "calls": {
+            "create": 1,
+            "run": 288,
+            "send": 288,
+            "inspect": 0,
+            "observer": 288
+          },
+          "scenarios": {
+            "short": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 1.6553749999998217,
+                  "p50Ms": 1.845167000000174,
+                  "p95Ms": 3.1356250000000045,
+                  "maxMs": 4.660541999999964,
+                  "meanMs": 1.9771897890624999
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 1.561748000000307,
+                  "p50Ms": 1.7266250000004675,
+                  "p95Ms": 3.001792000000023,
+                  "maxMs": 4.4834180000001425,
+                  "meanMs": 1.8623737968749747
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.007831999999552863,
+                  "p50Ms": 0.010958000000073298,
+                  "p95Ms": 0.013707999999951426,
+                  "maxMs": 0.03708399999993617,
+                  "meanMs": 0.011446367187502915
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.07924699999966833,
+                  "p50Ms": 0.10057999999958156,
+                  "p95Ms": 0.12916700000050696,
+                  "maxMs": 0.2168300000000727,
+                  "meanMs": 0.10336962500002222
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.06024999999999636,
+                  "p50Ms": 0.0730829999999969,
+                  "p95Ms": 0.13679100000013023,
+                  "maxMs": 4.903209000000061,
+                  "meanMs": 0.2877912812499943
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 1.715624999999818,
+                  "p50Ms": 1.9187910000000556,
+                  "p95Ms": 4.244542000000024,
+                  "maxMs": 6.915624999999977,
+                  "meanMs": 2.264981070312494
+                }
+              }
+            },
+            "long": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 2.3248329999996713,
+                  "p50Ms": 2.6749589999999444,
+                  "p95Ms": 3.4942909999999756,
+                  "maxMs": 8.979500000000371,
+                  "meanMs": 2.8547048124999996
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 2.0104169999995065,
+                  "p50Ms": 2.3105839999993805,
+                  "p95Ms": 3.036374000001615,
+                  "maxMs": 8.40691699999752,
+                  "meanMs": 2.4726775546874933
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.05270799999971132,
+                  "p50Ms": 0.05741800000009789,
+                  "p95Ms": 0.1799180000002707,
+                  "maxMs": 0.2763759999998001,
+                  "meanMs": 0.07235182812497776
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.26170800000045347,
+                  "p50Ms": 0.3002509999992071,
+                  "p95Ms": 0.36895800000274903,
+                  "maxMs": 0.4607549999986986,
+                  "meanMs": 0.3096754296875286
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.05666700000028868,
+                  "p50Ms": 0.07637500000009823,
+                  "p95Ms": 0.1101659999999356,
+                  "maxMs": 0.2569160000002739,
+                  "meanMs": 0.0803700859375045
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 2.38149999999996,
+                  "p50Ms": 2.7489160000000084,
+                  "p95Ms": 3.631666000000223,
+                  "maxMs": 9.072458000000097,
+                  "meanMs": 2.935074898437504
+                }
+              }
+            }
+          }
+        },
+        {
+          "label": "after",
+          "durableQueue": false,
+          "calls": {
+            "create": 1,
+            "run": 288,
+            "send": 288,
+            "inspect": 0,
+            "observer": 0
+          },
+          "scenarios": {
+            "short": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.40370899999993526,
+                  "p50Ms": 0.7668340000000171,
+                  "p95Ms": 1.1985830000000988,
+                  "maxMs": 1.3956249999998818,
+                  "meanMs": 0.7433906250000035
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 0.3480409999999665,
+                  "p50Ms": 0.6854570000001559,
+                  "p95Ms": 1.0826220000001285,
+                  "maxMs": 1.294832000000497,
+                  "meanMs": 0.6578588281249456
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.0019159999999374122,
+                  "p50Ms": 0.0029170000000249274,
+                  "p95Ms": 0.004709000000048036,
+                  "maxMs": 0.006334000000038031,
+                  "meanMs": 0.00316996093750177
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.05375200000003133,
+                  "p50Ms": 0.07987800000023526,
+                  "p95Ms": 0.10649800000078358,
+                  "maxMs": 0.15583200000003217,
+                  "meanMs": 0.0823618359375562
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.020208999999908883,
+                  "p50Ms": 0.025083000000222455,
+                  "p95Ms": 0.03491699999995035,
+                  "maxMs": 0.07929199999989578,
+                  "meanMs": 0.02679496093748579
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 0.4279999999998836,
+                  "p50Ms": 0.7919590000000198,
+                  "p95Ms": 1.225999999999999,
+                  "maxMs": 1.419499999999971,
+                  "meanMs": 0.7701855859374893
+                }
+              }
+            },
+            "long": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.6239579999996749,
+                  "p50Ms": 0.7151669999998376,
+                  "p95Ms": 1.071875000000091,
+                  "maxMs": 5.4907499999999345,
+                  "meanMs": 0.8224143906249939
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 0.368334000001596,
+                  "p50Ms": 0.43437300000050527,
+                  "p95Ms": 0.7539589999996679,
+                  "maxMs": 5.078584999999748,
+                  "meanMs": 0.5339560859374952
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.002040999999962878,
+                  "p50Ms": 0.0032919999998739513,
+                  "p95Ms": 0.005083000000013271,
+                  "maxMs": 0.02729200000021592,
+                  "meanMs": 0.003626968750012338
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.24524799999880997,
+                  "p50Ms": 0.27650299999959316,
+                  "p95Ms": 0.3393770000020595,
+                  "maxMs": 0.4401269999998476,
+                  "meanMs": 0.28483133593748633
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.021083999999973457,
+                  "p50Ms": 0.02729200000021592,
+                  "p95Ms": 1.559291999999914,
+                  "maxMs": 1.8846660000003794,
+                  "meanMs": 0.22473404687501564
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 0.6455409999998665,
+                  "p50Ms": 0.7475829999998496,
+                  "p95Ms": 2.370915999999852,
+                  "maxMs": 5.559541000000081,
+                  "meanMs": 1.0471484375000095
+                }
+              }
+            }
+          }
+        },
+        {
+          "label": "after",
+          "durableQueue": true,
+          "calls": {
+            "create": 1,
+            "run": 288,
+            "send": 288,
+            "inspect": 0,
+            "observer": 288
+          },
+          "scenarios": {
+            "short": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 2.8712920000000395,
+                  "p50Ms": 3.193540999999982,
+                  "p95Ms": 3.6651669999999967,
+                  "maxMs": 5.633125000000064,
+                  "meanMs": 3.2468847109375094
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 2.7427050000005693,
+                  "p50Ms": 3.0310840000006465,
+                  "p95Ms": 3.4602930000000924,
+                  "maxMs": 5.43779399999994,
+                  "meanMs": 3.0860080703124995
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.008165999999846463,
+                  "p50Ms": 0.01116799999988416,
+                  "p95Ms": 0.01445899999998801,
+                  "maxMs": 0.028958000000102402,
+                  "meanMs": 0.011425093749994453
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.12042099999962375,
+                  "p50Ms": 0.1442909999998392,
+                  "p95Ms": 0.18024800000000596,
+                  "maxMs": 0.26858299999958035,
+                  "meanMs": 0.1494515468750155
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.06099999999992178,
+                  "p50Ms": 0.07633399999986068,
+                  "p95Ms": 0.14525000000003274,
+                  "maxMs": 4.850541999999905,
+                  "meanMs": 0.2833112343749855
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 2.936042000000043,
+                  "p50Ms": 3.2770000000000437,
+                  "p95Ms": 4.127041999999847,
+                  "maxMs": 8.26016699999991,
+                  "meanMs": 3.530195945312495
+                }
+              }
+            },
+            "long": {
+              "metrics": {
+                "toTerminalMs": {
+                  "count": 128,
+                  "minMs": 3.679417000000285,
+                  "p50Ms": 3.919042000000445,
+                  "p95Ms": 5.1555419999999685,
+                  "maxMs": 9.06291599999986,
+                  "meanMs": 4.164960195312501
+                },
+                "storeMs": {
+                  "count": 128,
+                  "minMs": 3.2865840000004027,
+                  "p50Ms": 3.508205000000089,
+                  "p95Ms": 4.685085999999501,
+                  "maxMs": 8.587248000000727,
+                  "meanMs": 3.7450220390624285
+                },
+                "replyExclusiveMs": {
+                  "count": 128,
+                  "minMs": 0.05262400000083289,
+                  "p50Ms": 0.05754200000046694,
+                  "p95Ms": 0.06633199999987482,
+                  "maxMs": 0.38783300000068266,
+                  "meanMs": 0.06489090625000848
+                },
+                "otherBeforeTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.315209999999297,
+                  "p50Ms": 0.3454170000004524,
+                  "p95Ms": 0.4250020000004042,
+                  "maxMs": 0.49816600000076505,
+                  "meanMs": 0.3550472500000641
+                },
+                "afterTerminalMs": {
+                  "count": 128,
+                  "minMs": 0.06074999999964348,
+                  "p50Ms": 0.07954100000006292,
+                  "p95Ms": 1.8360830000001442,
+                  "maxMs": 2.7230830000003152,
+                  "meanMs": 0.3091048671874663
+                },
+                "totalMs": {
+                  "count": 128,
+                  "minMs": 3.7486250000001746,
+                  "p50Ms": 4.067708000000039,
+                  "p95Ms": 5.9373749999999745,
+                  "maxMs": 9.764000000000124,
+                  "meanMs": 4.474065062499967
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "interpretation": [
+      "defaultConcurrent与全量测试并行，受并行负载干扰；保留结果，不择优删除",
+      "defaultIsolated普通文本P95约0.429→0.437ms；双4.5MiB文件7.675→8.797ms，P50约6.239→6.247ms；尚未把尾部差异归因为产品代码",
+      "均衡分段128组中，durable配对终态落盘中位增量短文本1.335ms/长文本1.295ms，主要在Store方法（加密、序列化、落盘等合计）",
+      "默认/实验路径远端模拟调用数均一致，额外inspect=0；不据此宣称真实用户性能或整个目标验收通过"
+    ]
+  },
+  "liveMA": {
+    "child": {
+      "stage": "preparing_after_session_create",
+      "mode": "child",
+      "phase": "preparing",
+      "sessionId": "sesn-20260916165406-vl6sh",
+      "elapsedMs": 561,
+      "counts": {
+        "creates": 1,
+        "runs": 0,
+        "readinessChecks": 0,
+        "uploads": 0,
+        "configBuilds": 1,
+        "configHooks": 1,
+        "historyReads": 1,
+        "credentialMaintenance": 1,
+        "replies": 0,
+        "blockedOperations": 0,
+        "httpCreates": 1,
+        "httpMessages": 0,
+        "suppressedLogs": 1
+      },
+      "checks": {
+        "preparationAbsent": true,
+        "creationStepConfirmed": true,
+        "planFingerprint": "719e3813c1499965054f86e8e4737561b270196e39df66943450790582dc2e77",
+        "preparedFingerprint": "5c0b4e5bc901c90b38463524f4dfd82e3ce8446aa14dca53ff7259e93d24ba63"
+      },
+      "liveChannel": false
+    },
+    "parent": {
+      "stage": "passed",
+      "mode": "parent",
+      "phase": "preparing",
+      "sessionId": "sesn-20260916165406-vl6sh",
+      "elapsedMs": 9408,
+      "counts": {
+        "creates": 0,
+        "runs": 1,
+        "readinessChecks": 1,
+        "uploads": 0,
+        "configBuilds": 0,
+        "configHooks": 0,
+        "historyReads": 0,
+        "credentialMaintenance": 0,
+        "replies": 1,
+        "blockedOperations": 0,
+        "httpCreates": 0,
+        "httpMessages": 1,
+        "suppressedLogs": 1
+      },
+      "checks": {
+        "preparationAbsent": true,
+        "creationStepConfirmed": true,
+        "planFingerprint": "719e3813c1499965054f86e8e4737561b270196e39df66943450790582dc2e77",
+        "preparedFingerprint": "5c0b4e5bc901c90b38463524f4dfd82e3ce8446aa14dca53ff7259e93d24ba63",
+        "idleBeforeRecovery": true,
+        "readinessBindingMatches": true,
+        "runInputShaMatches": true,
+        "replyNonceMatches": true,
+        "eventInputShaMatches": true,
+        "eventNonceMatches": true,
+        "resultNonceMatches": true
+      },
+      "liveChannel": false,
+      "userMessages": 1,
+      "compactCommands": 0,
+      "compactEvents": 0,
+      "sessionErrors": 0,
+      "toolUses": 0,
+      "preparationCreates": 1,
+      "preparationCredentialMaintenance": 1,
+      "preparationConfigBuilds": 1,
+      "preparationConfigHooks": 1,
+      "syntheticReplyOnly": true,
+      "evidenceDir": "/var/folders/vy/49679c8s0455c5rgp0xrg1yw0000gn/T/ark-prepared-live-jKOkwE",
+      "evidenceName": "parent-evidence.json"
+    },
+    "scope": "真实MA；1个无Vault Session、仅1次nonce回显；未连接飞书、无工具操作、未部署开发机",
+    "resourceDisposition": "保留测试Session及本地加密证据以便核查；没有修改生产Agent/环境/凭证"
+  },
+  "remaining": [
+    "部分准备单聊dualIdentity授权代次证明",
+    "任意回调结果未知/无下载缓存的人工处理或明确恢复策略",
+    "CLI持久队列启用及真实飞书卡片/OAuth/排队端到端",
+    "升级网关闭环、Memory/TOS组合、客户原PDF复现、受控续办与回退演练",
+    "性能完整验收"
+  ]
+}

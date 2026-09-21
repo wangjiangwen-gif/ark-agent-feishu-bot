@@ -80,11 +80,12 @@ test("resultFromEvents preserves user authorization requirements despite MA is_e
   });
 });
 
-test("run stops streaming Agent denial text after lark-cli requests user authorization", async () => {
+for (const subtype of ["token_missing", "token_invalid"] as const) {
+test(`run stops streaming Agent denial text after lark-cli ${subtype}`, async () => {
   const snapshots: string[] = [];
   const events = [
     { type: "agent.tool_use", id: "call-one", name: "bash", input: { command: "lark-cli calendar +agenda --as user" } },
-    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_missing"}}` }] },
+    { type: "agent.tool_result", tool_use_id: "call-one", is_error: false, content: [{ type: "text", text: `exit_code: 3\n--- stdout ---\n\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"${subtype}"}}` }] },
     { type: "agent.message", content: [{ type: "text", text: "你没有凭证，请自行授权" }] },
     { type: "session.status_idle" }
   ];
@@ -99,6 +100,40 @@ test("run stops streaming Agent denial text after lark-cli requests user authori
 
   assert.deepEqual(snapshots, []);
   assert.equal(result.authorizationRequired?.domain, "calendar");
+  assert.equal(result.authorizationRequired?.subtype, subtype);
+});
+}
+
+for (const numbered of [false, true]) {
+  test(`actual user token_invalid error 99991668 is recognized (numbered=${numbered})`, () => {
+    const payload = JSON.stringify({ ok: false, identity: "user", error: {
+      type: "authentication", subtype: "token_invalid", code: 99991668,
+      message: "Invalid access token for authorization. Please make a request with token attached."
+    } }, null, 2);
+    const text = numbered ? payload.split("\n").map((line, i) => `${i + 1}\t${line}`).join("\n") : payload;
+    const event = { type: "agent.tool_result", tool_use_id: "call", is_error: false,
+      content: [{ type: "text", text: `exit_code: 3\n--- ${numbered ? "output (stdout + stderr)" : "stderr"} ---\n${text}` }] };
+    assert.deepEqual(eventUserAuthorizationRequired(event, new Map([["call", "calendar"]])), {
+      identity: "user", errorType: "authentication", subtype: "token_invalid", domain: "calendar"
+    });
+  });
+}
+
+for (const changed of [
+  { identity: "bot" }, { ok: true }, { error: { type: "authorization", subtype: "token_invalid" } },
+  { error: { type: "authorization", subtype: "scope_missing" } },
+  { error: { type: "authentication", subtype: "unknown_error" } }
+]) {
+  test(`unrelated error must not initiate OAuth: ${JSON.stringify(changed)}`, () => {
+    const payload = { ok: false, identity: "user", error: { type: "authentication", subtype: "token_invalid" }, ...changed };
+    assert.equal(eventUserAuthorizationRequired({ type: "agent.tool_result",
+      content: [{ type: "text", text: `exit_code: 3\n--- stderr ---\n${JSON.stringify(payload)}` }] }), undefined);
+  });
+}
+
+test("Agent denial text alone does not initiate OAuth", () => {
+  assert.equal(eventUserAuthorizationRequired({ type: "agent.message",
+    content: [{ type: "text", text: 'exit_code: 3\n--- stderr ---\n{"ok":false,"identity":"user","error":{"type":"authentication","subtype":"token_invalid"}}' }] }), undefined);
 });
 
 test("Ark requests configure lark-cli, Vault credential and Session binding", async () => {
@@ -151,6 +186,26 @@ test("Ark requests configure lark-cli, Vault credential and Session binding", as
     vault_ids: ["vlt-1"]
   });
   assert.equal(calls.at(-1)?.body?.environment_id, undefined);
+});
+
+test("Environment App ID conflicts are rejected before the Session request", async () => {
+  let creates = 0;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async url => {
+    if (String(url).endsWith("/sessions")) creates++;
+    return new Response(JSON.stringify({ config: { type: "cloud", env: { LARKSUITE_CLI_APP_ID: "other" } } }));
+  });
+  await assert.rejects(client.createSession("agent", "env", [], { LARKSUITE_CLI_APP_ID: "expected" }), /APP_ID/);
+  assert.equal(creates, 0);
+});
+
+test("Environment cache returns copies and supports explicit fresh reads", async () => {
+  let requests = 0;
+  const client = new ArkClient("key", "https://ark.example/api/v3", async () => {
+    requests++; return new Response(JSON.stringify({ config: { type: "cloud", env: { VALUE: String(requests) } } }));
+  });
+  const first = await client.getEnvironmentConfig("env"); first.env!.VALUE = "mutated";
+  assert.equal((await client.getEnvironmentConfig("env")).env?.VALUE, "1");
+  assert.equal((await client.getEnvironmentConfig("env", { fresh: true })).env?.VALUE, "2");
 });
 
 test("Ark createSession preserves the complete native Session request", async () => {
@@ -311,10 +366,87 @@ test("getSessionStats reports event count and latest model input tokens", async 
   const client = new ArkClient("key", "https://ark.example/api/v3", async () => new Response(JSON.stringify({ data: { items: [
     { type: "span.model_request_end", model_usage: { input_tokens: 1200 } },
     { type: "agent.message" },
-    { type: "span.model_request_end", model_usage: { input_tokens: 27611 } }
+    { id: "model-latest", type: "span.model_request_end", model_usage: { input_tokens: 27611 } }
   ] } }), { status: 200 }));
 
-  assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611 });
+  assert.deepEqual(await client.getSessionStats("session-1"), { eventCount: 3, latestInputTokens: 27611, latestTokenSampleId: "model-latest", latestEventId: "model-latest" });
+});
+
+test("session stats deduplicate events and exclude compact turns from business samples", async () => {
+  const events = [
+    { id: "user", type: "user.message", content: [{ type: "text", text: "task" }] },
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "idle", type: "session.status_idle" },
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "compact", type: "user.message", content: [{ type: "text", text: "/compact" }] },
+    { id: "compact-model", type: "span.model_request_end", model_usage: { input_tokens: 40000 } },
+    { id: "compact-idle", type: "session.status_idle" }
+  ];
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: events }));
+  assert.deepEqual(await client.getSessionStats("s"), {
+    eventCount: 3, latestInputTokens: 30000, latestTokenSampleId: "model", latestBusinessEventId: "user", latestEventId: "compact-idle", status: "idle"
+  });
+});
+
+test("zero-token error samples do not replace a successful business token sample", async () => {
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "failed-model", type: "span.model_request_end", is_error: true, model_usage: { input_tokens: 0 } },
+    { id: "running", type: "session.status_running" }
+  ] }));
+  const stats = await client.getSessionStats("s");
+  assert.equal(stats.latestTokenSampleId, "model");
+  assert.equal(stats.status, "running");
+});
+
+test("compact verification requires a new native compaction event and an idle terminal", async () => {
+  const base = [
+    { id: "old-proof", type: "agent.thread_context_compacted", session_thread_id: "main" },
+    { id: "boundary", type: "session.status_idle" },
+    { id: "command", type: "user.message", content: [{ type: "text", text: "/compact" }] }
+  ];
+  let after: Record<string, unknown>[] = [];
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [...base, ...after] }));
+  const idle = { id: "idle", type: "session.status_idle" };
+  const proof = { id: "proof", type: "agent.thread_context_compacted", session_thread_id: "main" };
+  after = [idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  after = [base[0], idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  after = [proof];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  after = [proof, idle];
+  assert.deepEqual(await client.inspectCompaction("s", "boundary"), { result: "succeeded", terminal: "idle", reason: "thread_context_compacted", evidenceEventId: "proof" });
+  after = [proof, { id: "error", type: "session.error" }, idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "failed");
+  after = [proof, { id: "child", type: "session.thread_status_running", session_thread_id: "child" }, idle];
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "unknown");
+  assert.equal((await client.inspectCompaction("s", "missing")).reason, "boundary_not_found");
+});
+
+test("compact reconciliation never consumes a subsequent business run or its error", async () => {
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [
+    { id: "boundary", type: "session.status_idle" },
+    { id: "command", type: "user.message", content: [{ type: "text", text: "/compact" }] },
+    { id: "proof", type: "agent.thread_context_compacted" },
+    { id: "idle", type: "session.status_idle" },
+    { id: "business", type: "user.message", content: [{ type: "text", text: "task" }] },
+    { id: "later-error", type: "session.error" }
+  ] }));
+  assert.equal((await client.inspectCompaction("s", "boundary")).result, "succeeded");
+  assert.equal((await client.inspectCompaction("s", "idle")).reason, "command_not_found");
+});
+
+test("session stats recognize native platform compaction without exposing its content", async () => {
+  const client = new ArkClient("key", "https://test", async () => Response.json({ data: [
+    { id: "business", type: "user.message", content: [{ type: "text", text: "task" }] },
+    { id: "model", type: "span.model_request_end", model_usage: { input_tokens: 30000 } },
+    { id: "proof", type: "agent.thread_context_compacted", session_thread_id: "main", content: "private summary" },
+    { id: "idle", type: "session.status_idle" }
+  ] }));
+  const stats = await client.getSessionStats("s");
+  assert.deepEqual(stats.latestCompaction, { eventId: "proof", eventCount: 2, tokenSampleId: "model", businessEventId: "business" });
+  assert.ok(!JSON.stringify(stats).includes("private summary"));
 });
 
 test("Ark uploads a file and mounts it in a Session", async () => {
@@ -386,6 +518,6 @@ test("event history follows native next_page and detects the newest token usage"
       ? Response.json({ data: [{ id: "new", model_usage: { input_tokens: 1000 } }] })
       : Response.json({ data: [{ id: "old", model_usage: { input_tokens: 30000 } }], next_page: "second" });
   });
-  assert.deepEqual(await client.getSessionStats("s"), { eventCount: 2, latestInputTokens: 1000 });
+  assert.deepEqual(await client.getSessionStats("s"), { eventCount: 2, latestInputTokens: 1000, latestTokenSampleId: "new", latestEventId: "new" });
   assert.equal(pages.length, 2);
 });

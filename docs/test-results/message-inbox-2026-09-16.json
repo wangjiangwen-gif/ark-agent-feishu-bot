@@ -1,0 +1,39 @@
+{
+  "date": "2026-09-16",
+  "baseline_commit": "357945e",
+  "scope": "加密持久化消息接收日志与恢复分类基础，不是完整网关队列恢复",
+  "targeted": {
+    "command": "node --experimental-strip-types --test tests/message-inbox.test.ts",
+    "passed": 15,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 499.6545
+  },
+  "regression": {
+    "command": "npm test",
+    "passed": 352,
+    "failed": 0,
+    "skipped": 0,
+    "duration_ms": 2607.417875,
+    "permission": "允许WebUI回归在127.0.0.1监听临时端口"
+  },
+  "checks": ["npm run check（语法检查，不是完整TypeScript类型检查）", "npm run build", "git diff --check"],
+  "verified": [
+    "消息正文、附件标识和引用信息在数据库重开后完整恢复，磁盘不出现测试正文/文件标识明文",
+    "真实子进程写入并退出后，运行锁可接管；排队任务保留，已派发任务为uncertain",
+    "准备阶段可能已有外部副作用，失败/重启不会自动重新领取",
+    "同scope强制FIFO，活动/未知/授权等待任务阻止后续领取；不同scope独立",
+    "Channel与应用过滤，重复消息不可切换租户/用户/会话",
+    "Agent、配置指纹或scope变化时拒绝领取",
+    "状态转换限制、单次领取、成功任务不重放",
+    "元数据认证、密钥缺失拒绝生成替代密钥、损坏恢复整批回滚"
+  ],
+  "remaining": [
+    "接入Gateway接收、调度、启动与processed_events原子事务",
+    "未知执行结果查询和安全解除阻塞，不能以永久阻塞代替需求",
+    "授权恢复、控制命令、表情与输出恢复的集成",
+    "真实Gateway进程崩溃及飞书/MA端到端",
+    "A07部分写入安全续跑、文件、原生挂载、upgrade和完整性能验收"
+  ],
+  "external_actions": "未操作真实飞书/MA，未部署或发布"
+}

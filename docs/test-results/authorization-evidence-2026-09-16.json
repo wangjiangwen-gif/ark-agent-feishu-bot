@@ -1,0 +1,38 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "583aacb",
+  "scope": "授权恢复执行证据与防止原请求盲重放的增量，不代表A07或整体目标完成",
+  "commands": [
+    { "command": "node --experimental-strip-types --test tests/run-evidence.test.ts", "phase": "red", "passed": 6, "failed": 3, "reason": "MCP被忽略、独立tool_use_id未关联、历史无执行证据" },
+    { "command": "npm test", "phase": "initial full regression", "passed": 308, "failed": 1, "reason": "WebUI回环监听被普通沙箱EPERM拒绝" },
+    { "command": "npm test", "phase": "final full regression with loopback permitted", "passed": 310, "failed": 0, "skipped": 0, "durationMs": 3329.554 },
+    { "command": "npm run check", "exitCode": 0, "scope": "所有src模块语法检查，不是全量TypeScript类型检查" },
+    { "command": "npm run build", "exitCode": 0 },
+    { "command": "git diff --check", "exitCode": 0 }
+  ],
+  "newTests": 18,
+  "coverage": [
+    "只读续跑使用原事件和工具调用ID，不重发原始请求",
+    "成功写入保留资源ID但不保存命令/文件正文/凭证",
+    "缺锚点、孤立结果、缺结果、重复冲突、未知工具、多线程、截断不能证明只读",
+    "MCP和自定义工具不能被安全评估忽略",
+    "复合shell和重定向不误判只读",
+    "SSE遗漏成功写入时用本轮历史补核",
+    "历史失败保留授权需求但停止自动续跑",
+    "普通请求不新增授权专用历史查询",
+    "加密重启、Session绑定、缺密钥拒绝",
+    "缺失/写入/未知证据阻止原请求重放并保存审计",
+    "同Session恢复不重复下载附件和读取引用"
+  ],
+  "realFeishuE2E": "not_run",
+  "realMAE2E": "not_run",
+  "deployment": "not_deployed",
+  "performance": "仅验证普通请求HTTP次数不增加；未完成真实用户延迟P50/P95验收",
+  "remaining": [
+    "A07完整的部分写入安全续跑，不以阻止代替完成",
+    "MA工具执行门禁/幂等契约及实际行为验证",
+    "普通排队消息的进程退出恢复和状态查询入口",
+    "文件终态、平台扩展、真实端到端、性能及迁移回退"
+  ],
+  "contractReference": "https://pkg.go.dev/github.com/volcengine/ark-runtime-go@v0.6.0/arkruntime/model/session"
+}

@@ -1,0 +1,57 @@
+{
+  "date": "2026-09-16",
+  "baseline": "f6dc0eb",
+  "scope": "已有Session附件挂载核查及回执恢复；不是完整准备事务或外部E2E验收",
+  "contractSources": [
+    "https://docs.volcengine.com/docs/82379/2555948?lang=zh",
+    "https://docs.volcengine.com/docs/82379/2555950?lang=zh"
+  ],
+  "contract": {
+    "readVia": "通过浏览器读取官方公共文档正文及请求/响应示例",
+    "method": "GET /sessions/{sessionId}/resources",
+    "envelope": "data: object[]",
+    "maxResources": 1000,
+    "pagination": false,
+    "proof": "唯一File ID与网关实际提示的sandbox mount path；原Session/来源绑定；不根据文件名匹配",
+    "absence": "unknown，不授权另一次POST"
+  },
+  "tests": {
+    "initialRed": { "total": 13, "failed": 13, "cause": "核查方法缺失且未知挂载被再次POST" },
+    "newTests": 28,
+    "fullSuite": { "command": "npm test", "passed": 594, "failed": 0, "skipped": 0, "durationMs": 4192.077875 },
+    "gates": ["npm run check（语法，不是全量TS类型检查）", "npm run build", "git diff --check"],
+    "realProcessTests": [
+      "模拟远端挂载落地后、返回前进程exit(78)，原回执pending；重启GET确认、0重复POST",
+      "挂载成功回执落盘后、marker前进程exit(78)；重启0GET、0重复POST"
+    ],
+    "faultCoverage": [
+      "权限错误脱敏与响应体中途超时取消", "4MiB/1000条边界及调用方取消",
+      "缺字段、重复资源、路径冲突、不同File ID、非沙箱路径别名、错误/不完整信封",
+      "过期/未来/错Session证明、查询中Session切换、旧回执CAS、同源作用域隔离",
+      "核查证明事务写入失败回滚、不修改原失败或pending记录",
+      "明确InvalidParameter拒绝可复用上传File ID，未知网络错误不允许再次POST",
+      "无核查能力不伪确认；当前单聊附件与历史群附件共用恢复路径；新Session不复用旧挂载证明",
+      "SQLite挂载查询使用部分索引，无临时排序"
+    ]
+  },
+  "performance": {
+    "command": "node --experimental-strip-types scripts/benchmark-mount-recovery.mjs",
+    "externalServices": "mock",
+    "warmup": 5,
+    "samplesPerGroup": 30,
+    "alternatingOrder": true,
+    "scenario": "已有Session追加两份4.5MiB数据，真实SQLite/Hash，模拟MA及飞书传输",
+    "before": { "p50Ms": 5.657625, "p95Ms": 9.145 },
+    "after": { "p50Ms": 5.695417, "p95Ms": 7.26525 },
+    "callsPerGroup": { "download": 70, "upload": 70, "mount": 70, "inspect": 0, "run": 35 },
+    "interpretation": "未发现明显额外本地开销；样本噪声存在，不证明真实端到端性能提升"
+  },
+  "limitations": [
+    "私有Session读取授权未确认，未重试此前被拒绝请求",
+    "没有Session ID的创建结果、没有File ID的未知上传尚未恢复",
+    "不会自动重放整个业务任务，durableQueue仍默认关闭",
+    "尚未复现并关闭客户PDF提前idle，未证明模型读懂或完成业务",
+    "完整真实飞书/MA、Memory/TOS/upgrade/compact与回退验收仍未完成",
+    "未部署开发机，未发布GitHub/npm"
+  ]
+}

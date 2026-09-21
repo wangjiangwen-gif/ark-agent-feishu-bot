@@ -3,7 +3,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { NormalizedMessage } from "@larksuite/channel";
 import { Gateway } from "../src/gateway.ts";
-import { LarkChannelAdapter, normalizeLarkChannelMessage, toLarkSendInput, type LarkChannelPort } from "../src/lark-channel.ts";
+import { LarkChannelAdapter, normalizeLarkChannelMessage, readLarkMessage, toLarkSendInput, type LarkChannelPort } from "../src/lark-channel.ts";
 import { GatewayStore } from "../src/store.ts";
 
 function normalized(overrides: Partial<NormalizedMessage> = {}): NormalizedMessage {
@@ -15,6 +15,69 @@ function normalized(overrides: Partial<NormalizedMessage> = {}): NormalizedMessa
     ...overrides
   };
 }
+
+for (const phase of ["create", "delete"] as const) {
+  test(`reaction ${phase} requires native business success instead of trusting SDK void`, async () => {
+    const client = { im: { v1: { messageReaction: {
+      create: async () => ({ code: 230001, msg: "private-error", data: { reaction_id: "misleading-id" } }),
+      delete: async () => ({ code: 230001, msg: "private-error" })
+    } } } };
+    const port = { rawClient: client, addReaction: async () => "unchecked", removeReaction: async () => {} } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+    const inbound = normalizeLarkChannelMessage(normalized(), "cli");
+    await assert.rejects(phase === "create" ? adapter.addReaction(inbound, "Get") : adapter.removeReaction(inbound, "rid"), error => {
+      assert.ok(error instanceof Error); assert.equal(error.message.includes("private-error"), false); return true;
+    });
+  });
+}
+
+test("native reaction success uses exact message and receipt IDs", async () => {
+  const calls: unknown[] = [];
+  const port = { rawClient: { im: { v1: { messageReaction: {
+    create: async p => { calls.push(p); return { code: 0, data: { reaction_id: "rid" } }; },
+    delete: async p => { calls.push(p); return { code: 0 }; }
+  } } } } } as unknown as LarkChannelPort;
+  const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+  const inbound = normalizeLarkChannelMessage(normalized(), "cli");
+  await adapter.removeReaction(inbound, await adapter.addReaction(inbound, "Get"));
+  assert.deepEqual(calls, [{ path: { message_id: "om-1" }, data: { reaction_type: { emoji_type: "Get" } } }, { path: { message_id: "om-1", reaction_id: "rid" } }]);
+});
+
+for (const response of [{}, { code: 0, data: { reaction_id: "" } }]) {
+  test(`native reaction rejects incomplete creation response ${JSON.stringify(response)}`, async () => {
+    const port = { rawClient: { im: { v1: { messageReaction: { create: async () => response } } } } } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "unused", channel: port });
+    await assert.rejects(adapter.addReaction(normalizeLarkChannelMessage(normalized(), "cli"), "Get"));
+  });
+}
+
+test("direct message lookup validates the exact chat and thread before exposing content", async () => {
+  const trigger = normalizeLarkChannelMessage(normalized({ createTime: 200 }), "cli");
+  const payloads: unknown[] = [];
+  let item = { message_id: "q", chat_id: "other", thread_id: "", msg_type: "text", create_time: "100", body: { content: JSON.stringify({ text: "secret" }) } };
+  const client = { im: { message: { list: async () => ({}), get: async payload => { payloads.push(payload); return { code: 0, data: { items: [item] } }; } } } } as any;
+  assert.equal((await readLarkMessage(client, trigger, "q", new AbortController().signal)).status, "unavailable");
+  item = { ...item, chat_id: trigger.conversationId, thread_id: "other" };
+  assert.equal((await readLarkMessage(client, trigger, "q", new AbortController().signal)).status, "unavailable");
+  item = { ...item, thread_id: "" };
+  const available = await readLarkMessage(client, trigger, "q", new AbortController().signal);
+  assert.equal(available.status, "available");
+  assert.deepEqual(payloads[0], { path: { message_id: "q" }, params: { user_id_type: "open_id", with_sender_name: true } });
+});
+
+test("direct lookup distinguishes deleted, missing, unavailable and transport failure", async () => {
+  const trigger = normalizeLarkChannelMessage(normalized({ createTime: 200 }), "cli");
+  const fixtures = [
+    [{ code: 0, data: { items: [{ message_id: "q", chat_id: "oc-1", create_time: "100", deleted: true }] } }, "deleted"],
+    [{ code: 0, data: { items: [] } }, "not_found"],
+    [{ code: 123, msg: "not accessible" }, "unavailable"]
+  ] as const;
+  for (const [response, status] of fixtures) {
+    const client = { im: { message: { get: async () => response } } } as any;
+    assert.equal((await readLarkMessage(client, trigger, "q", new AbortController().signal)).status, status);
+  }
+  assert.equal((await readLarkMessage({ im: { message: { get: async () => { throw new Error("network"); } } } } as any, trigger, "q", new AbortController().signal)).status, "failed");
+});
 
 test("Channel SDK message maps to the channel-neutral contract", () => {
   const result = normalizeLarkChannelMessage(normalized({
@@ -260,7 +323,7 @@ test("Channel adapter streams snapshots and manages the Get reaction", async () 
   assert.deepEqual(reactions, ["add:om-1:Get", "remove:om-1:reaction-1"]);
 });
 
-test("Channel adapter preserves producer failures after flushing the latest snapshot", async () => {
+test("Channel adapter preserves producer failures and replaces the partial snapshot with safe failure text", async () => {
   const snapshots: string[] = [];
   const port = {
     connect: async () => undefined,
@@ -283,7 +346,8 @@ test("Channel adapter preserves producer failures after flushing the latest snap
     await update("已生成部分内容");
     throw new Error("upstream failed");
   }), /upstream failed/);
-  assert.equal(snapshots.at(-1), "已生成部分内容");
+  assert.ok(snapshots.includes("已生成部分内容"));
+  assert.match(snapshots.at(-1)!, /执行失败/);
 });
 
 test("Channel adapter progressively reveals a complete upstream snapshot", async () => {
@@ -368,8 +432,8 @@ test("Channel adapter waits for native CardKit typing before closing the stream"
     rawClient: {
       im: { messageResource: { get: async () => { throw new Error("unused"); } } },
       cardkit: { v1: {
-        cardElement: { content: async (payload: unknown) => { operations.push({ type: "content", value: payload }); } },
-        card: { settings: async (payload: unknown) => { operations.push({ type: "settings", value: payload }); } }
+        cardElement: { content: async (payload: unknown) => { operations.push({ type: "content", value: payload }); return { code: 0 }; } },
+        card: { settings: async (payload: unknown) => { operations.push({ type: "settings", value: payload }); return { code: 0 }; } }
       } }
     }
   } as unknown as LarkChannelPort;
@@ -398,6 +462,25 @@ test("Channel adapter waits for native CardKit typing before closing the stream"
   assert.equal(card.config.streaming_config.print_step.default, 10);
   assert.equal(card.body.elements[0].content, "Thinking...");
 });
+
+for (const [phase, response] of [["content", { code: 230001, msg: "secret-error-payload" }], ["settings", { code: 230002 }], ["content", {}], ["settings", undefined]] as const) {
+  test(`native CardKit rejects unsuccessful ${phase} response ${JSON.stringify(response)}`, async () => {
+    const port = { createCard: async () => ({ cardId: "card" }), send: async () => ({ messageId: "reply" }), rawClient: {
+      im: { messageResource: { get: async () => { throw new Error("unused"); } } },
+      cardkit: { v1: {
+        cardElement: { content: async () => phase === "content" ? response : { code: 0 } },
+        card: { settings: async () => phase === "settings" ? response : { code: 0 } }
+      } }
+    } } as unknown as LarkChannelPort;
+    const adapter = new LarkChannelAdapter({ appId: "cli", appSecret: "secret", channel: port,
+      streaming: { intervalMs: 1, printFrequencyMs: 1, printStep: 100, settlePaddingMs: 0 } });
+    await assert.rejects(() => adapter.streamReply(normalizeLarkChannelMessage(normalized(), "cli"), async update => update("reply")), error => {
+      assert.ok(error instanceof Error && error.message.includes("CardKit"));
+      assert.ok(!String(error).includes("secret-error-payload"));
+      return true;
+    });
+  });
+}
 
 test("Channel adapter enforces the attachment limit", async () => {
   const port = {

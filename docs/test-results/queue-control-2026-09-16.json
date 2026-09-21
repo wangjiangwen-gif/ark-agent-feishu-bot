@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "437f83b",
+  "scope": "持久化队列的管理员核查与显式放弃入口",
+  "verification": {
+    "newTests": 16,
+    "fullSuite": { "passed": 541, "failed": 0, "skipped": 0, "durationMs": 3771.297666 },
+    "syntaxCheck": "passed",
+    "build": "passed",
+    "diffCheck": "passed",
+    "http": "真实本机HTTP服务、真实Gateway与SQLite；MA查询和飞书发送模拟",
+    "processExit": "真实Node子进程完成放弃事务后exit(79)，重开数据库验证失败终态、审计与去重保留",
+    "browser": "隔离控制台首页加载成功；浏览器未返回控件操作API文档，未完成实际按钮点击验收"
+  },
+  "assertions": [
+    "状态列表只读、不触发MA，分页最多100条，仅当前Channel/应用/Agent",
+    "列表不返回用户原文、模型输出、凭证或完整运行结果",
+    "控制台写入要求管理Token、JSON、同源、当前revision及显式放弃确认",
+    "重新核查不会自动放弃无法确认送达的任务",
+    "放弃前重新核查原Session/请求，要求原生请求和终态事件证据且无待授权结果",
+    "放弃以failed保存，不补造replyConfirmed，不重跑MA或撤销外部操作",
+    "任务、processed_events和管理员审计同事务；审计写入失败整体回滚",
+    "运行中、结果未知、授权等待、陈旧或未来证明均拒绝放弃",
+    "查询期间Session变化、并发请求、过期revision、错误应用均不解除暂停",
+    "10秒超时保持原任务；迟到查询结果不能覆盖已保存状态",
+    "放弃后按FIFO处理后续消息，相同原消息重复投递仍拒绝"
+  ],
+  "notVerified": [
+    "真实飞书/MA响应丢失及崩溃恢复端到端",
+    "浏览器实际按钮点击和确认弹窗视觉验收",
+    "准备阶段副作用、无派发锚点与无消息ID发送的完整恢复",
+    "部分业务写入后的安全续跑和完整授权恢复衔接",
+    "CLI默认启用实验队列、开发机迁移及真实用户性能P50/P95",
+    "文件、Memory/TOS、upgrade及其余总体方案验收"
+  ],
+  "deployment": "未部署、未推送GitHub、未发布npm；CLI实验队列仍默认关闭"
+}

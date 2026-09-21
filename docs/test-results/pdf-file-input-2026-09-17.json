@@ -1,0 +1,127 @@
+{
+  "date": "2026-09-17",
+  "version": "0.2.10-rc.3",
+  "scope": "PDF直传Files引用；不发布GitHub/npm，不继续扩展旧目标",
+  "contract": {
+    "events": "https://docs.volcengine.com/docs/82379/2559583?lang=zh",
+    "files": "https://docs.volcengine.com/docs/82379/1870405?lang=zh",
+    "shape": {
+      "type": "document",
+      "source": {
+        "type": "file",
+        "file_id": "<uploaded-file-id>"
+      }
+    }
+  },
+  "regression": {
+    "tests": 1710,
+    "passed": 1710,
+    "failed": 0,
+    "skipped": 0,
+    "durationMs": 17009.926708,
+    "check": "passed",
+    "build": "passed",
+    "diffCheck": "passed"
+  },
+  "package": {
+    "sha256": "9206e67aa9f41efb78928c9bf386d69f779a1f36728c95c6642198736ebbf43c",
+    "files": 84,
+    "secretFileGate": "passed"
+  },
+  "deployment": {
+    "deployed": true,
+    "version": "0.2.10-rc.3",
+    "release": "/home/wangjiangwen/.local/src/arkagent-0.2.10-rc.3-936bf4e",
+    "backup": "/home/wangjiangwen/.local/src/arkagent-backup-before-rc3-gB0cRn",
+    "startedAt": "2026-09-17T04:20:24.847Z",
+    "pid": "2674147",
+    "restarts": "0",
+    "web": 200,
+    "authenticatedApi": 200,
+    "unauthenticatedApi": 401,
+    "feishuWebSocket": "ready",
+    "configUnchanged": true,
+    "preserved": {
+      "sessions": 6,
+      "sessionHash": "10a67b12e3077d4a03f42e6b505cff947258b7f7f40ad7d3bbb615a8323f82e3",
+      "attachments": 11,
+      "mounts": 11
+    },
+    "build": {
+      "commit": "936bf4e06b502d90ec1fb9db15132baeeeb3e04d",
+      "dirty": false,
+      "sourceHash": "b4c3bb2f6d2ea2b9c8a1e00186410954f26b8a22b9e13683082876f57f44f4e5"
+    },
+    "oldExecutable": "/data00/home/wangjiangwen/.local/src/arkagent-0.2.10-rc.2-b014259/package/dist/cli.js"
+  },
+  "probe": {
+    "passed": true,
+    "sessions": [
+      "sesn-20260917041944-lrfmw"
+    ],
+    "uploads": [
+      {
+        "id": "file-20260917121944-tbcpc",
+        "bytes": 4492499
+      },
+      {
+        "id": "file-20260917121945-t25hh",
+        "bytes": 4492583
+      }
+    ],
+    "downloads": 2,
+    "sourceTypes": [
+      [
+        "file",
+        "file"
+      ],
+      [
+        "file",
+        "file"
+      ]
+    ],
+    "tools": [],
+    "errors": 0,
+    "rounds": [
+      {
+        "sessionId": "sesn-20260917041944-lrfmw",
+        "elapsedMs": 6653,
+        "terminal": "idle",
+        "files": [
+          {
+            "fileId": "file-20260917121944-tbcpc",
+            "title": "memory-store.pdf"
+          },
+          {
+            "fileId": "file-20260917121945-t25hh",
+            "title": "memory-record.pdf"
+          }
+        ],
+        "facts": "4/4"
+      },
+      {
+        "sessionId": "sesn-20260917041944-lrfmw",
+        "elapsedMs": 7633,
+        "terminal": "idle",
+        "files": [
+          {
+            "fileId": "file-20260917121944-tbcpc",
+            "title": "memory-store.pdf"
+          },
+          {
+            "fileId": "file-20260917121945-t25hh",
+            "title": "memory-record.pdf"
+          }
+        ],
+        "facts": "4/4"
+      }
+    ],
+    "scope": "real Gateway + Files + MA; synthetic Feishu adapter and synthetic PDFs; no customer files"
+  },
+  "health": "MainPID=2674147\nNRestarts=0\nActiveState=active",
+  "limits": [
+    "合成PDF，非客户原文件；飞书下载适配器为合成输入，Gateway/Files/MA是真实调用。",
+    "未证明客户PDF超时彻底解决；旧Session历史Base64不自动删除。",
+    "普通文字/TXT/Markdown/非PDF路径保持；每轮最多8份PDF直接引用。"
+  ]
+}

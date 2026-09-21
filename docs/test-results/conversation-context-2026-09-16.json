@@ -1,0 +1,56 @@
+{
+  "date": "2026-09-16",
+  "baselineCommit": "33fa31c",
+  "workingTreeChanges": "conversation-context stage 1",
+  "location": "local Mac Gateway harness + remote MA",
+  "liveFeishu": false,
+  "productionGatewayChanged": false,
+  "agentId": "agent-20260819140401-nf7xw",
+  "environmentId": "env-20260820154731-qspjg",
+  "sessionId": "sesn-20260916030636-vf5pc",
+  "vaultIds": [],
+  "localRegression": {
+    "tests": 160,
+    "passed": 160,
+    "syntaxCheck": true,
+    "build": true,
+    "diffCheck": true,
+    "typescriptTypecheck": "not configured in the existing project"
+  },
+  "cases": [
+    {
+      "id": "C01-ma",
+      "request": "需要（引用问题要求回显校验短语）",
+      "expected": "CONTEXT_c10b7265",
+      "actual": "CONTEXT_c10b7265",
+      "terminal": "idle",
+      "elapsedMs": 4506,
+      "passed": true
+    },
+    {
+      "id": "C06-ma",
+      "request": "在同一Session返回本轮current_actor.open_id",
+      "expected": "probe-user-b",
+      "actual": "probe-user-b",
+      "terminal": "idle",
+      "elapsedMs": 32088,
+      "firstDeltaMs": 31999,
+      "sessionCreates": 1,
+      "passed": true
+    }
+  ],
+  "performanceEvidence": {
+    "secondUserEvent": "2026-09-16T11:06:41.852680096+08:00",
+    "zeroTokenModelRequestStarts": [
+      "2026-09-16T11:06:41.911298529+08:00",
+      "2026-09-16T11:06:46.930485535+08:00",
+      "2026-09-16T11:06:54.952383324+08:00",
+      "2026-09-16T11:07:02.970761340+08:00"
+    ],
+    "effectiveModelRequestStart": "2026-09-16T11:07:10.989801272+08:00",
+    "agentMessage": "2026-09-16T11:07:13.523856671+08:00",
+    "idle": "2026-09-16T11:07:13.598059289+08:00",
+    "conclusion": "第二轮等待主要出现在MA模型请求事件之间；错误根因未确认，不能据此宣称性能通过。"
+  },
+  "remaining": ["真实飞书入口引用与Thread测试", "重复模型语义测试", "固定配置性能基线对照", "开发机全量端到端"]
+}
